@@ -1,4 +1,4 @@
-const VERSION = '0.18.0';
+const VERSION = '0.19.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -2570,7 +2570,7 @@ async function narrate() {
         let prose = '';
         try {
             prose = String(await withRetry(async () => generateRaw([
-                { role: 'system', content: '你是酒馆主 AI 的战后叙事融合器。只能依据本地 BATTLE_RESULT_DSL 写中文剧情，不能改写命中、伤害、位置、伤亡、胜负或 MVU Patch；只输出正文，不要 JSON、不要分析。' },
+                { role: 'system', content: '你是酒馆主 AI 的战后叙事融合器。只能依据本地 BATTLE_RESULT_DSL 写中文剧情，不能改写命中、伤害、位置、伤亡、胜负或 MVU Patch；只输出正文，不要 JSON、不要分析。DSL 中标记为 ELIMINATED 的敌方单位已被消灭（死亡/倒下），后续剧情必须让它们以被消灭的状态延续，不得让它们满血复活、恢复行动或以满血存活。' },
                 { role: 'user', content: `战前最近剧情：\n${JSON.stringify(recent)}\n\n本地权威战报：\n${dsl}` },
             ], 6000, '战后剧情创作'), '战后剧情创作')).replace(/<UpdateVariable>[\s\S]*?<\/UpdateVariable>/gi, '').trim();
         } catch (error) {

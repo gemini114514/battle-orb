@@ -60,6 +60,12 @@ export function buildBattleResultDsl({ state, events, final }) {
         }
     }
     for (const casualty of final?.casualties || []) output.push(line(['CASUALTY', `unit=${quote(unitLabel(casualty.id, units))}`, `side=${quote(casualty.side)}`, `state=${quote(casualty.state)}`]));
+    // 被消灭的敌方单位（战斗结束后 state 不再是 active）：这是权威的“击杀名单”，
+    // 正文 AI 必须以死亡/倒下状态延续这些单位，不得让它们满血复活或继续存活。
+    for (const unit of units.values()) {
+        if (unit.side !== 'enemy' || unit.state === 'active') continue;
+        output.push(line(['ELIMINATED', `unit=${quote(unitLabel(unit.id, units))}`, `side=${quote(unit.side)}`, `state=${quote(unit.state)}`, `count=${number(unit.count) ?? 1}`]));
+    }
     output.push(line(['END', `winner=${quote(final?.winner || 'undecided')}`, `rounds=${number(final?.rounds ?? state.round) ?? 0}`]));
     return output.join('\n');
 }

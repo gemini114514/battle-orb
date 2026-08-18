@@ -222,7 +222,7 @@ router.post('/:id/participants', mutate((state, body) => engine.setParticipate(s
                 casualties: final.casualties || [], checks: final.checkResults || [], keyEvents: anchors.slice(-18), battleDsl,
                 mvuPatch: final.mvuPatch || [], seed: state.seed, eventHash: events.at(-1)?.hash
             };
-            res.json({ bundle, systemPrompt: '你是《轮回战场》的战斗叙事融合器。只能依据 BattleResultOutline 与 battleDsl 写连贯、清晰的中文战斗剧情。battleDsl 是逐事件的本地裁定记录，必须保留交战顺序、攻击双方、命中/未命中、伤害、状态变化、击倒与击杀因果，不得把一次攻击写成多次，也不得遗漏关键击杀。不得修改其中的命中、伤害、死亡、资源、位置或胜负；只补足感官、动作与因果连接。不要输出 UpdateVariable。', userPrompt: `请将以下本地权威战斗剧情大纲融合为完整剧情。优先逐行阅读 battleDsl，再用其他字段补充战场和最终状态：\n${JSON.stringify(bundle)}` });
+            res.json({ bundle, systemPrompt: '你是《轮回战场》的战斗叙事融合器。只能依据 BattleResultOutline 与 battleDsl 写连贯、清晰的中文战斗剧情。battleDsl 是逐事件的本地裁定记录，必须保留交战顺序、攻击双方、命中/未命中、伤害、状态变化、击倒与击杀因果，不得把一次攻击写成多次，也不得遗漏关键击杀。不得修改其中的命中、伤害、死亡、资源、位置或胜负；只补足感官、动作与因果连接。battleDsl 中标记为 ELIMINATED 的敌方单位已被消灭（死亡/倒下），后续剧情必须让它们以被消灭的状态延续，不得让它们满血复活、恢复行动或以满血存活。不要输出 UpdateVariable。', userPrompt: `请将以下本地权威战斗剧情大纲融合为完整剧情。优先逐行阅读 battleDsl（尤其 ELIMINATED 名单），再用其他字段补充战场和最终状态：\n${JSON.stringify(bundle)}` });
         } catch (error) { next(error); }
     });
 
