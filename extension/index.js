@@ -1,4 +1,4 @@
-const VERSION = '0.6.1';
+const VERSION = '0.6.2';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -390,8 +390,21 @@ function normalizeDeclaration(input) {
 }
 
 const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition；已有 MVU 实体 source=existing 并填写 reference，新敌人 source=create。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
-const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)；每个 combatant 必须有 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/armor/resistance/position/visionMeters/intelProfile/tacticalProfile/abilities。能力至少包含 basic-attack，禁止计算战斗结果；玩家方必须 controller=player，敌方 controller=ai。`;
-const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据检查 AI（第二段对抗性审查）。检查给定的 CombatModel 是否自洽，并直接输出修正后的完整 JSON，不要 Markdown、解释或只输出差异。重点检查并修正：1) 武器/能力射程矛盾——例如配置了远程武器却只带近战能力、或近战武器却配置远程能力，能力射程必须与武器类型相符；2) 未实现的技能效果——引用了效果但未定义、或效果无数值的必须补齐或删除，能力必须至少包含 basic-attack；3) 与战场声明不符——participants 中声明存在的实体缺失、或出现声明外的实体；4) 玩家方必须 controller=player，敌方 controller=ai；5) 数值越界（HP/EP 为 0 或负、射程为负等）必须修正。可以连续多次修正，但最终只输出一个完整、可用的 CombatModel JSON。`;
+const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)。每个 combatant 必须含 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/position/visionMeters/intelProfile/tacticalProfile/abilities。必须保持 declaration 中的 participant 都出现：玩家 combatant 用原 declarationId，controller=player；敌方可把声明中的群体（count>1）展开成多个独立单位，id 用 原id+序号（如 corpse_01/corpse_02）但 name 保持可识别。每个 ability 必须含 id/name/type(physical|hybrid)/actionType(main|minor)/power/modifier/epCost/minRangeMeters/maxRangeMeters/cooldownRounds/targetCount/aoe；远程武器（弓弩/枪械/法杖/投掷/射击）的 maxRangeMeters 必须 ≥ 6m，近战 ≤ 2.5m。禁止计算战斗结果；玩家方必须 controller=player，敌方 controller=ai。`;
+const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据审查 AI（第二段对抗性检查）。你只审查给定的 CombatModel 并输出"整改建议"列表，绝不重新生成整个模型，绝不允许改动任何与矛盾无关的数值、名单、数量、射程或能力。
+
+【输入】你会收到：完整 CombatModel（每个 combatant 含 abilities 的 id/name/type/actionType/power/modifier/epCost/minRangeMeters/maxRangeMeters/cooldownRounds/targetCount/aoe）、战场声明 declaration。
+
+【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。
+
+【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩、枪械等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：能力引用了效果但字段缺失/无数值（缺少 power/modifier/epCost/maxRangeMeters/actionType）必须补齐为合理默认。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
+
+【输出格式】只输出一个 JSON 数组 suggestions，不要 Markdown。每项形如：
+{"op":"set_ability","declarationId":"..","abilityId":"..","field":"maxRangeMeters","value":15}
+{"op":"set_combatant","declarationId":"..","field":"controller","value":"player"}
+{"op":"add_combatant","declarationId":".."}
+{"op":"note","message":"无需修改或说明"}
+没有需要修改时输出 []。禁止输出 CombatModel 或 declaration 本体，禁止输出非 suggestions 的包装。`;
 
 function safeJson(value, limit = DEBUG_TRACE_VALUE_LIMIT) {
     if (value === undefined) return undefined;
@@ -611,38 +624,199 @@ function fallbackModel(input) {
     };
 }
 
-function mergeModel(candidate, input) {
-    const fallback = fallbackModel(input);
-    if (!candidate || typeof candidate !== 'object') return fallback;
-    const output = { ...fallback, ...candidate, battlefield: { ...fallback.battlefield, ...(candidate.battlefield || {}) }, zones: Array.isArray(candidate.zones) && candidate.zones.length ? candidate.zones : fallback.zones };
-    const candidateByDeclaration = new Map((candidate.combatants || []).map(item => [String(item.declarationId || item.id), item]));
-    output.combatants = fallback.combatants.map(base => {
-        const item = candidateByDeclaration.get(String(base.declarationId)) || candidateByDeclaration.get(String(base.id)) || {};
-        const abilities = Array.isArray(item.abilities) && item.abilities.length ? item.abilities : base.abilities;
-        return { ...base, ...item, id: base.id, declarationId: base.declarationId, side: base.side, controller: base.controller, position: { ...base.position, ...(item.position || {}) }, abilities: abilities.map(ability => { const { script, scriptHash, ...safeAbility } = ability || {}; return { ...base.abilities[0], ...safeAbility }; }) };
-    });
+function clampPercent(value, ...objectKeys) {
+    if (Number.isFinite(Number(value))) return Math.max(0, Math.min(95, Number(value)));
+    if (value && typeof value === 'object') {
+        for (const key of objectKeys) if (Number.isFinite(Number(value[key]))) return Math.max(0, Math.min(95, Number(value[key])));
+    }
+    return 0;
+}
+
+function normalizeAbility(source) {
+    const ability = source && typeof source === 'object' ? source : {};
+    const cost = ability.cost && typeof ability.cost === 'object' ? ability.cost : {};
+    const kind = String(ability.kind || ability.type || ability.attackStyle || '').toLowerCase();
+    const name = String(ability.name || ability.id || '能力');
+    const rawRange = ability.maxRangeMeters ?? ability.rangeMeters ?? ability.range;
+    let maxRange;
+    if (Number.isFinite(Number(rawRange))) maxRange = Number(rawRange);
+    else if (String(rawRange) === 'far') maxRange = 1000;
+    else if (String(rawRange) === 'medium') maxRange = 10;
+    else if (String(rawRange) === 'contact' || String(rawRange) === 'melee') maxRange = 1.8;
+    else maxRange = NaN;
+    const hintRanged = /弓|弩|枪|铳|炮|法杖|杖|投|射|远程|rifle|bow|crossbow|gun|ranged|staff|wanc|wand/i.test(name) || /弓|弩|枪|炮|投|射|远程|ranged/i.test(kind);
+    if (!Number.isFinite(maxRange)) maxRange = hintRanged ? 15 : 1.8;
+    if (hintRanged && maxRange < 6) maxRange = 15;
+    const isMagic = /mag|法|咒|术|spell|element/i.test(kind);
+    const output = {
+        id: String(ability.id || ability.name || 'ability'),
+        name,
+        type: isMagic ? 'hybrid' : 'physical',
+        actionType: ability.actionType === 'minor' ? 'minor' : 'main',
+        power: Math.max(0, Number(ability.power ?? ability.basePower ?? 0)),
+        modifier: Math.max(0, Number(ability.modifier ?? 0)),
+        epCost: Math.max(0, Number(ability.epCost ?? cost.ep ?? 0)),
+        minRangeMeters: Math.max(0, Number(ability.minRangeMeters ?? ability.minimumRangeMeters ?? 0)),
+        maxRangeMeters: Math.max(0, Number(maxRange)),
+        cooldownRounds: Math.max(0, Number(ability.cooldownRounds ?? ability.cooldown ?? 0)),
+        targetCount: Math.max(1, Number(ability.targetCount ?? ability.targets ?? (ability.aoe || ability.areaOfEffect ? 3 : 1))),
+        aoe: Boolean(ability.aoe || ability.areaOfEffect),
+    };
+    if (ability.script) output.script = ability.script;
+    if (ability.scriptHash) output.scriptHash = ability.scriptHash;
     return output;
 }
 
-async function superviseCombatModel(candidate, declaration, snapshot, maxRounds = 3) {
+function normalizeCombatant(unit, base) {
+    const source = unit && typeof unit === 'object' ? unit : {};
+    const baseUnit = base && typeof base === 'object' ? base : {};
+    const side = source.side === 'player' ? 'player' : source.side === 'neutral' ? 'neutral' : 'enemy';
+    const abilities = Array.isArray(source.abilities) && source.abilities.length
+        ? source.abilities.map(normalizeAbility)
+        : (Array.isArray(baseUnit.abilities) && baseUnit.abilities.length ? baseUnit.abilities.map(normalizeAbility) : [normalizeAbility(null)]);
+    const maxHp = Math.max(1, Number(source.maxHp ?? source.hp ?? baseUnit.maxHp ?? 20));
+    const hp = Math.max(0, Math.min(maxHp, Number(source.hp ?? maxHp)));
+    const maxEp = Math.max(0, Number(source.maxEp ?? source.ep ?? baseUnit.maxEp ?? 0));
+    const ep = Math.max(0, Math.min(maxEp, Number(source.ep ?? 0)));
+    return {
+        ...baseUnit,
+        ...source,
+        id: String(source.id || source.declarationId || baseUnit.id || 'unit'),
+        declarationId: String(source.declarationId || source.id || baseUnit.declarationId || 'unit'),
+        name: String(source.name || baseUnit.name || '单位'),
+        side,
+        controller: side === 'player' ? 'player' : 'ai',
+        hp, maxHp, ep, maxEp,
+        armor: clampPercent(source.armor, 'physicalDamageReductionPercent', 'physicalReduction', 'physical'),
+        resistance: clampPercent(source.resistance, 'magicalDamageReductionPercent', 'magicalReduction', 'magical') || clampPercent(source.armor, 'magicalDamageReductionPercent', 'magicalReduction', 'magical'),
+        attack: Math.max(0, Number(source.attack ?? source.attackPower ?? baseUnit.attack ?? 0)),
+        magicAttack: Math.max(0, Number(source.magicAttack ?? source.spellPower ?? baseUnit.magicAttack ?? 0)),
+        attackModifier: Number(source.attackModifier ?? baseUnit.attackModifier ?? 0),
+        defenseDC: Number(source.defenseDC ?? baseUnit.defenseDC ?? 30),
+        initiativeDC: Number(source.initiativeDC ?? baseUnit.initiativeDC ?? 0),
+        position: { ...(baseUnit.position || { x: 0, y: 0 }), ...(source.position || {}) },
+        attributes: { ...(baseUnit.attributes || {}), ...(source.attributes || {}) },
+        intelProfile: { ...(baseUnit.intelProfile || {}), ...(source.intelProfile || {}) },
+        tacticalProfile: { ...(baseUnit.tacticalProfile || {}), ...(source.tacticalProfile || {}) },
+        abilities,
+    };
+}
+
+function deconflictPositions(combatants) {
+    const units = (combatants || []).map(unit => {
+        if (!unit.position || !Number.isFinite(Number(unit.position.x)) || !Number.isFinite(Number(unit.position.y))) return { ...unit, position: { x: 0, y: 0 } };
+        return unit;
+    });
+    for (let pass = 0; pass < 8; pass += 1) {
+        let moved = false;
+        for (let i = 0; i < units.length; i += 1) {
+            for (let j = i + 1; j < units.length; j += 1) {
+                const a = units[i].position, b = units[j].position;
+                const min = Number(units[i].radiusMeters || .5) + Number(units[j].radiusMeters || .5) + .2;
+                const dx = b.x - a.x, dy = b.y - a.y;
+                const d = Math.hypot(dx, dy) || .001;
+                if (d >= min) continue;
+                const push = (min - d) / 2;
+                const nx = b.x + dx / d * push + (dx === 0 ? push : 0);
+                const ny = b.y + dy / d * push + (dy === 0 ? push : 0);
+                b.x = Math.round(nx * 100) / 100; b.y = Math.round(ny * 100) / 100;
+                moved = true;
+            }
+        }
+        if (!moved) break;
+    }
+    return units;
+}
+
+function mergeModel(candidate, input) {
+    const fallback = fallbackModel(input);
+    if (!candidate || typeof candidate !== 'object') return fallback;
+    const modelCombatants = Array.isArray(candidate.combatants) ? candidate.combatants : [];
+    const fallbackById = new Map(fallback.combatants.map(unit => [String(unit.declarationId), unit]));
+    const seen = new Set();
+    const combatants = modelCombatants.map(modelUnit => {
+        const key = String(modelUnit.declarationId || modelUnit.id || '');
+        seen.add(key);
+        return normalizeCombatant(modelUnit, fallbackById.get(key) || null);
+    });
+    const modelCounts = { player: 0, enemy: 0 };
+    for (const unit of combatants) modelCounts[unit.side === 'player' ? 'player' : 'enemy'] += 1;
+    const fallbackCounts = { player: 0, enemy: 0 };
+    for (const unit of fallback.combatants) fallbackCounts[unit.side === 'player' ? 'player' : 'enemy'] += 1;
+    for (const base of fallback.combatants) {
+        const side = base.side === 'player' ? 'player' : 'enemy';
+        if (seen.has(String(base.declarationId))) continue;
+        if (modelCounts[side] >= fallbackCounts[side]) continue;
+        combatants.push(normalizeCombatant({ declarationId: base.declarationId, id: base.declarationId, name: base.name, side: base.side, count: base.count }, base));
+    }
+    const output = {
+        ...fallback,
+        ...candidate,
+        battlefield: { ...fallback.battlefield, ...(candidate.battlefield || {}) },
+        zones: Array.isArray(candidate.zones) && candidate.zones.length ? candidate.zones : fallback.zones,
+        combatants: deconflictPositions(combatants),
+    };
+    return output;
+}
+
+function applyModelSuggestions(model, declaration, suggestions) {
+    if (!Array.isArray(suggestions) || !suggestions.length) return model;
+    const numericFields = new Set(['maxRangeMeters', 'minRangeMeters', 'power', 'modifier', 'epCost', 'cooldownRounds', 'targetCount', 'hp', 'maxHp', 'ep', 'maxEp']);
+    let changed = false;
+    const combatants = (model.combatants || []).map(unit => {
+        let unitChanged = false;
+        const nextUnit = clone(unit);
+        for (const s of suggestions) {
+            if (!s || typeof s !== 'object') continue;
+            const declId = String(s.declarationId || '');
+            if (declId && declId !== unit.declarationId && declId !== unit.id) continue;
+            if (s.op === 'set_ability') {
+                const ability = (nextUnit.abilities || []).find(a => String(a.id) === String(s.abilityId));
+                if (ability && ability[s.field] !== s.value) {
+                    const isNumeric = numericFields.has(s.field);
+                    if (isNumeric && !Number.isFinite(Number(s.value))) continue;
+                    if (isNumeric) ability[s.field] = Math.max(0, Number(s.value));
+                    else ability[s.field] = s.value;
+                    unitChanged = true; changed = true;
+                }
+            } else if (s.op === 'set_combatant') {
+                if (s.field === 'controller' && (s.value === 'player' || s.value === 'ai') && nextUnit.controller !== s.value) { nextUnit.controller = s.value; unitChanged = true; changed = true; }
+                else if (s.field === 'side' && ['player', 'enemy', 'neutral'].includes(s.value) && nextUnit.side !== s.value) { nextUnit.side = s.value; unitChanged = true; changed = true; }
+                else if (numericFields.has(s.field) && Number.isFinite(Number(s.value)) && Number(nextUnit[s.field]) !== Number(s.value)) { nextUnit[s.field] = Math.max(0, Number(s.value)); unitChanged = true; changed = true; }
+            }
+        }
+        return nextUnit;
+    });
+    for (const s of suggestions) {
+        if (!s || s.op !== 'add_combatant' || !s.declarationId) continue;
+        if (combatants.some(u => u.declarationId === s.declarationId || u.id === s.declarationId)) continue;
+        const fallback = fallbackModel(declaration).combatants.find(u => u.declarationId === s.declarationId);
+        if (fallback) { combatants.push(normalizeCombatant({ declarationId: fallback.declarationId, id: fallback.declarationId, name: fallback.name, side: fallback.side, count: fallback.count }, fallback)); changed = true; }
+    }
+    if (!changed) return model;
+    return { ...model, combatants };
+}
+
+async function superviseCombatModel(candidate, declaration, snapshot, maxRounds = 2) {
     if (!candidate || typeof candidate !== 'object') return candidate;
     let current = mergeModel(candidate, declaration);
     for (let round = 0; round < maxRounds; round += 1) {
-        let revised = null;
+        let suggestions = [];
         try {
-            revised = extractJsonObject(await generateRaw([
+            const raw = await generateRaw([
                 { role: 'system', content: MODEL_SUPERVISOR_SYSTEM },
-                { role: 'user', content: JSON.stringify({ declaration, mvu: snapshot?.mvu?.state, combatModel: current }, null, 2) },
-            ], 7000, `战斗数据检查（第二段 · 第 ${round + 1} 轮）`));
+                { role: 'user', content: JSON.stringify({ declaration, combatModel: current }, null, 2) },
+            ], 5000, `战斗数据审查（第二段 · 第 ${round + 1} 轮）`);
+            const parsed = extractJsonObject(raw);
+            suggestions = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
         } catch (error) {
             if (String(error?.message || '').includes('已取消')) throw error;
-            setStatus(`战斗数据检查 AI 第 ${round + 1} 轮修正失败：${error.message}`, 'warn');
+            setStatus(`战斗数据审查第 ${round + 1} 轮失败：${error.message}`, 'warn');
             break;
         }
-        if (!revised || typeof revised !== 'object') break;
-        const normalized = mergeModel(revised, declaration);
-        if (JSON.stringify(normalized) === JSON.stringify(current)) return current;
-        current = normalized;
+        const next = applyModelSuggestions(current, declaration, suggestions);
+        if (next === current) return current;
+        current = next;
     }
     return current;
 }
@@ -1695,6 +1869,7 @@ globalThis.__battleOrbDebug = {
     attackEffects: () => attackEffects.map(effect => ({ ...effect })),
     settings: () => ({ ...settings }),
     flowError: () => flowError ? { ...flowError } : null,
+    state: () => publicBattle(),
 };
 } catch (error) {
     bootTrace('bootstrap-fatal', { message: error?.message || String(error), stack: error?.stack || '' });
