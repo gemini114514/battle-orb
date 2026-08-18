@@ -1,4 +1,4 @@
-const VERSION = '0.8.5';
+const VERSION = '0.8.6';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -13,15 +13,16 @@ void import('./diagnose.js')
 
 (async function battleOrbBootstrap() {
 try {
-    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl }, sandbox] = await Promise.all([
+    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl }, sandbox, { damageValue, isMeleeAbility, rangeLegal, living }] = await Promise.all([
         import('../../../extensions.js'),
         import('./combat/engine.js'),
         import('./combat/browser-repository.js'),
         import('./combat/model.js'),
         import('./combat/narrative-dsl.js'),
         import('./combat/sandbox.js'),
+        import('./combat/rules.js'),
     ]);
-    const { inspectScript, testScript } = sandbox;
+    const { inspectScript, testScript, runScript } = sandbox;
     bootTrace('dependencies-loaded');
 
 const ROOT_ID = 'battle-orb-root';
@@ -40,6 +41,7 @@ let mapZoom = 1;
 let mapPan = { x: 0, y: 0 };
 let mapIntent = null;
 let mapMenu = null;
+let actionPreview = null;
 let mapSuppressClickUntil = 0;
 let mapPointer = null;
 let selectedUnitId = null;
@@ -60,7 +62,7 @@ let settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastM
 let flowError = null;
 try {
     const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-    settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() }, ...stored };
+    settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, previewCombat: true, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() }, ...stored };
     for (const kind of ['declaration', 'modeling']) {
         settings.api[kind] = { ...WORK_API_DEFAULT, ...(settings.api?.[kind] || {}) };
         if (!Array.isArray(settings.api[kind].profiles)) settings.api[kind].profiles = [];
@@ -1681,7 +1683,7 @@ function stageMarkup(stage) {
     }
     const state = publicBattle();
     const completed = stage === 'completed';
-    return `<section id="battle-orb-field" class="bo-field"><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div>${completed ? `<button id="battle-orb-narrate" class="bo-primary" type="button">回写主 AI</button>` : ''}</header><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details>${completed ? `<div class="bo-completed-actions"><button id="battle-orb-new-battle" class="bo-secondary" type="button">发起新战斗</button><button id="battle-orb-tool-debug-inline" class="bo-secondary" type="button">导出 DEBUG</button></div>` : ''}</section>`;
+    return `<section id="battle-orb-field" class="bo-field"><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div>${completed ? `<button id="battle-orb-narrate" class="bo-primary" type="button">回写主 AI</button>` : ''}</header><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-turn" class="bo-turn"></div><div id="battle-orb-preview"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details><div class="bo-preview-toggle"><label><input id="battle-orb-preview-toggle" type="checkbox" ${settings.previewCombat ? 'checked' : ''}><span>释放前预览检定与伤害（可撤回，范围技能无需点目标）</span></label></div>${completed ? `<div class="bo-completed-actions"><button id="battle-orb-new-battle" class="bo-secondary" type="button">发起新战斗</button><button id="battle-orb-tool-debug-inline" class="bo-secondary" type="button">导出 DEBUG</button></div>` : ''}</section>`;
 }
 
 function renderStage() {
@@ -1715,9 +1717,196 @@ function renderStage() {
         const narrateButton = $('#battle-orb-narrate'); if (narrateButton) narrateButton.disabled = busy || !state || state.status !== 'completed';
         const metaBox = $('#battle-orb-battle-meta');
         if (metaBox && state) metaBox.textContent = `${state.title || '遭遇'} · ${state.status} · seed ${String(state.seed || '').slice(0, 12)}`;
-        renderTurn(state); renderLedger(state); renderBattlefield(state);
+        renderTurn(state); renderLedger(state); renderBattlefield(state); renderActionPreview();
     }
     renderView();
+}
+
+function renderActionPreview() {
+    const slot = $('#battle-orb-preview');
+    if (!slot) { actionPreview = null; return; }
+    if (!actionPreview) { slot.innerHTML = ''; return; }
+    const { command, data } = actionPreview;
+    if (!data) {
+        slot.innerHTML = `<div class="combat-preview"><header><b>释放 ${escapeHtml(command.abilityId || command.type)}？</b><small>无法预计算检定，确认后按实际规则结算</small></header><div class="combat-preview-actions"><button class="bo-primary" id="battle-orb-preview-confirm" type="button">确认释放</button><button class="bo-secondary" id="battle-orb-preview-cancel" type="button">撤回</button></div></div>`;
+        return;
+    }
+    const movementMarkup = data.movement && Number(data.movement.meters) > 0.01 ? `<div class="combat-preview-move">先移动 ${data.movement.meters.toFixed(1)}m 至 (${data.movement.to.x.toFixed(1)}, ${data.movement.to.y.toFixed(1)})，再发起攻击（整体可撤回）</div>` : '';
+    const visible = data.rows.slice(0, 3);
+    const more = data.rows.length - visible.length;
+    const summaryMarkup = data.rows.length > 1 ? previewSummaryMarkup(data.rows) : '';
+    const rowsMarkup = visible.map(row => previewRowMarkup(row)).join('');
+    slot.innerHTML = `<div class="combat-preview">
+      <header><b>${escapeHtml(data.actorName)} · ${escapeHtml(data.abilityName || command.type)}</b><small>预览不结算任何效果，可随时撤回整个操作</small></header>
+      ${movementMarkup}
+      ${summaryMarkup}
+      <div class="combat-preview-rows">${rowsMarkup}${more > 0 ? `<div class="combat-preview-more">… 等 ${more} 个目标</div>` : ''}</div>
+      <div class="combat-preview-actions"><button class="bo-primary" id="battle-orb-preview-confirm" type="button">应用（不可撤销）</button><button class="bo-secondary" id="battle-orb-preview-cancel" type="button">撤回</button></div>
+    </div>`;
+}
+
+function previewRowMarkup(row) {
+    const checkParts = (row.checks || []).map(check => {
+        const modeLabel = check.mode === 'advantage' ? '（优势）' : check.mode === 'disadvantage' ? '（劣势）' : '';
+        const critText = check.onCrit !== check.onHit ? ` · 暴击 -${check.onCrit}` : '';
+        return `<div class="combat-preview-check">D100${modeLabel} +${check.modifier} vs DC ${check.dc} · 命中 ${(check.pHit * 100).toFixed(0)}% · 命中 -${check.onHit}${critText} · 期望 ${check.expected.toFixed(0)}</div>`;
+    }).join('');
+    const direct = Number(row.directDamage) > 0 ? `<div class="combat-preview-direct">直接伤害 -${row.directDamage}</div>` : '';
+    const statuses = (row.statuses || []).length ? `<div class="combat-preview-status">附加 ${(row.statuses || []).map(escapeHtml).join('、')}</div>` : '';
+    return `<div class="combat-preview-row"><b>${escapeHtml(row.targetName)}</b>${checkParts}${direct}${statuses}</div>`;
+}
+
+function previewSummaryMarkup(rows) {
+    const checks = rows.flatMap(row => row.checks || []);
+    const totalExpected = checks.reduce((sum, check) => sum + check.expected, 0) + rows.reduce((sum, row) => sum + (Number(row.directDamage) || 0), 0);
+    const avgHit = checks.length ? `${((checks.reduce((sum, check) => sum + check.pHit, 0) / checks.length) * 100).toFixed(0)}%` : '—';
+    const avgCrit = checks.length ? `${((checks.reduce((sum, check) => sum + check.pCrit, 0) / checks.length) * 100).toFixed(0)}%` : '—';
+    return `<div class="combat-preview-summary">对 ${rows.length} 个目标 · 平均命中 ${avgHit} · 平均暴击 ${avgCrit} · 期望总伤害 ≈${totalExpected.toFixed(0)}</div>`;
+}
+
+function rollModeFor(actor, target) {
+    const state = publicBattle();
+    const evasive = (target.statuses || []).find(item => item.id === 'evasive' && Number(item.remainingAttacks || 0) > 0);
+    const ambush = engine?.isStealthed?.(actor) && !engine?.isTracking?.(engine.knowledge(state, target.id, actor.id));
+    const advantage = actor.statuses?.some(item => item.id === 'advantage');
+    const disadvantage = actor.statuses?.some(item => item.id === 'disadvantage');
+    if (evasive || disadvantage) return 'disadvantage';
+    if (ambush || advantage) return 'advantage';
+    return 'normal';
+}
+
+function hitProbability(modifier, dc, mode) {
+    const need = dc - modifier;
+    const classify = roll => {
+        if (roll <= 5) return 'miss';
+        if (roll >= 96) return 'crit';
+        return roll >= need ? 'hit' : 'miss';
+    };
+    let hits = 0, crits = 0, total = 0;
+    if (mode === 'advantage' || mode === 'disadvantage') {
+        for (let a = 1; a <= 100; a += 1) for (let b = 1; b <= 100; b += 1) {
+            const roll = mode === 'advantage' ? Math.max(a, b) : Math.min(a, b);
+            const kind = classify(roll);
+            if (kind === 'hit') hits += 1;
+            else if (kind === 'crit') { hits += 1; crits += 1; }
+            total += 1;
+        }
+    } else {
+        for (let r = 1; r <= 100; r += 1) {
+            const kind = classify(r);
+            if (kind === 'hit') hits += 1;
+            else if (kind === 'crit') { hits += 1; crits += 1; }
+            total += 1;
+        }
+    }
+    return { pHit: hits / total, pCrit: crits / total };
+}
+
+function buildCheckPreview(actor, target, ability) {
+    const mode = rollModeFor(actor, target);
+    const attackBonus = engine.statusBonusSum(actor.statuses, ability, 'attackBonus');
+    const defenseBonus = engine.statusBonusSum(target.statuses, ability, 'defenseBonus');
+    const modifier = (Number(actor.attackModifier) || 0) + (Number(actor.tierCorrection) || 0) + (Number(ability.modifier) || 0) + attackBonus;
+    const dc = (Number(target.defenseDC) || 0) + defenseBonus;
+    const { pHit, pCrit } = hitProbability(modifier, dc, mode);
+    const onHit = damageValue(actor, target, ability, false).final;
+    const onCrit = damageValue(actor, target, ability, true).final;
+    const expected = (pHit - pCrit) * onHit + pCrit * onCrit;
+    return { mode, modifier, dc, pHit, pCrit, onHit, onCrit, expected };
+}
+
+async function previewScriptEffects(actor, ability, targets) {
+    const state = publicBattle();
+    const snapshot = unit => ({ id: unit.id, name: unit.name, side: unit.side, hp: unit.hp, maxHp: unit.maxHp, ep: unit.ep, maxEp: unit.maxEp, thp: unit.thp, attack: unit.attack, magicAttack: unit.magicAttack, attackModifier: unit.attackModifier, defenseDC: unit.defenseDC, initiativeDC: unit.initiativeDC, armor: unit.armor, resistance: unit.resistance, tierCorrection: unit.tierCorrection, speedMeters: unit.speedMeters, visionMeters: unit.visionMeters, exertion: unit.exertion, maxExertion: unit.maxExertion, position: unit.position, statuses: unit.statuses, attributes: unit.attributes });
+    const output = await runScript(ability.script, {
+        ability: { ...ability, script: undefined },
+        actor: structuredClone(actor),
+        targets: structuredClone(targets),
+        units: state.combatants.filter(unit => unit.state !== 'dying').map(snapshot),
+        battlefield: state.battlefield,
+        round: state.round,
+        zones: state.zones,
+        rng: { seed: 'preview', count: 0 },
+    });
+    return output.effects || [];
+}
+
+async function buildCommandPreview(command) {
+    const state = publicBattle();
+    const actor = state?.combatants?.find(unit => unit.id === command.actorId);
+    if (!actor) return null;
+    const ability = command.abilityId ? actor.abilities?.find(item => item.id === command.abilityId) : (command.type === 'move_attack' ? actor.abilities?.find(item => item.id === 'basic-attack') : null);
+    let targets = (command.targetIds || []).map(id => state.combatants.find(unit => unit.id === id)).filter(Boolean);
+    if (!targets.length && command.targetId) {
+        const target = state.combatants.find(unit => unit.id === command.targetId);
+        if (target) targets = [target];
+    }
+    if (!targets.length && ability && (ability.aoe || Number(ability.targetCount || 1) > 1 || ability.script)) {
+        targets = state.combatants.filter(unit => living(unit) && unit.side !== actor.side && unit.side !== 'neutral' && engine.canTarget(state, actor, unit) && (ability.script || rangeLegal(state, actor, unit, ability)));
+    }
+    if (!targets.length) return null;
+    const movement = command.type === 'move_attack' ? (() => {
+        try {
+            const basic = actor.abilities?.find(item => item.id === 'basic-attack');
+            const destination = engine.shortestAttackPosition(state, actor, targets[0], basic || ability || { maxRangeMeters: 1.5 });
+            const meters = Math.hypot(destination.x - actor.position.x, destination.y - actor.position.y);
+            return { meters, to: destination };
+        } catch { return null; }
+    })() : null;
+    const rows = [];
+    if (ability?.script) {
+        let effects = [];
+        try { effects = await previewScriptEffects(actor, ability, targets); } catch { effects = []; }
+        const byTarget = new Map();
+        for (const fx of effects) {
+            if (!byTarget.has(fx.targetId)) byTarget.set(fx.targetId, { checks: [], direct: 0, statuses: [] });
+            const row = byTarget.get(fx.targetId);
+            if (fx.type === 'attack') {
+                const target = state.combatants.find(unit => unit.id === fx.targetId);
+                if (target) row.checks.push(buildCheckPreview(actor, target, { ...ability, type: fx.damageType || ability.type || 'physical', power: fx.power, modifier: fx.modifier }));
+            } else if (fx.type === 'damage') row.direct += Math.max(0, Number(fx.amount) || 0);
+            else if (fx.type === 'status') row.statuses.push(fx.status?.name || fx.status?.id || String(fx.status));
+        }
+        for (const [targetId, row] of byTarget) {
+            const target = state.combatants.find(unit => unit.id === targetId);
+            if (target) rows.push({ targetId: target.id, targetName: target.name, checks: row.checks, directDamage: row.direct, statuses: row.statuses });
+        }
+        if (!rows.length) for (const target of targets) rows.push({ targetId: target.id, targetName: target.name, checks: [], directDamage: null, statuses: [] });
+    } else {
+        for (const target of targets) {
+            rows.push({ targetId: target.id, targetName: target.name, checks: ability ? [buildCheckPreview(actor, target, ability)] : [], directDamage: null, statuses: [] });
+        }
+    }
+    return { actorName: actor.name, abilityName: ability?.name || command.type, abilityId: ability?.id, type: command.type, movement, rows };
+}
+
+async function showActionPreview(command) {
+    if (!settings.previewCombat) return false;
+    let data = null;
+    try {
+        data = await buildCommandPreview(command);
+        if (data && Array.isArray(data.rows) && data.rows.length && !(command.targetIds || []).length) {
+            command.targetIds = data.rows.map(row => row.targetId);
+        }
+    } catch { data = null; }
+    actionPreview = { command, data };
+    mapIntent = null; mapMenu = null; selectedUnitId = null;
+    render();
+    return true;
+}
+
+function confirmActionPreview() {
+    const preview = actionPreview;
+    if (!preview) return;
+    actionPreview = null;
+    mapIntent = null; mapMenu = null; selectedUnitId = null;
+    void execute(preview.command);
+}
+
+function cancelActionPreview() {
+    actionPreview = null;
+    mapIntent = null; mapMenu = null; selectedUnitId = null;
+    render();
 }
 
 function renderScriptApproval(state) {
@@ -1895,13 +2084,16 @@ async function handleMapClick(event) {
     }
     if (mapIntent.type === 'move_attack') {
         const intent = mapIntent; mapIntent = null; mapMenu = null;
+        if (await showActionPreview({ type: 'move_attack', actorId: actor.id, targetId: abilityHit.id })) return true;
         const ok = await execute({ type: 'move_attack', actorId: actor.id, targetId: abilityHit.id });
         if (!ok) { mapIntent = intent; render(); }
         return true;
     }
     const intent = mapIntent; mapIntent = null;
     mapMenu = null;
-    const ok = await execute({ type: intent.script ? 'script' : 'attack', actorId: actor.id, abilityId: intent.abilityId, targetIds: [abilityHit.id] });
+    const command = { type: intent.script ? 'script' : 'attack', actorId: actor.id, abilityId: intent.abilityId, targetIds: [abilityHit.id] };
+    if (await showActionPreview(command)) return true;
+    const ok = await execute(command);
     if (!ok) { mapIntent = intent; render(); }
     return true;
 }
@@ -2006,8 +2198,10 @@ function resetToStageOne() {
 
 function bindPanel() {
     document.addEventListener('click', event => {
-        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts');
+        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts, #battle-orb-preview-confirm, #battle-orb-preview-cancel');
         if (!target) return;
+        if (target.id === 'battle-orb-preview-confirm') { confirmActionPreview(); return; }
+        if (target.id === 'battle-orb-preview-cancel') { cancelActionPreview(); return; }
         if (target.id === 'battle-orb-sync') {
             flowError = null;
             try {
@@ -2104,6 +2298,7 @@ function bindPanel() {
         if (event.target.id === 'battle-orb-unit-hint') { settings.unitHint = String(event.target.value || '').trim(); saveSettings(); return; }
         if (event.target.id === 'battle-orb-declaration') { try { declaration = normalizeDeclaration(JSON.parse(event.target.value)); } catch { declaration = null; } render(); return; }
         if (event.target.id === 'battle-orb-write-verdict') { settings.writeVerdictBasis = Boolean(event.target.checked); saveSettings(); setStatus(settings.writeVerdictBasis ? '判断依据回写正文：战斗记录正式插入楼层后再创作剧情' : '只写回剧情：仅把剧情写回楼层', 'ok'); return; }
+        if (event.target.id === 'battle-orb-preview-toggle') { settings.previewCombat = Boolean(event.target.checked); saveSettings(); if (!settings.previewCombat) cancelActionPreview(); setStatus(settings.previewCombat ? '释放前预览检定与伤害已启用' : '已关闭释放预览，恢复直接结算', 'ok'); return; }
         if (event.target.id === 'battle-orb-fast-modeling') { settings.fastModeling = Boolean(event.target.checked); saveSettings(); setStatus(settings.fastModeling ? '急速模式：创建战场时将跳过二阶段检查' : '已关闭急速模式，恢复两段式审查', 'ok'); return; }
         if (event.target.id === 'battle-orb-rollback-modeling') { settings.rollbackModeling = Boolean(event.target.checked); saveSettings(); setStatus(settings.rollbackModeling ? '回滚模式：二阶段失败将立即用第一阶段结果创建战场' : '已关闭回滚模式', 'ok'); return; }
         const apiFieldMatch = String(event.target.id).match(/^battle-orb-api-(decl|model)-(.+)$/);
@@ -2271,7 +2466,13 @@ function bindPanel() {
             const actor = mapState?.combatants?.find(unit => unit.id === mapState?.activeUnitId);
             const ability = actor?.abilities?.find(item => item.id === event.target.closest('[data-combat-ability-id]')?.dataset.combatAbilityId);
             if (!ability) { notify('当前能力不可用', 'error'); return; }
-            if (Array.isArray(ability.legalTargetIds) && !ability.legalTargetIds.length) { notify('当前攻击范围内没有合法目标，请先移动或取消攻击模式。', 'info'); return; }
+            const legalAction = (mapState?.pauseReason?.legalActions || []).find(item => item.id === ability.id);
+            if (legalAction && Array.isArray(legalAction.legalTargetIds) && !legalAction.legalTargetIds.length) { notify('当前攻击范围内没有合法目标，请先移动或取消攻击模式。', 'info'); return; }
+            const isArea = ability.aoe || Number(ability.targetCount || 1) > 1;
+            if (settings.previewCombat && isArea) {
+                void showActionPreview({ type: ability.script ? 'script' : 'attack', actorId: actor.id, abilityId: ability.id });
+                return;
+            }
             mapIntent = { type: 'ability', abilityId: ability.id, abilityName: ability.name, script: event.target.closest('[data-combat-script]')?.dataset.combatScript === 'true' }; mapMenu = null; render(); return;
         }
         if (action === 'combat-map-menu-move-attack') {
@@ -2290,7 +2491,8 @@ function bindPanel() {
         if (action.dataset.boAction === 'attack') {
             const actorUnit = state?.combatants?.find(unit => unit.id === actorId);
             const ability = actorUnit?.abilities?.find(item => item.id === action.dataset.ability);
-            void execute({ type: ability?.script ? 'script' : 'attack', actorId, abilityId: action.dataset.ability, targetIds: [action.dataset.target] });
+            const command = { type: ability?.script ? 'script' : 'attack', actorId, abilityId: action.dataset.ability, targetIds: [action.dataset.target] };
+            void showActionPreview(command).then(previewed => { if (!previewed) void execute(command); });
         }
         else void execute({ type: action.dataset.boAction, actorId });
     });
