@@ -1,4 +1,4 @@
-const VERSION = '0.15.0';
+const VERSION = '0.16.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -900,7 +900,7 @@ async function runBenchmark() {
     busy = true; setStatus('正在运行本地战斗基准测试（1 对 100）…', 'working'); render();
     const startedAt = performance.now();
     try {
-        const benchRepo = new BrowserCombatRepository();
+        const benchRepo = new BrowserCombatRepository({ chatId: tavernSnapshot?.chatId || null });
         const benchEngine = new CombatEngine(benchRepo);
         const encounter = benchmarkEncounter();
         const created = benchEngine.create({ seed: id('bench'), mode: 'auto', transient: true, storySessionId: 'benchmark', encounter });
@@ -1411,7 +1411,7 @@ async function createBattleCore() {
         }
         model = mergeModel(candidate, declaration);
         recordDebug('modeling_final', { mode: modeNote || '两段式', combatants: model.combatants?.length || 0, basicAttacks: model.combatants?.reduce((sum, unit) => sum + (unit.abilities || []).filter(ability => /^basic-attack/.test(ability.id)).length, 0) || 0 });
-        repository = new BrowserCombatRepository();
+        repository = new BrowserCombatRepository({ chatId: tavernSnapshot?.chatId || null });
         engine = new CombatEngine(repository);
         // 全自动模式：进入战场时自动批准脚本（并写入持久化缓存），无需手动逐条确认。
         repository.autoApprove = Boolean(autoState.running);

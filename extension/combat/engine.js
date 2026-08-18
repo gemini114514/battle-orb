@@ -332,7 +332,13 @@ export class CombatEngine {
         return true;
     }
 
-    knownTargets(state, observer) { return enemiesOf(state, observer).filter(target => this.canTarget(state, observer, target)); }
+    knownTargets(state, observer) {
+        // 中立单位如果被玩家在编制部署中勾选参战，只把敌对单位视为目标：它协助玩家
+        // 对抗敌人，绝不攻击玩家方或其它中立单位（绝不内讧）。
+        const pool = enemiesOf(state, observer);
+        if (observer.side === 'neutral') return pool.filter(target => target.side === 'enemy' && this.canTarget(state, observer, target));
+        return pool.filter(target => this.canTarget(state, observer, target));
+    }
 
     strategyFor(state, actor) {
         const global = state?.strategy || {};
@@ -790,6 +796,9 @@ export class CombatEngine {
 
     shouldManualPause(state, actor) {
         const strategy = this.strategyFor(state, actor);
+        // 中立单位绝不手操：即使建模/兜底把 controller 默认为 player，也绝不停下等待
+        // 玩家输入，否则整回合会永远卡在该单位上（玩家界面不会为其提供行动选项）。
+        if (actor.side === 'neutral') return false;
         if (actor.controller !== 'player' || actor.controlMode === 'auto') return false;
         if (actor.controlMode === 'manual') return true;
         return state.mode === 'manual' || state.mode === 'semi' && !strategy?.confirmed;
@@ -1265,7 +1274,11 @@ export class CombatEngine {
             const roll = rng.d100(evasive ? 'disadvantage' : ambush || actor.statuses.some(item => item.id === 'advantage') ? 'advantage' : actor.statuses.some(item => item.id === 'disadvantage') ? 'disadvantage' : 'normal');
             const total = roll.selected + actor.attackModifier + actor.tierCorrection + ability.modifier + this.statusBonusSum(actor.statuses, ability, 'attackBonus');
             const effectiveDefenseDC = target.defenseDC + this.statusBonusSum(target.statuses, ability, 'defenseBonus');
-            const hit = total >= effectiveDefenseDC;
+            // 必中锁定：被锁定的目标下一次受击必中（命中无需再检定），命中后消耗该锁定。
+            const lockedIndex = target.statuses.findIndex(item => item.id === 'locked' && item.lockGrade);
+            const locked = lockedIndex >= 0;
+            if (locked) { const consumed = target.statuses.splice(lockedIndex, 1)[0]; this.event(state, 'lock_consumed', { actorId: actor.id, targetId: target.id, grade: consumed?.lockGrade || null }); }
+            const hit = locked || total >= effectiveDefenseDC;
             let damage = null, applied = null;
             if (hit) {
                 damage = damageValue(actor, target, ability, roll.selected >= 96);
@@ -1278,7 +1291,7 @@ export class CombatEngine {
                 }
                 this.checkBossPhase(state, target);
             }
-            const result = { targetId: target.id, rawRolls: roll.rolls, selected: roll.selected, rngIndex: roll.rngIndex, modifier: total - roll.selected, total, defenseDC: effectiveDefenseDC, ambush, outcome: roll.selected <= 5 ? 'disaster' : roll.selected >= 96 ? 'miracle' : hit ? 'hit' : 'miss', damage, applied };
+            const result = { targetId: target.id, rawRolls: roll.rolls, selected: roll.selected, rngIndex: roll.rngIndex, modifier: total - roll.selected, total, defenseDC: effectiveDefenseDC, ambush, outcome: locked ? 'hit' : roll.selected <= 5 ? 'disaster' : roll.selected >= 96 ? 'miracle' : hit ? 'hit' : 'miss', damage, applied };
             const attackBasis = {
                 actor: { id: actor.id, attack: actor.attack, magicAttack: actor.magicAttack, attackModifier: actor.attackModifier, tierCorrection: actor.tierCorrection },
                 ability: { id: ability.id, name: ability.name, type: ability.type, power: ability.power, modifier: ability.modifier, minRangeMeters: ability.minRangeMeters, maxRangeMeters: ability.maxRangeMeters, aoe: ability.aoe },
@@ -1724,7 +1737,30 @@ export class CombatEngine {
                 this.checkBossPhase(state, target);
             }
             else if (effect.type === 'heal' && target) { const beforeState = target.state; target.hp = Math.min(target.maxHp, target.hp + Math.max(0, Math.round(effect.amount))); if (target.hp > 0 && target.state === 'dying') target.state = 'active'; if (beforeState !== target.state) this.event(state, 'unit_state_changed', { unitId: target.id, from: beforeState, to: target.state }); }
-            else if (effect.type === 'status' && target) target.statuses.push(typeof effect.status === 'object' && effect.status !== null ? { ...effect.status, duration: Math.max(1, Math.round(Number(effect.status.duration ?? 1))) } : { id: String(effect.status), duration: Math.max(1, Math.round(Number(effect.duration ?? 1))) });
+            else if (effect.type === 'status' && target) {
+                const status = typeof effect.status === 'object' && effect.status !== null
+                    ? { ...effect.status, duration: Math.max(1, Math.round(Number(effect.status.duration ?? 1))) }
+                    : { id: String(effect.status), duration: Math.max(1, Math.round(Number(effect.duration ?? 1))) };
+                // 状态若带 saveDC（豁免 DC），目标做一次抵抗检定：d100 + 精神修正 + 自身
+                // 状态的 resistanceBonus（如逻辑偏转的 +15）>= saveDC 则抵抗成功，状态不生效。
+                const saveDC = Number(status.saveDC);
+                if (saveDC > 0 && this.resistanceCheck(state, target, saveDC, { label: `抵抗 ${status.name || status.id}` })) {
+                    this.event(state, 'status_resisted', { unitId: target.id, status: status.id, saveDC, label: status.name || status.id });
+                } else {
+                    target.statuses.push(status);
+                }
+            }
+            else if (effect.type === 'lock' && target) {
+                // 必中锁定：带等级（A 最强 → F 最弱）。目标若拥有 lockImmunity（如"免疫 D 级
+                // 及以下"），等级不高于免疫等级的锁定被自动抵抗；否则附加 locked 状态，
+                // 下一次对该目标的受击判定自动命中并消耗。
+                const grade = String(effect.grade || 'C').toUpperCase();
+                if (this.isLockImmune(target, grade)) {
+                    this.event(state, 'lock_resisted', { unitId: target.id, grade, immunity: this.lockImmunityOf(target) });
+                } else {
+                    target.statuses.push({ id: 'locked', name: String(effect.name || '必中锁定'), lockGrade: grade, duration: Math.max(1, Math.round(Number(effect.duration ?? 1))) });
+                }
+            }
             else if (effect.type === 'dispel' && target) target.statuses = target.statuses.filter(item => item.id !== effect.status);
             else if (effect.type === 'modify' && target) this.applyStatMod(target, effect);
             else if (effect.type === 'move' && target && effect.position && Number.isFinite(Number(effect.position.x)) && Number.isFinite(Number(effect.position.y))) this.moveTo(state, target, effect.position, { ignoreBudget: true, source: 'script', disengageChecked: true });
@@ -1777,7 +1813,7 @@ export class CombatEngine {
         if (status?.vsAttackType) {
             const t = String(status.vsAttackType);
             if (t === 'melee' || t === 'ranged') { if ((t === 'melee') !== isMeleeAbility(ability)) return false; }
-            else if (ability.type !== t) return false;
+            else if (!ability || ability.type !== t) return false;
         }
         if (status?.vsMelee !== undefined && Boolean(status.vsMelee) !== isMeleeAbility(ability)) return false;
         if (status?.vsAbilityId) {
@@ -1793,6 +1829,44 @@ export class CombatEngine {
             if (!bonus) return sum;
             return this.statusApplies(status, ability) ? sum + bonus : sum;
         }, 0);
+    }
+
+    // 抵抗检定：d100 + 精神修正 + 自身状态的 resistanceBonus（如"逻辑偏转 +15"）
+    // >= DC 即抵抗成功。用于带 saveDC 的状态附加前是否被目标抵抗。
+    resistanceCheck(state, target, dc, { label = '抵抗检定', rng: sharedRng = null } = {}) {
+        const rng = sharedRng || this.rng(state);
+        const roll = rng.d100();
+        const modifier = Number(target.attributes?.spiritModifier || 0) + this.statusBonusSum(target.statuses, null, 'resistanceBonus');
+        const total = roll.selected + modifier;
+        this.saveRng(state, rng);
+        this.event(state, 'resistance_check', { unitId: target.id, rawRolls: roll.rolls, selected: roll.selected, modifier, total, dc, success: total >= dc, label });
+        return total >= dc;
+    }
+
+    // 必中锁定等级：A 最强 → F 最弱，未知等级按 F 处理。
+    lockGradeRank(grade) {
+        return ({ A: 1, B: 2, C: 3, D: 4, E: 5, F: 6 })[String(grade || '').toUpperCase()] || 7;
+    }
+
+    // 目标当前最"强"的锁定免疫声明（rank 最小即最保守/最强保护，例如 C 覆盖 C,D,E,F）。
+    lockImmunityOf(target) {
+        let strongest = null, strongestRank = Infinity;
+        for (const status of target.statuses || []) {
+            const grade = String(status.lockImmunity || '').toUpperCase();
+            if (!grade) continue;
+            const rank = this.lockGradeRank(grade);
+            if (rank < strongestRank) { strongestRank = rank; strongest = grade; }
+        }
+        return strongest;
+    }
+
+    // "免疫 X 级及以下"的锁定：锁定的等级不高于目标的免疫等级即被抵抗。
+    isLockImmune(target, grade) {
+        const lockRank = this.lockGradeRank(grade);
+        return (target.statuses || []).some(status => {
+            const immunity = String(status.lockImmunity || '').toUpperCase();
+            return immunity && lockRank >= this.lockGradeRank(immunity);
+        });
     }
 
     afterAction(state) {

@@ -3,16 +3,24 @@ import { deepClone } from './util.js';
 const APPROVED_KEY = 'battle-orb.approved-scripts';
 const APPROVED_LIMIT = 500;
 
+const scopedKey = (base, chatId) => {
+    const scope = String(chatId || '').trim();
+    return scope ? `${base}.${scope}` : base;
+};
+
 export class BrowserCombatRepository {
-    constructor() {
+    // 脚本审批缓存按酒馆聊天/存档编号隔离：同一源码哈希 + 规则版本，只在同一个
+    // chatId 内跨战斗/跨刷新复用，避免不同存档之间的脚本审批互相污染。
+    constructor(options = {}) {
         this.states = new Map();
         this.ledger = new Map();
         this.assets = new Map();
         this.approved = new Set();
         this.autoApprove = false;
+        this.storageKey = scopedKey(APPROVED_KEY, options.chatId);
         // 持久化脚本审批缓存：同一规则版本 + 同一源码哈希跨战斗/跨刷新复用，避免每次战斗重复创建脚本。
         try {
-            const stored = JSON.parse(localStorage.getItem(APPROVED_KEY) || '[]');
+            const stored = JSON.parse(localStorage.getItem(this.storageKey) || '[]');
             if (Array.isArray(stored)) for (const key of stored) this.approved.add(String(key));
         } catch { /* 忽略持久化缓存读取失败 */ }
     }
@@ -50,7 +58,7 @@ export class BrowserCombatRepository {
     approveScript(hash, rulesetVersion) {
         this.approved.add(`${rulesetVersion}:${hash}`);
         try {
-            localStorage.setItem(APPROVED_KEY, JSON.stringify([...this.approved].slice(-APPROVED_LIMIT)));
+            localStorage.setItem(this.storageKey, JSON.stringify([...this.approved].slice(-APPROVED_LIMIT)));
         } catch { /* 忽略持久化写入失败 */ }
     }
 

@@ -41,7 +41,7 @@ export function inspectScript(source, ability = {}) {
     if (textSize > MAX_SOURCE) throw new Error('脚本超过 64KB');
     const forbidden = /\b(?:fetch|XMLHttpRequest|WebSocket|require|process|Deno|Bun|importScripts|eval|Function|document|window|location)\b|\bimport\s*\(/;
     if (forbidden.test(text)) throw new Error('脚本请求了沙箱禁止能力');
-    const apiNames = ['state', 'distance', 'unitsInArea', 'd100', 'd', 'attack', 'damage', 'heal', 'status', 'dispel', 'move', 'push', 'resource', 'modify', 'summon', 'log', 'event'];
+    const apiNames = ['state', 'distance', 'unitsInArea', 'd100', 'd', 'attack', 'damage', 'heal', 'status', 'dispel', 'move', 'push', 'resource', 'modify', 'summon', 'check', 'lock', 'log', 'event'];
     const capabilities = [...new Set([...text.matchAll(/api\.([a-zA-Z]+)\s*\(/g)].map(match => match[1]).filter(name => apiNames.includes(name)))];
     return { hash: scriptHash(text), rulesetVersion: RULESET_VERSION, ability: { id: ability.id, name: ability.name }, source: text, size: textSize, capabilities, limits: { executionMs: 25, memoryMb: 16, maxEffects: MAX_EFFECTS, triggerDepth: 8 } };
 }
@@ -109,6 +109,25 @@ export async function runScript(source, input) {
                   rounds: options && options.rounds !== undefined ? Math.max(0, Math.floor(Number(options.rounds))) : 0,
               }),
               summon: (templateId, zoneId, count = 1, x = null, y = null) => emit("summon", { templateId: String(templateId), zoneId: String(zoneId), count: Number(count), x: x === null ? null : Number(x), y: y === null ? null : Number(y) }),
+              // 判定/检定：d100 + modifier vs dc，返回是否成功。决定性与战斗 RNG 同源
+              // （沙箱内确定性随机），脚本据此分支（成功/失败的不同效果）。
+              check: (options = {}) => {
+                  const roll = 1 + Math.floor(rand() * 100);
+                  const dc = Number(options && options.dc || 0);
+                  const modifier = Number(options && options.modifier || 0);
+                  const total = roll + modifier;
+                  const label = String((options && options.label) || "检定");
+                  emit("log", { message: label + "：" + roll + (modifier ? (modifier > 0 ? " + " + modifier : " - " + Math.abs(modifier)) : "") + " = " + total + " vs DC " + dc + " → " + (total >= dc ? "成功" : "失败") });
+                  return total >= dc;
+              },
+              // 必中锁定：对目标附加"下一次受击必中"的锁定（带等级）。目标若拥有足够高
+              // 的 lockImmunity 状态（免疫 D 级及以下等）则自动抵抗，不发锁定。
+              lock: (targetId, options = {}) => emit("lock", {
+                  targetId: String(targetId),
+                  grade: String((options && options.grade) || "C"),
+                  duration: options && options.duration !== undefined ? Math.max(1, Math.floor(Number(options.duration))) : 1,
+                  name: String((options && options.name) || "必中锁定"),
+              }),
               log: (message) => emit("log", { message: String(message) }),
               event: () => ({ type: input.event?.type || null, actor: input.actor || null, target: input.event?.target || null })
             });

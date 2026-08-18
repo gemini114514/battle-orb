@@ -18,7 +18,7 @@ export const SCRIPT_LIBRARY = Object.freeze([
         name: '防御架势',
         description: '给自己或指定友方附加防御架势：被近战攻击时防御 DC 提升，持续若干回合。',
         params: { turns: 3, defenseBonus: 6, target: 'self' },
-        script: `const actor = api.state().actor; const target = {{target}} === 'self' ? actor : (api.state().targets[0] || actor); api.status(target.id, { id: 'guard-stance', name: '防御架势', defenseBonus: {{defenseBonus}}, vsMelee: true }, {{turns}}); api.log('防御架势展开');`,
+        script: `const actor = api.state().actor; const target = '{{target}}' === 'self' ? actor : (api.state().targets[0] || actor); api.status(target.id, { id: 'guard-stance', name: '防御架势', defenseBonus: {{defenseBonus}}, vsMelee: true }, {{turns}}); api.log('防御架势展开');`,
     },
     {
         id: 'heal',
@@ -46,7 +46,7 @@ export const SCRIPT_LIBRARY = Object.freeze([
         name: '属性增益（buff）',
         description: '给自己或指定目标附加某项属性加成（attack/attackModifier/defenseDC/armor 等），持续若干回合后自动还原。',
         params: { turns: 3, field: 'attack', amount: 5, target: 'self' },
-        script: `const actor = api.state().actor; const target = {{target}} === 'self' ? actor : (api.state().targets[0] || actor); api.modify(target.id, '{{field}}', {{amount}}, { rounds: {{turns}} }); api.log('属性增益生效');`,
+        script: `const actor = api.state().actor; const target = '{{target}}' === 'self' ? actor : (api.state().targets[0] || actor); api.modify(target.id, '{{field}}', {{amount}}, { rounds: {{turns}} }); api.log('属性增益生效');`,
     },
     {
         id: 'pushback',
@@ -54,6 +54,20 @@ export const SCRIPT_LIBRARY = Object.freeze([
         description: '推开目标一段距离（可选先发一次攻击，再击退）。',
         params: { dx: 1.5, amount: 0 },
         script: `const target = api.state().targets[0]; if (target) { if ({{amount}} > 0) { api.attack(target.id); } api.push(target.id, {{dx}}, 0); api.log('击退目标'); }`,
+    },
+    {
+        id: 'logic-deflection',
+        name: '逻辑偏转（精神判定 + 防御强化）',
+        description: '辅助型：对自己或指定友方/中立单位做一次精神判定（api.check）。成功则持续 turns 回合：目标防御 DC +defenseBonus 常驻加值、所有抵抗检定 +resistanceBonus 修正、并免疫 lockImmunity 级及以下（含同级）的必中锁定。判定失败则无事发生。目标省略时作用于自身。',
+        params: { dc: 70, defenseBonus: 25, resistanceBonus: 15, lockImmunity: 'D', turns: 4, target: 'self' },
+        script: `const actor = api.state().actor; const target = '{{target}}' === 'self' ? actor : (api.state().targets[0] || actor); const ok = api.check({ dc: {{dc}}, modifier: Number(actor.attributes && actor.attributes.spiritModifier || 0), label: '逻辑偏转·精神判定' }); if (ok) { api.status(target.id, { id: 'logic-deflection', name: '逻辑偏转', defenseBonus: {{defenseBonus}}, resistanceBonus: {{resistanceBonus}}, lockImmunity: '{{lockImmunity}}' }, {{turns}}); api.log('逻辑偏转生效：防御DC+{{defenseBonus}}、抵抗+{{resistanceBonus}}、免疫{{lockImmunity}}级及以下必中锁定，持续{{turns}}回合'); } else { api.log('精神判定失败，逻辑偏转未生效'); }`,
+    },
+    {
+        id: 'lock-on',
+        name: '必中锁定（命中锁定）',
+        description: '对敌方目标附加 grade 级必中锁定（A 最强 → F 最弱）：锁定持续 duration 回合，下一次对该目标进行的攻击判定必中。若目标免疫该级及以下的锁定则被自动抵抗。',
+        params: { grade: 'D', turns: 1 },
+        script: `const target = api.state().targets[0]; if (target) { api.lock(target.id, { grade: '{{grade}}', duration: {{turns}}, name: '必中锁定' }); api.log('对目标施加{{grade}}级必中锁定'); }`,
     },
 ]);
 
