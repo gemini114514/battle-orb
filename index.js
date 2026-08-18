@@ -1,4 +1,4 @@
-const VERSION = '0.13.0';
+const VERSION = '0.14.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -2218,7 +2218,7 @@ function renderStage() {
         const narrateButton = $('#battle-orb-narrate'); if (narrateButton) narrateButton.disabled = busy || !state || state.status !== 'completed';
         const metaBox = $('#battle-orb-battle-meta');
         if (metaBox && state) metaBox.textContent = `${state.title || '遭遇'} · ${state.status} · seed ${String(state.seed || '').slice(0, 12)}`;
-        renderTurn(state); renderLedger(state); renderBattlefield(state); renderActionPreview();
+        renderTurn(state); renderLedger(state); renderBattlefield(state); renderActionPreview(); renderBattleResult();
     }
     renderView();
 }
@@ -2244,6 +2244,26 @@ function renderActionPreview() {
       <div class="combat-preview-rows">${rowsMarkup}${more > 0 ? `<div class="combat-preview-more">… 等 ${more} 个目标</div>` : ''}</div>
       <div class="combat-preview-actions"><button class="bo-primary" id="battle-orb-preview-confirm" type="button">应用（不可撤销）</button><button class="bo-secondary" id="battle-orb-preview-cancel" type="button">撤回</button></div>
     </div>`;
+}
+
+// 战斗结束后在行动确认对话框同样的位置显示醒目的胜负结果。
+function renderBattleResult() {
+    const slot = $('#battle-orb-preview');
+    if (!slot) return;
+    const state = publicBattle();
+    if (actionPreview || !state || state.status !== 'completed' || !state.finalResult) {
+        slot.classList.remove('bo-result-overlay');
+        if (!actionPreview) slot.innerHTML = '';
+        return;
+    }
+    const final = state.finalResult;
+    const win = final.winner === 'player';
+    const lose = final.winner === 'enemy';
+    const kind = win ? 'win' : lose ? 'lose' : 'draw';
+    const text = win ? '胜利' : lose ? '失败' : '平局';
+    const sub = `第 ${final.rounds ?? state.round ?? 0} 回合结束 · ${win ? '敌方已被全灭' : lose ? '我方已无法再战' : '双方均无法再战'}`;
+    slot.classList.add('bo-result-overlay');
+    slot.innerHTML = `<div class="combat-result ${kind}"><div class="combat-result-text">${text}</div><div class="combat-result-sub">${sub}</div></div>`;
 }
 
 function previewRowMarkup(row) {
