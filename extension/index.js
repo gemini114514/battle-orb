@@ -1,4 +1,4 @@
-const VERSION = '0.4.1';
+const VERSION = '0.5.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -45,6 +45,8 @@ let inspectorUnitId = null;
 let actionNotice = null;
 let actionNoticeTimer = null;
 const forcedUnitIds = new Set();
+let attackEffects = [];
+let combatEffectFrame = 0;
 let mapState = null;
 let busy = false;
 let mounted = false;
@@ -382,6 +384,7 @@ function normalizeDeclaration(input) {
 
 const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition；已有 MVU 实体 source=existing 并填写 reference，新敌人 source=create。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
 const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)；每个 combatant 必须有 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/armor/resistance/position/visionMeters/intelProfile/tacticalProfile/abilities。能力至少包含 basic-attack，禁止计算战斗结果；玩家方必须 controller=player，敌方 controller=ai。`;
+const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据检查 AI（第二段对抗性审查）。检查给定的 CombatModel 是否自洽，并直接输出修正后的完整 JSON，不要 Markdown、解释或只输出差异。重点检查并修正：1) 武器/能力射程矛盾——例如配置了远程武器却只带近战能力、或近战武器却配置远程能力，能力射程必须与武器类型相符；2) 未实现的技能效果——引用了效果但未定义、或效果无数值的必须补齐或删除，能力必须至少包含 basic-attack；3) 与战场声明不符——participants 中声明存在的实体缺失、或出现声明外的实体；4) 玩家方必须 controller=player，敌方 controller=ai；5) 数值越界（HP/EP 为 0 或负、射程为负等）必须修正。可以连续多次修正，但最终只输出一个完整、可用的 CombatModel JSON。`;
 
 async function generateRaw(messages, responseLength = 4000) {
     const ctx = activeContext();
@@ -436,6 +439,25 @@ function mergeModel(candidate, input) {
     return output;
 }
 
+async function superviseCombatModel(candidate, declaration, snapshot, maxRounds = 3) {
+    if (!candidate || typeof candidate !== 'object') return candidate;
+    let current = mergeModel(candidate, declaration);
+    for (let round = 0; round < maxRounds; round += 1) {
+        let revised = null;
+        try {
+            revised = extractJsonObject(await generateRaw([
+                { role: 'system', content: MODEL_SUPERVISOR_SYSTEM },
+                { role: 'user', content: JSON.stringify({ declaration, mvu: snapshot?.mvu?.state, combatModel: current }, null, 2) },
+            ], 7000));
+        } catch (error) { setStatus(`战斗数据检查 AI 第 ${round + 1} 轮修正失败：${error.message}`, 'warn'); break; }
+        if (!revised || typeof revised !== 'object') break;
+        const normalized = mergeModel(revised, declaration);
+        if (JSON.stringify(normalized) === JSON.stringify(current)) return current;
+        current = normalized;
+    }
+    return current;
+}
+
 function declarationValidation(value) {
     const report = validateBattleDeclaration(value, { strict: false });
     if (!report?.ok) throw new Error((report?.errors || []).slice(0, 5).map(error => `${error.path}：${error.message}`).join('\n') || '战场声明校验失败');
@@ -450,7 +472,7 @@ async function recognize() {
         const tagged = battleDeclarationFromFloor();
         const content = tagged ? tagged : extractJsonObject(await generateRaw([
             { role: 'system', content: DECLARATION_SYSTEM },
-            { role: 'user', content: JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state }, null, 2) },
+            { role: 'user', content: JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}) }, null, 2) },
         ], 2600));
         declaration = normalizeDeclaration(content);
         declarationValidation(declaration);
@@ -477,7 +499,9 @@ async function createBattle() {
                 { role: 'system', content: MODEL_SYSTEM },
                 { role: 'user', content: JSON.stringify({ declaration, mvu: tavernSnapshot.mvu.state }, null, 2) },
             ], 7000));
+            setStatus('CombatModel 已生成，正在由战斗数据检查 AI 审查修正…', 'working'); render();
         } catch (error) { setStatus(`CombatModel 生成失败，改用本地安全默认模型：${error.message}`, 'warn'); }
+        candidate = await superviseCombatModel(candidate, declaration, tavernSnapshot);
         model = mergeModel(candidate, declaration);
         repository = new BrowserCombatRepository();
         engine = new CombatEngine(repository);
@@ -501,7 +525,9 @@ async function execute(command) {
         await engine.command(battle, command);
         repository.commit(battle);
         mapIntent = null; mapMenu = null;
-        const notice = actionNoticeFromEvents(repository.events(battle.id).slice(-24), publicBattle(), command.actorId, command.type);
+        const recentEvents = repository.events(battle.id).slice(-24);
+        spawnAttackEffects(publicBattle(), recentEvents);
+        const notice = actionNoticeFromEvents(recentEvents, publicBattle(), command.actorId, command.type);
         showActionNotice(notice);
         if (notice) setStatus(notice.text, notice.kind);
         return true;
@@ -622,7 +648,7 @@ function mapMenuMarkup(state, actor) {
     const remaining = Number(state.turnBudget?.[actor.id]?.movementMeters ?? actor.speedMeters ?? 0);
     const basic = legal.find(ability => ability.id === 'basic-attack');
     const moveAttackButton = basic && manual && remaining > 0 ? `<button data-action="combat-map-menu-move-attack"><b>移动攻击</b><small>自动移动到最短基础攻击距离后攻击</small></button>` : '';
-    return `<div class="combat-map-menu" role="menu"><header><b>${escapeHtml(actor.name || actor.id)}</b><small>${manual ? `移动 ${remaining.toFixed(1)}m · 体力 ${actor.exertion ?? 0}/${actor.maxExertion ?? 0}` : '当前不可手操'}</small></header><button data-action="combat-map-menu-move" ${manual && remaining > 0 ? '' : 'disabled'}><b>移动到这里</b><small>剩余 ${remaining.toFixed(1)}m 落点</small></button>${moveAttackButton}${maneuverButtons}${abilityButtons || '<small class="combat-menu-empty">暂无可用技能</small>'}<button data-action="combat-map-menu-wait" ${manual ? '' : 'disabled'}><b>结束行动</b><small>恢复体力并交给本地演算继续</small></button></div>`;
+    return `<div class="combat-map-menu" role="menu"><header><b>${escapeHtml(actor.name || actor.id)}</b><small>${manual ? `移动 ${remaining.toFixed(1)}m · 体力 ${actor.exertion ?? 0}/${actor.maxExertion ?? 0}` : '当前不可手操'}</small></header><button data-action="combat-map-menu-wait" class="combat-menu-end" ${manual ? '' : 'disabled'}><b>结束行动</b><small>恢复体力并交给本地演算继续</small></button><button data-action="combat-map-menu-move" ${manual && remaining > 0 ? '' : 'disabled'}><b>移动到这里</b><small>剩余 ${remaining.toFixed(1)}m 落点</small></button>${moveAttackButton}${maneuverButtons}${abilityButtons || '<small class="combat-menu-empty">暂无可用技能</small>'}</div>`;
 }
 
 function showActionNotice(notice) {
@@ -769,7 +795,94 @@ function drawMap() {
         const hp = list.reduce((sum, unit) => sum + unit.hp + unit.thp, 0), maxHp = list.reduce((sum, unit) => sum + unit.maxHp, 0);
         context.textAlign = 'center'; context.fillStyle = '#f0c2b8'; context.font = '600 10px sans-serif'; context.fillText(`${list[0].name} ×${list.length}`, x, top); context.fillStyle = '#a9b7aa'; context.font = '9px sans-serif'; context.fillText(`总 HP ${hp}/${maxHp}`, x, top + 11);
     }
+    renderAttackEffects(context, transform, state);
     context.restore();
+}
+
+const ATTACK_EFFECT_OUTCOMES = { hit: { label: '命中', color: '#ffd27a' }, miss: { label: '未命中', color: '#9aa5a0' }, critical: { label: '暴击', color: '#ff6b6b' }, miracle: { label: '大成功', color: '#ffd700' }, blocked: { label: '格挡', color: '#7aa2ff' }, resisted: { label: '抵抗', color: '#b787f5' }, absorbed: { label: '吸收', color: '#69d8b8' }, evaded: { label: '闪避', color: '#8bd7f2' } };
+const attackEffectStyle = outcome => ATTACK_EFFECT_OUTCOMES[String(outcome || '').toLowerCase()] || { label: '结算', color: '#d0e6a5' };
+
+function spawnAttackEffects(state, events) {
+    const now = Date.now();
+    const knownIds = new Set((state?.combatants || []).map(unit => unit.id));
+    for (const event of events || []) {
+        if (event?.type !== 'action_resolved' && event?.type !== 'script_action_resolved') continue;
+        const attackerId = event.payload?.actorId;
+        if (!knownIds.has(attackerId)) continue;
+        for (const result of Array.isArray(event.payload?.results) ? event.payload.results : []) {
+            const targetId = result?.targetId;
+            if (!targetId || !knownIds.has(targetId)) continue;
+            const outcome = String(result?.outcome || result?.kind || 'hit').toLowerCase();
+            const style = attackEffectStyle(outcome);
+            attackEffects = attackEffects.filter(effect => !(effect.attackerId === attackerId && effect.targetId === targetId));
+            attackEffects.push({ attackerId, targetId, outcome, color: style.color, label: style.label, startedAt: now, duration: 2600 });
+        }
+    }
+    if (attackEffects.length) animateCombatEffects();
+}
+
+function animateCombatEffects() {
+    if (combatEffectFrame) cancelAnimationFrame(combatEffectFrame);
+    const step = () => {
+        const now = Date.now();
+        attackEffects = attackEffects.filter(effect => now - effect.startedAt < effect.duration);
+        if (!attackEffects.length) { combatEffectFrame = 0; return; }
+        drawMap();
+        combatEffectFrame = requestAnimationFrame(step);
+    };
+    combatEffectFrame = requestAnimationFrame(step);
+}
+
+function bezierPoint(a, mid, b, t) {
+    const u = 1 - t;
+    return { x: u * u * a.x + 2 * u * t * mid.x + t * t * b.x, y: u * u * a.y + 2 * u * t * mid.y + t * t * b.y };
+}
+
+function renderAttackEffects(context, transform, state) {
+    const now = Date.now();
+    for (const effect of attackEffects) {
+        const from = state.combatants.find(unit => unit.id === effect.attackerId);
+        const to = state.combatants.find(unit => unit.id === effect.targetId);
+        if (!from || !to) continue;
+        const progress = Math.min(1, (now - effect.startedAt) / effect.duration);
+        const a = transform.toCanvas(from.position);
+        const b = transform.toCanvas(to.position);
+        const arcHeight = Math.min(46, Math.max(10, Math.hypot(b.x - a.x, b.y - a.y) * 0.18));
+        const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - arcHeight };
+        const travel = Math.min(1, progress / 0.55);
+        const p = bezierPoint(a, mid, b, travel);
+        context.save();
+        context.globalAlpha = progress > 0.75 ? (1 - progress) / 0.25 : 1;
+        context.lineCap = 'round';
+        context.strokeStyle = effect.color;
+        context.lineWidth = 2.5;
+        context.beginPath(); context.moveTo(a.x, a.y); context.lineTo(p.x, p.y); context.stroke();
+        context.globalAlpha *= .35;
+        context.lineWidth = 6;
+        context.stroke();
+        context.globalAlpha = progress > 0.75 ? (1 - progress) / 0.25 : 1;
+        context.fillStyle = '#fff';
+        context.beginPath(); context.arc(p.x, p.y, 3.4, 0, Math.PI * 2); context.fill();
+        context.fillStyle = effect.color;
+        context.beginPath(); context.arc(p.x, p.y, 2, 0, Math.PI * 2); context.fill();
+        const flash = (progress - 0.55) / 0.45;
+        if (flash > 0) {
+            const radius = Math.max(4, 8 + flash * 16);
+            context.globalAlpha = (progress > 0.75 ? (1 - progress) / 0.25 : 1) * Math.max(0, 1 - flash);
+            context.strokeStyle = effect.color;
+            context.lineWidth = 2;
+            context.beginPath(); context.arc(b.x, b.y, radius, 0, Math.PI * 2); context.stroke();
+            context.globalAlpha = (progress > 0.75 ? (1 - progress) / 0.25 : 1) * Math.max(0, .55 - flash * .5);
+            context.fillStyle = effect.color;
+            context.beginPath(); context.arc(b.x, b.y, Math.max(3, 7 + flash * 8), 0, Math.PI * 2); context.fill();
+        }
+        context.globalAlpha = 1;
+        context.fillStyle = effect.color;
+        context.font = '700 11px sans-serif';
+        context.textAlign = 'center';
+        context.fillText(effect.label, b.x, b.y - 16);
+        context.restore();
+    }
 }
 
 function renderBattlefield(state) {
@@ -820,18 +933,6 @@ function renderBattlefield(state) {
             const menuActor = state?.combatants?.find(unit => unit.id === state.activeUnitId);
             const remaining = Number(state?.turnBudget?.[menuActor?.id]?.movementMeters ?? menuActor?.speedMeters ?? 0);
             if (moveButton && (state?.pauseReason?.type !== 'manual_turn' || remaining <= 0)) moveButton.remove();
-            const secondaryButtons = [...menu.querySelectorAll('[data-action="combat-map-menu-maneuver"]')];
-            if (secondaryButtons.length) {
-                const secondary = document.createElement('details');
-                secondary.className = 'combat-secondary-actions';
-                const summary = document.createElement('summary');
-                summary.textContent = '其他行动';
-                const body = document.createElement('div');
-                secondary.append(summary, body);
-                secondaryButtons.forEach(button => body.append(button));
-                const cancel = menu.querySelector('.combat-menu-cancel');
-                (cancel ? menu.insertBefore(secondary, cancel) : menu.append(secondary));
-            }
         }
         const canvas = $('#battle-orb-map');
         canvas?.addEventListener('wheel', event => {
@@ -1093,6 +1194,7 @@ function bindPanel() {
     $('#battle-orb-create')?.addEventListener('click', () => void createBattle());
     $('#battle-orb-narrate')?.addEventListener('click', () => void narrate());
     $('#battle-orb-write-verdict')?.addEventListener('change', event => { settings.writeVerdictBasis = Boolean(event.target.checked); saveSettings(); setStatus(settings.writeVerdictBasis ? '判断依据回写正文：战斗记录正式插入楼层后再创作剧情' : '只写回剧情：仅把剧情写回楼层', 'ok'); });
+    $('#battle-orb-recognize-hint')?.addEventListener('input', event => { settings.recognizeHint = String(event.target.value || '').trim(); saveSettings(); });
     $('#battle-orb-declaration')?.addEventListener('input', event => { try { declaration = normalizeDeclaration(JSON.parse(event.target.value)); } catch { declaration = null; } render(); });
     document.addEventListener('click', async event => {
         const action = event.target.closest('[data-action]')?.dataset.action;
@@ -1171,6 +1273,7 @@ function mount() {
             <button id="battle-orb-create" class="bo-step" type="button"><i>③</i><b>创建战场</b><small>CombatModel</small></button>
           </div>
           <label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label>
+          <label class="bo-hint-field"><span>识别提示（可选）</span><input id="battle-orb-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="敌人数量范围 / 规模 / 战术等额外提醒"></label>
           <div id="battle-orb-status" class="bo-status">准备就绪：点击“读取”</div>
           <div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div>
           <details class="bo-fold"><summary>当前 MVU 快照</summary><pre id="battle-orb-mvu">同步后显示</pre></details>
@@ -1225,6 +1328,11 @@ addEventListener('battle-orb:set-fab-visible', event => {
 
 mount();
 bootTrace('bootstrap-complete', { rootConnected: Boolean(document.getElementById(ROOT_ID)), fabExists: Boolean(document.getElementById(FAB_ID)) });
+globalThis.__battleOrbDebug = {
+    attackEffects: () => attackEffects.map(effect => ({ ...effect })),
+    settings: () => ({ ...settings }),
+    flowError: () => flowError ? { ...flowError } : null,
+};
 } catch (error) {
     bootTrace('bootstrap-fatal', { message: error?.message || String(error), stack: error?.stack || '' });
     console.error('[Battle Orb] 启动失败；请在扩展菜单运行诊断', error);
