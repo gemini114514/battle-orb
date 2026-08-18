@@ -1,4 +1,3 @@
-import { getQuickJS } from 'quickjs-emscripten';
 import { sha256, RULESET_VERSION } from './util.js';
 
 const MAX_SOURCE = 64 * 1024;
@@ -20,7 +19,15 @@ export function inspectScript(source, ability = {}) {
 
 export async function runScript(source, input) {
     const inspection = inspectScript(source, input.ability);
-    quickJsPromise ||= getQuickJS();
+    // The same engine module is shared with the Tavern browser extension. Do
+    // not put quickjs-emscripten in the static import graph: Tavern loads
+    // extension files directly and has no npm dependency directory there.
+    // Browser-injected abilities are deliberately rejected; the Node harness
+    // loads QuickJS lazily only when a scripted ability is actually tested.
+    if (typeof window !== 'undefined' || typeof document !== 'undefined') {
+        throw new Error('酒馆注入模式不执行脚本能力；请把该能力改写为本地规则能力后再开战');
+    }
+    quickJsPromise ||= import('quickjs-emscripten').then(module => module.getQuickJS());
     const QuickJS = await quickJsPromise;
     const runtime = QuickJS.newRuntime();
     runtime.setMemoryLimit(16 * 1024 * 1024);

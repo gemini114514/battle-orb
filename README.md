@@ -21,4 +21,6 @@ C:\SillyTavern\comic-orb-test-tavern\public\scripts\extensions\third-party\battl
 5. 在扩展内直接运行复用的二维本地权威战斗引擎，固定种子记录骰点、伤害、状态、位置、事件账本和胜负。
 6. 战斗结束后调用当前酒馆 AI 融合战报，把正文、`CheckResult` 和 `UpdateVariable / JSONPatch` 作为 assistant 楼层直接写回当前聊天。
 
+如果悬浮球没有出现，可在酒馆“扩展”菜单打开“Battle Orb 战斗球”：菜单提供重新挂载、显示/隐藏悬浮球、启动诊断和导出 DEBUG。诊断只记录脚本、样式、DOM、酒馆接口和错误状态，不记录 API Key 或聊天正文。
+
 `combat/` 是从独立端抽出的规则、引擎、模型校验、策略和战报 DSL；`combat/browser-repository.js` 只负责把持久化改为当前酒馆页面内存存储。根目录中的 Node 服务文件仅保留给原有自动化回归测试使用，酒馆运行 Battle Orb 不会调用它。

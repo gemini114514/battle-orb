@@ -1,12 +1,29 @@
-import { getContext } from '../../../extensions.js';
-import { CombatEngine } from './combat/engine.js';
-import { BrowserCombatRepository } from './combat/browser-repository.js';
-import { validateBattleDeclaration } from './combat/model.js';
-import { buildBattleResultDsl } from './combat/narrative-dsl.js';
+const VERSION = '0.2.0';
+globalThis.__battleOrbExpectedVersion = VERSION;
+const bootTrace = (stage, detail = {}) => {
+    const event = { time: new Date().toISOString(), stage, detail };
+    if (!Array.isArray(globalThis.__battleOrbBootEvents)) globalThis.__battleOrbBootEvents = [];
+    globalThis.__battleOrbBootEvents.push(event);
+    globalThis.__battleOrbBootEvents = globalThis.__battleOrbBootEvents.slice(-100);
+};
+bootTrace('bootstrap-entered', { version: VERSION, readyState: document.readyState });
+void import('./diagnose.js')
+    .then(module => module.install({ version: VERSION }))
+    .catch(error => console.warn('[Battle Orb] 诊断模块加载失败', error));
+
+(async function battleOrbBootstrap() {
+try {
+    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl }] = await Promise.all([
+        import('../../../extensions.js'),
+        import('./combat/engine.js'),
+        import('./combat/browser-repository.js'),
+        import('./combat/model.js'),
+        import('./combat/narrative-dsl.js'),
+    ]);
+    bootTrace('dependencies-loaded');
 
 const ROOT_ID = 'battle-orb-root';
 const FAB_ID = 'battle-orb-fab';
-const VERSION = '0.2.0';
 const MAX_FLOOR_CHARS = 9000;
 
 let context = null;
@@ -35,6 +52,15 @@ function notify(message, type = 'info') {
 function setStatus(message, kind = 'info') {
     const node = $('#battle-orb-status');
     if (node) { node.textContent = String(message || ''); node.dataset.kind = kind; }
+}
+
+function fabVisible() {
+    try { return localStorage.getItem('battle-orb.fab-visible') !== '0'; } catch { return true; }
+}
+
+function applyFabVisibility() {
+    const fab = document.getElementById(FAB_ID);
+    if (fab) fab.style.display = fabVisible() ? '' : 'none';
 }
 
 function activeContext() {
@@ -425,6 +451,7 @@ function mount() {
       <section id="battle-orb-field" class="bo-field" hidden><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div><button id="battle-orb-narrate" disabled>战斗完成后回写主 AI</button></header><div class="bo-map-wrap"><canvas id="battle-orb-map"></canvas></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details></section>`;
     document.body.append(root);
     const fab = document.createElement('button'); fab.id = FAB_ID; fab.type = 'button'; fab.textContent = '⚔'; fab.title = `Battle Orb ${VERSION}`; document.body.append(fab);
+    applyFabVisibility();
     const toggle = () => root.classList.toggle('open'); fab.addEventListener('click', toggle); $('#battle-orb-close').addEventListener('click', () => root.classList.remove('open'));
     bindPanel();
     tavernSnapshot = readTavern();
@@ -442,4 +469,23 @@ function mount() {
     console.info(`[Battle Orb] 已注入酒馆工作流 v${VERSION}，无独立端口`);
 }
 
+addEventListener('battle-orb:open-panel', () => {
+    if (!document.getElementById(ROOT_ID) && !mounted) mount();
+    document.getElementById(ROOT_ID)?.classList.add('open');
+});
+addEventListener('battle-orb:remount', () => {
+    if (!document.getElementById(ROOT_ID)) { mounted = false; mount(); }
+    document.getElementById(ROOT_ID)?.classList.add('open');
+});
+addEventListener('battle-orb:set-fab-visible', event => {
+    const fab = document.getElementById(FAB_ID);
+    if (fab) fab.style.display = event.detail?.visible === false ? 'none' : '';
+});
+
 mount();
+bootTrace('bootstrap-complete', { rootConnected: Boolean(document.getElementById(ROOT_ID)), fabExists: Boolean(document.getElementById(FAB_ID)) });
+} catch (error) {
+    bootTrace('bootstrap-fatal', { message: error?.message || String(error), stack: error?.stack || '' });
+    console.error('[Battle Orb] 启动失败；请在扩展菜单运行诊断', error);
+}
+})();
