@@ -1,4 +1,4 @@
-const VERSION = '0.7.6';
+const VERSION = '0.7.7';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -54,9 +54,18 @@ let busy = false;
 let mounted = false;
 
 const SETTINGS_KEY = 'battle-orb.settings';
-let settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false };
+const WORK_API_DEFAULT = { provider: 'tavern', baseUrl: '', path: '/v1/chat/completions', apiKey: '', model: '', temperature: 0.4, extraHeaders: '{}', extraBody: '{}', profiles: [], activeProfile: '' };
+const defaultWorkApi = () => ({ ...WORK_API_DEFAULT });
+let settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() } };
 let flowError = null;
-try { settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { /* keep defaults */ }
+try {
+    const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+    settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() }, ...stored };
+    for (const kind of ['declaration', 'modeling']) {
+        settings.api[kind] = { ...WORK_API_DEFAULT, ...(settings.api?.[kind] || {}) };
+        if (!Array.isArray(settings.api[kind].profiles)) settings.api[kind].profiles = [];
+    }
+} catch { /* keep defaults */ }
 const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} };
 
 let stageOverride = null;
@@ -506,15 +515,94 @@ function recordPrompt(stage, messages, detail = {}) {
     return entry;
 }
 
-async function generateRaw(messages, responseLength = 4000, label = 'LLM 调用') {
+// —— 工作 API 预设（移植自漫画球）——
+// 战场识别 / 战场建模 两种调用场景可由设置中的"工作 API 预设"接管：酒馆 API
+// （ctx.generateRaw）只是其中一个选项；选择自定义 API 时走下方 fetch 直连。
+const WORK_API_LABELS = { declaration: '战场识别', modeling: '战场建模' };
+const WORK_API_PREFIX = { declaration: 'decl', modeling: 'model' };
+const WORK_API_FIELDS = { 'base-url': 'baseUrl', 'path': 'path', 'model': 'model', 'key': 'apiKey', 'temperature': 'temperature', 'headers': 'extraHeaders', 'body': 'extraBody' };
+function normalizeWorkEndpoint(conf) {
+    const base = String(conf.baseUrl || '').trim().replace(/\/+$/, '');
+    if (!base) throw new Error('自定义 API 的 Base URL 未配置（设置 → 工作 API 预设）');
+    let path = String(conf.path || '/v1/chat/completions').trim();
+    if (/\/v1\/chat\/completions$/i.test(base) && !path) return base;
+    if (/\/v\d+$/i.test(base) && /^\/?v1\//i.test(path)) path = path.replace(/^\/?v1\//i, '/');
+    return `${base}/${path.replace(/^\/+/, '')}`;
+}
+function parseJsonObject(value, label = 'JSON 对象') {
+    if (value === undefined || value === null || value === '') return {};
+    const parsed = typeof value === 'string' ? (() => { try { return JSON.parse(value); } catch { return null; } })() : value;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${label} 不是有效 JSON 对象`);
+    return parsed;
+}
+function apiTextValue(value) {
+    if (typeof value === 'string') return value.trim();
+    if (!value || typeof value !== 'object') return '';
+    if (Array.isArray(value)) return value.map(apiTextValue).filter(Boolean).join('\n').trim();
+    if (typeof value.text === 'string') return value.text.trim();
+    if (typeof value.content === 'string') return value.content.trim();
+    if (Array.isArray(value.content)) return apiTextValue(value.content);
+    if (Array.isArray(value.parts)) return apiTextValue(value.parts);
+    return '';
+}
+function extractApiText(data) {
+    const candidates = [
+        data?.choices?.[0]?.message?.content,
+        data?.choices?.[0]?.text,
+        data?.output_text,
+        data?.output,
+        data?.result,
+        data?.response,
+        data?.text,
+        data?.candidates?.[0]?.content?.parts,
+        data?.data?.choices?.[0]?.message?.content,
+        data?.data?.text,
+    ];
+    for (const value of candidates) { const text = apiTextValue(value); if (text) return text; }
+    return '';
+}
+async function callCustomApi(conf, messages, responseLength) {
+    const endpoint = normalizeWorkEndpoint(conf);
+    const headers = { 'Content-Type': 'application/json', ...(String(conf.apiKey || '').trim() ? { Authorization: `Bearer ${conf.apiKey}` } : {}), ...parseJsonObject(conf.extraHeaders, '额外请求头') };
+    const body = {
+        model: conf.model,
+        messages,
+        temperature: Number.isFinite(Number(conf.temperature)) ? Number(conf.temperature) : 0.4,
+        ...(Number(responseLength) > 0 ? { max_tokens: Number(responseLength) } : {}),
+        ...parseJsonObject(conf.extraBody, '额外请求体'),
+    };
+    let response;
+    try {
+        response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body) });
+    } catch (error) {
+        throw new Error(`自定义 API 请求失败：${error?.message || error}`);
+    }
+    if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(`自定义 API 返回 HTTP ${response.status}：${String(detail || response.statusText).slice(0, 300)}`);
+    }
+    let data;
+    try { data = await response.json(); } catch (error) { throw new Error(`自定义 API 响应不是有效 JSON：${error?.message || error}`); }
+    const text = extractApiText(data);
+    if (!text) throw new Error('自定义 API 响应中没有可用的文本内容');
+    return text;
+}
+
+async function generateRaw(messages, responseLength = 4000, label = 'LLM 调用', apiKind = null) {
     const ctx = activeContext();
-    if (typeof ctx.generateRaw !== 'function') throw new Error('当前酒馆版本没有 generateRaw 扩展接口');
+    const conf = apiKind ? settings.api?.[apiKind] : null;
+    const custom = Boolean(conf && conf.provider === 'custom');
     const startedAt = performance.now();
     let ok = false;
     let response = null;
     let failure = null;
     try {
-        response = await withLlmTask(label, () => ctx.generateRaw({ prompt: messages, responseLength, trimNames: false }));
+        if (custom) {
+            response = await withLlmTask(label, () => callCustomApi(conf, messages, responseLength));
+        } else {
+            if (typeof ctx.generateRaw !== 'function') throw new Error('当前酒馆版本没有 generateRaw 扩展接口');
+            response = await withLlmTask(label, () => ctx.generateRaw({ prompt: messages, responseLength, trimNames: false }));
+        }
         ok = true;
         return response;
     } catch (error) {
@@ -875,7 +963,7 @@ async function superviseCombatModel(candidate, declaration, snapshot, maxRounds 
             const raw = await generateRaw([
                 { role: 'system', content: MODEL_SUPERVISOR_SYSTEM },
                 { role: 'user', content: JSON.stringify({ declaration, combatModel: current, ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2) },
-            ], 5000, `战斗数据审查（第二段 · 第 ${round + 1} 轮）`);
+            ], 5000, `战斗数据审查（第二段 · 第 ${round + 1} 轮）`, 'modeling');
             const parsed = extractJsonObject(raw);
             suggestions = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
         } catch (error) {
@@ -906,7 +994,7 @@ async function recognize() {
         const content = tagged ? tagged : extractJsonObject(await generateRaw([
             { role: 'system', content: DECLARATION_SYSTEM },
             { role: 'user', content: JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2) },
-        ], 2600, '识别战场声明'));
+        ], 2600, '识别战场声明', 'declaration'));
         declaration = normalizeDeclaration(content);
         declarationValidation(declaration);
         const declarationBox = $('#battle-orb-declaration'); if (declarationBox) declarationBox.value = JSON.stringify(declaration, null, 2);
@@ -941,7 +1029,7 @@ async function createBattle() {
                 candidate = extractJsonObject(await generateRaw([
                     { role: 'system', content: MODEL_SYSTEM },
                     { role: 'user', content: JSON.stringify(userPayload, null, 2) },
-                ], 7000, attempt ? `战斗建模（第一段 · 修复请求 ${attempt}）` : '战斗建模（第一段生成）'));
+                ], 7000, attempt ? `战斗建模（第一段 · 修复请求 ${attempt}）` : '战斗建模（第一段生成）', 'modeling'));
                 fatalErrors = checkCombatModelFatalErrors(mergeModel(candidate, declaration));
                 if (!fatalErrors.length) break;
                 recordDebug('modeling_phase1_fatal_errors', { attempt, errors: fatalErrors });
@@ -1750,11 +1838,38 @@ async function handleMapClick(event) {
     return true;
 }
 
+function renderWorkApiSection(kind) {
+    const label = WORK_API_LABELS[kind];
+    const prefix = WORK_API_PREFIX[kind];
+    const conf = settings.api[kind];
+    const profiles = conf.profiles || [];
+    const active = profiles.find(profile => profile.id === conf.activeProfile) || profiles[0];
+    return `<details class="bo-fold bo-work-api" data-bo-api-kind="${kind}" open>
+        <summary>${label} API</summary>
+        <label class="bo-setting"><span>调用来源</span><select id="battle-orb-api-${prefix}-provider"><option value="tavern" ${conf.provider !== 'custom' ? 'selected' : ''}>酒馆 API（generateRaw）</option><option value="custom" ${conf.provider === 'custom' ? 'selected' : ''}>自定义 API 预设</option></select></label>
+        <div class="bo-api-fields" ${conf.provider !== 'custom' ? 'hidden' : ''}>
+            <label class="bo-setting bo-api-field"><span>API Base URL</span><input id="battle-orb-api-${prefix}-base-url" type="text" inputmode="url" autocomplete="off" value="${escapeHtml(conf.baseUrl)}" placeholder="https://api.openai.com"></label>
+            <label class="bo-setting bo-api-field"><span>接口路径</span><input id="battle-orb-api-${prefix}-path" value="${escapeHtml(conf.path)}" placeholder="/v1/chat/completions"></label>
+            <label class="bo-setting bo-api-field"><span>模型</span><input id="battle-orb-api-${prefix}-model" value="${escapeHtml(conf.model)}" placeholder="gpt-4o-mini"></label>
+            <label class="bo-setting bo-api-field"><span>API Key</span><input id="battle-orb-api-${prefix}-key" type="password" autocomplete="off" value="${escapeHtml(conf.apiKey)}"></label>
+            <label class="bo-setting bo-api-field"><span>Temperature</span><input id="battle-orb-api-${prefix}-temperature" type="number" step="0.1" min="0" max="2" value="${Number(conf.temperature) ?? 0.4}"></label>
+            <label class="bo-setting bo-api-field"><span>额外请求头 JSON</span><input id="battle-orb-api-${prefix}-headers" value="${escapeHtml(conf.extraHeaders || '{}')}" placeholder='{"X-Custom":"value"}'></label>
+            <label class="bo-setting bo-api-field"><span>额外请求体 JSON</span><input id="battle-orb-api-${prefix}-body" value="${escapeHtml(conf.extraBody || '{}')}" placeholder='{"response_format":{"type":"json_object"}}'></label>
+        </div>
+        <div class="bo-profile-manager">
+            <label class="bo-setting"><span>已保存 API 实例</span><select id="battle-orb-api-${prefix}-profile">${profiles.map(profile => `<option value="${escapeHtml(profile.id)}" ${profile.id === active?.id ? 'selected' : ''}>${escapeHtml(profile.name)}</option>`).join('')}</select></label>
+            <label class="bo-setting"><span>实例名称</span><input id="battle-orb-api-${prefix}-profile-name" value="${escapeHtml(active?.name || '')}" placeholder="命名后点“新建实例”"></label>
+            <div class="bo-api-actions"><button class="bo-secondary" id="battle-orb-api-${prefix}-profile-new" type="button">新建实例</button><button class="bo-secondary" id="battle-orb-api-${prefix}-profile-save" type="button">保存实例</button><button class="bo-secondary" id="battle-orb-api-${prefix}-profile-delete" type="button">删除实例</button><button class="bo-secondary" id="battle-orb-api-${prefix}-import" type="button">导入实例集</button><input id="battle-orb-api-${prefix}-file" type="file" accept="application/json,.json" hidden><button class="bo-secondary" id="battle-orb-api-${prefix}-export" type="button">导出实例集</button><button class="bo-secondary" id="battle-orb-api-${prefix}-test" type="button">测试连接</button></div>
+            <div class="bo-api-status" id="battle-orb-api-${prefix}-status"></div>
+        </div>
+    </details>`;
+}
+
 function renderSettingsView() {
     const content = $('#battle-orb-settings-content');
     if (!content) return;
     const floorInfo = tavernSnapshot ? `<div id="battle-orb-floor" class="bo-floor">已读取 ${tavernSnapshot.messages.length} 楼 · MVU ${tavernSnapshot.mvu.applied} 条 Patch · ${tavernSnapshot.mvu.source}</div>` : '<div class="bo-floor">尚未读取楼层</div>';
-    content.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>战场建模</summary><label class="bo-setting"><input id="battle-orb-fast-modeling" type="checkbox" ${settings.fastModeling ? 'checked' : ''}><span>急速模式（无二阶段检查）</span><small>建模阶段仅做一次生成，跳过战斗数据检查 AI 的审查；适合追求速度与低消耗。</small></label><label class="bo-setting"><input id="battle-orb-rollback-modeling" type="checkbox" ${settings.rollbackModeling ? 'checked' : ''}><span>回滚模式</span><small>第一阶段成功即归档；第二阶段全部失败时立刻用第一阶段结果创建战场，不再报错或等待。</small></label></details><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示、判断依据与建模模式设置已持久化到浏览器本地。</p>`;
+    content.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>战场建模</summary><label class="bo-setting"><input id="battle-orb-fast-modeling" type="checkbox" ${settings.fastModeling ? 'checked' : ''}><span>急速模式（无二阶段检查）</span><small>建模阶段仅做一次生成，跳过战斗数据检查 AI 的审查；适合追求速度与低消耗。</small></label><label class="bo-setting"><input id="battle-orb-rollback-modeling" type="checkbox" ${settings.rollbackModeling ? 'checked' : ''}><span>回滚模式</span><small>第一阶段成功即归档；第二阶段全部失败时立刻用第一阶段结果创建战场，不再报错或等待。</small></label></details><details class="bo-fold" open><summary>工作 API 预设</summary><small class="bo-muted">为“战场识别”与“战场建模”两种调用场景各自配置调用来源：酒馆 API（generateRaw）为默认选项，也可改用自定义 API 预设（Base URL / 路径 / 模型 / Key / 额外头与体），并可按实例保存复用。</small>${renderWorkApiSection('declaration')}${renderWorkApiSection('modeling')}</details><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示、判断依据、建模模式与工作 API 预设设置已持久化到浏览器本地。</p>`;
     const mvu = content.querySelector('#battle-orb-mvu');
     if (mvu) mvu.textContent = tavernSnapshot ? JSON.stringify(tavernSnapshot.mvu.state, null, 2) : '同步后显示';
 }
@@ -1921,6 +2036,129 @@ function bindPanel() {
         if (event.target.id === 'battle-orb-write-verdict') { settings.writeVerdictBasis = Boolean(event.target.checked); saveSettings(); setStatus(settings.writeVerdictBasis ? '判断依据回写正文：战斗记录正式插入楼层后再创作剧情' : '只写回剧情：仅把剧情写回楼层', 'ok'); return; }
         if (event.target.id === 'battle-orb-fast-modeling') { settings.fastModeling = Boolean(event.target.checked); saveSettings(); setStatus(settings.fastModeling ? '急速模式：创建战场时将跳过二阶段检查' : '已关闭急速模式，恢复两段式审查', 'ok'); return; }
         if (event.target.id === 'battle-orb-rollback-modeling') { settings.rollbackModeling = Boolean(event.target.checked); saveSettings(); setStatus(settings.rollbackModeling ? '回滚模式：二阶段失败将立即用第一阶段结果创建战场' : '已关闭回滚模式', 'ok'); return; }
+        const apiFieldMatch = String(event.target.id).match(/^battle-orb-api-(decl|model)-(.+)$/);
+        if (apiFieldMatch && Object.hasOwn(WORK_API_FIELDS, apiFieldMatch[2])) {
+            const kind = apiFieldMatch[1] === 'decl' ? 'declaration' : 'modeling';
+            const field = WORK_API_FIELDS[apiFieldMatch[2]];
+            settings.api[kind][field] = field === 'temperature' ? Number(event.target.value) : String(event.target.value);
+            saveSettings();
+            return;
+        }
+    });
+    document.addEventListener('change', event => {
+        const provider = event.target.closest('#battle-orb-api-decl-provider, #battle-orb-api-model-provider');
+        if (provider) {
+            const kind = provider.id.includes('decl') ? 'declaration' : 'modeling';
+            settings.api[kind].provider = provider.value;
+            saveSettings();
+            const fields = provider.closest('.bo-work-api')?.querySelector('.bo-api-fields');
+            if (fields) fields.hidden = provider.value !== 'custom';
+            setStatus(`“${WORK_API_LABELS[kind]}”调用来源：${provider.value === 'custom' ? '自定义 API 预设' : '酒馆 API'}`, 'ok');
+            return;
+        }
+        const profileSelect = event.target.closest('#battle-orb-api-decl-profile, #battle-orb-api-model-profile');
+        if (profileSelect) {
+            const kind = profileSelect.id.includes('decl') ? 'declaration' : 'modeling';
+            const profile = settings.api[kind].profiles.find(item => item.id === profileSelect.value);
+            if (profile) {
+                settings.api[kind] = { ...WORK_API_DEFAULT, ...profile.config, profiles: settings.api[kind].profiles, activeProfile: profile.id };
+                saveSettings();
+                renderSettingsView();
+            }
+            return;
+        }
+        const fileInput = event.target.closest('[id^="battle-orb-api-"][id$="-file"]');
+        if (fileInput && fileInput.files?.length) {
+            const kind = fileInput.id.includes('decl') ? 'declaration' : 'modeling';
+            const reader = new FileReader();
+            reader.onload = () => {
+                try {
+                    const list = JSON.parse(String(reader.result || ''));
+                    if (!Array.isArray(list)) throw new Error('实例集必须是 JSON 数组');
+                    settings.api[kind].profiles = list.filter(item => item && item.id).map(item => ({ id: String(item.id), name: String(item.name || '未命名'), config: item.config || {} }));
+                    settings.api[kind].activeProfile = settings.api[kind].profiles[0]?.id || '';
+                    saveSettings(); renderSettingsView();
+                    notify(`已导入 ${settings.api[kind].profiles.length} 个实例`, 'success');
+                } catch (error) { notify(`导入失败：${error.message}`, 'error'); }
+            };
+            reader.readAsText(fileInput.files[0]);
+            return;
+        }
+    });
+    document.addEventListener('click', event => {
+        const apiBtn = event.target.closest('[id^="battle-orb-api-"][id$="-profile-new"], [id^="battle-orb-api-"][id$="-profile-save"], [id^="battle-orb-api-"][id$="-profile-delete"], [id^="battle-orb-api-"][id$="-import"], [id^="battle-orb-api-"][id$="-export"], [id^="battle-orb-api-"][id$="-test"]');
+        if (!apiBtn) return;
+        const match = String(apiBtn.id).match(/^battle-orb-api-(decl|model)-(.+)$/);
+        if (!match) return;
+        const kind = match[1] === 'decl' ? 'declaration' : 'modeling';
+        const op = match[2];
+        const conf = settings.api[kind];
+        const prefix = WORK_API_PREFIX[kind];
+        const syncFields = () => {
+            const v = suffix => document.querySelector(`#battle-orb-api-${prefix}-${suffix}`)?.value ?? '';
+            conf.baseUrl = String(v('base-url') || '').trim();
+            conf.path = String(v('path') || '').trim();
+            conf.model = String(v('model') || '').trim();
+            conf.apiKey = String(v('key') || '');
+            conf.temperature = Number.isFinite(Number(v('temperature'))) ? Number(v('temperature')) : 0.4;
+            conf.extraHeaders = String(v('headers') || '{}').trim();
+            conf.extraBody = String(v('body') || '{}').trim();
+        };
+        if (op === 'profile-new') {
+            syncFields();
+            const name = String(document.querySelector(`#battle-orb-api-${prefix}-profile-name`)?.value || '').trim() || `${WORK_API_LABELS[kind]} API ${conf.profiles.length + 1}`;
+            const profile = { id: id('api'), name, config: { ...conf, profiles: undefined, activeProfile: undefined } };
+            conf.profiles.push(profile);
+            conf.activeProfile = profile.id;
+            saveSettings(); renderSettingsView();
+            notify(`已新建 API 实例：${name}`, 'success');
+            return;
+        }
+        if (op === 'profile-save') {
+            syncFields();
+            const active = conf.profiles.find(item => item.id === conf.activeProfile);
+            if (!active) { notify('请先在“已保存 API 实例”中选择一个实例，或点“新建实例”', 'warn'); return; }
+            active.name = String(document.querySelector(`#battle-orb-api-${prefix}-profile-name`)?.value || '').trim() || active.name;
+            active.config = { ...conf, profiles: undefined, activeProfile: undefined };
+            saveSettings(); renderSettingsView();
+            notify(`已保存 API 实例：${active.name}`, 'success');
+            return;
+        }
+        if (op === 'profile-delete') {
+            const active = conf.profiles.find(item => item.id === conf.activeProfile);
+            if (!active || !globalThis.confirm(`确定删除 API 实例“${active.name}”？`)) return;
+            conf.profiles = conf.profiles.filter(item => item.id !== active.id);
+            conf.activeProfile = conf.profiles[0]?.id || '';
+            saveSettings(); renderSettingsView();
+            notify('API 实例已删除', 'success');
+            return;
+        }
+        if (op === 'export') {
+            const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([JSON.stringify(conf.profiles, null, 2)], { type: 'application/json' })); link.download = `战斗球-${WORK_API_LABELS[kind]}-API实例集.json`; link.click(); URL.revokeObjectURL(link.href);
+            notify(`已导出 ${conf.profiles.length} 个实例`, 'success');
+            return;
+        }
+        if (op === 'import') {
+            const file = document.querySelector(`#battle-orb-api-${prefix}-file`);
+            if (file) file.click();
+            return;
+        }
+        if (op === 'test') {
+            void (async () => {
+                syncFields();
+                const status = document.querySelector(`#battle-orb-api-${prefix}-status`);
+                if (status) { status.textContent = '正在发送测试…'; status.dataset.kind = ''; }
+                try {
+                    await generateRaw([{ role: 'user', content: '测试连接，请回复 OK' }], 200, `${WORK_API_LABELS[kind]} API 测试`, kind);
+                    if (status) { status.textContent = `测试成功（${WORK_API_LABELS[kind]} API 正常响应）`; status.dataset.kind = 'ok'; }
+                    notify(`${WORK_API_LABELS[kind]} API 测试成功`, 'success');
+                } catch (error) {
+                    if (status) { status.textContent = `测试失败：${error.message}`; status.dataset.kind = 'error'; }
+                    notify(`测试失败：${error.message}`, 'error');
+                }
+            })();
+            return;
+        }
     });
     document.addEventListener('click', async event => {
         const action = event.target.closest('[data-action]')?.dataset.action;
