@@ -1,4 +1,4 @@
-const VERSION = '0.16.0';
+const VERSION = '0.17.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -48,6 +48,9 @@ const COMBAT_STRATEGY_PRESETS = Object.freeze({
 let deployState = { strategyText: '', activePreset: null, assignments: {} };
 let autoState = { running: false, step: '', startedAt: 0, attempt: 0, failed: false };
 let autoCancelRequested = false;
+// 胜负横幅：入场动画只播一次；回写主 AI 期间显示进度态。
+let resultAnimatedKey = null;
+let narrateProgress = null;
 let mapZoom = 1;
 let mapPan = { x: 0, y: 0 };
 let mapIntent = null;
@@ -1589,6 +1592,7 @@ function resetBattleState() {
     battle = null; engine = null; repository = null; model = null;
     deployState = { strategyText: '', activePreset: null, assignments: {} };
     mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; actionPreview = null;
+    resultAnimatedKey = null; narrateProgress = null;
 }
 
 async function execute(command) {
@@ -2269,7 +2273,16 @@ function renderBattleResult() {
     const text = win ? '胜利' : lose ? '失败' : '平局';
     const sub = `第 ${final.rounds ?? state.round ?? 0} 回合结束 · ${win ? '敌方已被全灭' : lose ? '我方已无法再战' : '双方均无法再战'}`;
     slot.classList.add('bo-result-overlay');
-    slot.innerHTML = `<div class="combat-result ${kind}"><div class="combat-result-text">${text}</div><div class="combat-result-sub">${sub}</div></div>`;
+    if (narrateProgress === 'running') {
+        // 回写主 AI 进度：保持胜负配色，显示旋转进度指示，禁止重复点击。
+        slot.innerHTML = `<div class="combat-result ${kind} combat-result--busy"><div class="combat-result-spinner" aria-hidden="true"></div><div class="combat-result-text">${text}</div><div class="combat-result-sub">正在回写主 AI…</div></div>`;
+        return;
+    }
+    // 入场动画只播一次：同一场战斗的同一份战果重复渲染时不再重新播放。
+    const key = `${state.id}:${final.eventHash || '?'}:${final.rounds ?? state.round ?? 0}`;
+    const animated = resultAnimatedKey === key;
+    if (!animated) resultAnimatedKey = key;
+    slot.innerHTML = `<div class="combat-result ${kind}${animated ? ' combat-result-static' : ''}" role="button" tabindex="0" title="点击回写主 AI"><div class="combat-result-text">${text}</div><div class="combat-result-sub">${sub} · 点击回写主 AI</div></div>`;
 }
 
 function previewRowMarkup(row) {
@@ -2516,7 +2529,7 @@ async function narrate() {
     if (!state || state.status !== 'completed' || busy) return;
     const ctx = activeContext(); const battleId = state.id;
     if (ctx.chat?.some(message => message.extra?.battleOrb?.battleId === battleId)) return notify('这场战斗已经回写过当前聊天', 'info');
-    busy = true; setStatus('正在回写战报…', 'working'); render();
+    busy = true; narrateProgress = 'running'; setStatus('正在回写战报…', 'working'); render();
     try {
         const events = repository.events(battleId);
         const final = state.finalResult;
@@ -2556,8 +2569,13 @@ async function narrate() {
         await ctx.saveChat();
         setStatus(settings.writeVerdictBasis ? '战斗记录与剧情已写回当前酒馆楼层' : '剧情已写回当前酒馆楼层（仅剧情）', 'ok');
         notify('Battle Orb 战报已回写当前酒馆聊天', 'success');
-    } catch (error) { notify(`战后回写失败：${error.message}`, 'error'); }
-    finally { busy = false; render(); }
+        // 回写成功：关闭战斗球界面并重置到初始状态（① 读取）。
+        const panel = $(`#${PANEL_ID}`);
+        if (panel) panel.classList.remove('open');
+        startNewBattle();
+        return;
+    } catch (error) { narrateProgress = null; notify(`战后回写失败：${error.message}`, 'error'); }
+    finally { busy = false; narrateProgress = null; render(); }
 }
 
 async function handleMapClick(event) {
@@ -2719,6 +2737,7 @@ function startNewBattle() {
     deployState = { strategyText: '', activePreset: null, assignments: {} };
     mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; actionNotice = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
     flowError = null; stageOverride = 'read'; lastStage = null; lastAutoKey = ''; autoState.failed = false; autoCancelRequested = false;
+    resultAnimatedKey = null; narrateProgress = null;
     setStatus('已重置；从读取阶段开始新战斗', 'ok');
     render();
 }
@@ -2732,8 +2751,9 @@ function resetToStageOne() {
 
 function bindPanel() {
     document.addEventListener('click', event => {
-        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-enter-battle, #battle-orb-back-create, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts, #battle-orb-preview-confirm, #battle-orb-preview-cancel, #battle-orb-auto, #battle-orb-auto-cancel, [data-deploy-preset]');
+        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-enter-battle, #battle-orb-back-create, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts, #battle-orb-preview-confirm, #battle-orb-preview-cancel, #battle-orb-auto, #battle-orb-auto-cancel, [data-deploy-preset], .combat-result');
         if (!target) return;
+        if (target.classList.contains('combat-result')) { void narrate(); return; }
         const presetButton = event.target.closest('[data-deploy-preset]');
         if (presetButton) {
             const preset = COMBAT_STRATEGY_PRESETS[presetButton.dataset.deployPreset];
