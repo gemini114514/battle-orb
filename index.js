@@ -1,4 +1,4 @@
-const VERSION = '0.12.0';
+const VERSION = '0.13.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -2145,6 +2145,7 @@ function autoCardMarkup() {
         ${running ? `<button id="battle-orb-auto-cancel" class="bo-secondary bo-auto-cancel" type="button">取消任务</button>` : ''}
       </div>
       ${action}
+      <label class="bo-hint-field"><span>剧情识别提示（可选）</span><input id="battle-orb-auto-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="可选：一键模式识别剧情不稳时，写清关键设定，例如：静香是友方NPC，敌方是走廊尸群…" ${running ? 'disabled' : ''}></label>
       <p class="bo-muted">默认隐藏详细的分步页面；如需手动分步控制，请在设置中开启 DEBUG 模式。</p>
     </section>`;
 }
@@ -2827,7 +2828,7 @@ function bindPanel() {
             render();
             return;
         }
-        if (event.target.id === 'battle-orb-recognize-hint') { settings.recognizeHint = String(event.target.value || '').trim(); saveSettings(); return; }
+        if (event.target.id === 'battle-orb-recognize-hint' || event.target.id === 'battle-orb-auto-recognize-hint') { settings.recognizeHint = String(event.target.value || '').trim(); saveSettings(); return; }
         if (event.target.id === 'battle-orb-unit-hint') { settings.unitHint = String(event.target.value || '').trim(); saveSettings(); return; }
         if (event.target.id === 'battle-orb-declaration') { try { declaration = normalizeDeclaration(JSON.parse(event.target.value)); } catch { declaration = null; } render(); return; }
         if (event.target.id === 'battle-orb-write-verdict') { settings.writeVerdictBasis = Boolean(event.target.checked); saveSettings(); setStatus(settings.writeVerdictBasis ? '判断依据回写正文：战斗记录正式插入楼层后再创作剧情' : '只写回剧情：仅把剧情写回楼层', 'ok'); return; }
