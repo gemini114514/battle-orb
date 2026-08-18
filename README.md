@@ -2,13 +2,15 @@
 
 Battle Orb 现在是 SillyTavern / Comic Orb 工作流内的原生第三方扩展，不需要启动独立服务、不需要 iframe，也不需要额外端口。
 
-扩展源码位于仓库的 `extension/` 目录；将该目录内容复制到下面的酒馆扩展目录即可：
+仓库根目录就是可安装的酒馆扩展入口；使用酒馆的第三方扩展安装器安装本仓库即可：
 
 扩展位置：
 
 ```text
 C:\SillyTavern\comic-orb-test-tavern\public\scripts\extensions\third-party\battle-orb
 ```
+
+手动安装时，将仓库根目录的 `manifest.json`、`index.js`、`style.css` 和 `combat/` 复制到上面的目录。`extension/` 目录保留为同一份扩展源码备份。
 
 刷新或重启酒馆后，点击右下角 Battle Orb 按钮即可使用：
 

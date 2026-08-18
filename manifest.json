@@ -1,0 +1,13 @@
+{
+  "display_name": "Battle Orb 战斗球",
+  "loading_order": 55,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "gemini114514",
+  "co_author": "gemini114514",
+  "license": "CC BY-NC-SA 4.0",
+  "version": "0.2.0",
+  "homePage": "https://github.com/gemini114514/battle-orb"
+}
