@@ -41,7 +41,7 @@ export function inspectScript(source, ability = {}) {
     if (textSize > MAX_SOURCE) throw new Error('脚本超过 64KB');
     const forbidden = /\b(?:fetch|XMLHttpRequest|WebSocket|require|process|Deno|Bun|importScripts|eval|Function|document|window|location)\b|\bimport\s*\(/;
     if (forbidden.test(text)) throw new Error('脚本请求了沙箱禁止能力');
-    const apiNames = ['state', 'distance', 'unitsInArea', 'd100', 'd', 'attack', 'damage', 'heal', 'status', 'dispel', 'move', 'push', 'resource', 'summon', 'log', 'event'];
+    const apiNames = ['state', 'distance', 'unitsInArea', 'd100', 'd', 'attack', 'damage', 'heal', 'status', 'dispel', 'move', 'push', 'resource', 'modify', 'summon', 'log', 'event'];
     const capabilities = [...new Set([...text.matchAll(/api\.([a-zA-Z]+)\s*\(/g)].map(match => match[1]).filter(name => apiNames.includes(name)))];
     return { hash: scriptHash(text), rulesetVersion: RULESET_VERSION, ability: { id: ability.id, name: ability.name }, source: text, size: textSize, capabilities, limits: { executionMs: 25, memoryMb: 16, maxEffects: MAX_EFFECTS, triggerDepth: 8 } };
 }
@@ -94,11 +94,20 @@ export async function runScript(source, input) {
                   damageType: options && options.damageType || String(input.ability && input.ability.type || 'physical'),
               }),
               heal: (targetId, amount) => emit("heal", { targetId: String(targetId), amount: Number(amount) }),
-              status: (targetId, status, duration = 1) => emit("status", { targetId: String(targetId), status: String(status), duration: Number(duration) }),
+              status: (targetId, statusOrId, duration = 1) => {
+                  const base = typeof statusOrId === 'object' && statusOrId !== null ? statusOrId : { id: String(statusOrId) };
+                  emit("status", { targetId: String(targetId), status: { ...base, id: String(base.id), duration: base.duration !== undefined ? Number(base.duration) : Number(duration) } });
+              },
               dispel: (targetId, status) => emit("dispel", { targetId: String(targetId), status: String(status) }),
               move: (targetId, x, y) => emit("move", { targetId: String(targetId), position: { x: Number(x), y: Number(y) } }),
               push: (targetId, dx, dy) => emit("push", { targetId: String(targetId), dx: Number(dx), dy: Number(dy) }),
               resource: (targetId, resource, delta) => emit("resource", { targetId: String(targetId), resource: String(resource), delta: Number(delta) }),
+              modify: (targetId, field, delta, options = {}) => emit("modify", {
+                  targetId: String(targetId),
+                  field: String(field),
+                  delta: Number(delta),
+                  rounds: options && options.rounds !== undefined ? Math.max(0, Math.floor(Number(options.rounds))) : 0,
+              }),
               summon: (templateId, zoneId, count = 1, x = null, y = null) => emit("summon", { templateId: String(templateId), zoneId: String(zoneId), count: Number(count), x: x === null ? null : Number(x), y: y === null ? null : Number(y) }),
               log: (message) => emit("log", { message: String(message) }),
               event: () => ({ type: input.event?.type || null, actor: input.actor || null, target: input.event?.target || null })

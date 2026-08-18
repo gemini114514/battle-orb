@@ -1,4 +1,4 @@
-const VERSION = '0.8.2';
+const VERSION = '0.8.3';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -425,11 +425,16 @@ const t = api.state().targets[0];
 api.attack(t.id);                                // 第一击：权威战斗检定
 api.attack(t.id);                                // 第二击：再次独立检定（连击=多次调用）
 【攻击检定铁律】对敌人造成伤害的攻击必须用 api.attack（与普通攻击完全一致的权威检定：D100+攻击修正+位阶修正+能力修正 vs 目标防御DC，原始 96-100 奇迹、1-5 灾难，命中后经护甲/抗性减伤由引擎结算伤害）。严禁用 api.d100 手搓"命中率/暴击"再 api.damage 补伤害——那是绕过防御 DC 的非法攻击检定；api.damage 只用于不经过战斗检定的直接效果（持续伤害 DoT、环境伤害、自伤、固定扣血等）。
-可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（返回半径 r 内单位对象数组，每项含 id/name/side/hp/position，可直接遍历 unit.id/unit.side/unit.position 等）、api.d100()/api.d(n)（确定性骰，仅用于非检定的脚本判定）、api.attack(targetId, options?)，api.damage(targetId,amount,type?)，api.heal、api.status、api.dispel、api.move、api.push(targetId,dx,y)、api.resource、api.summon(templateId,zoneId,count)、api.log。信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责命中/护甲/死亡/碰撞结算。
+可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies，单位对象含 id/name/side/hp/maxHp/ep/maxEp/thp/attack/magicAttack/attackModifier/defenseDC/initiativeDC/armor/resistance/tierCorrection/speedMeters/visionMeters/exertion/position/statuses/attributes，可直接读取判定属性做条件）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（返回半径 r 内单位对象数组，字段同上）、api.d100()/api.d(n)（确定性骰，仅用于非检定的脚本判定）、api.attack(targetId, options?)、api.damage(targetId,amount,type?)、api.heal(targetId,amount)、api.status(targetId,status,时长)、api.dispel(targetId,status)、api.move、api.push(targetId,dx,y)、api.resource(targetId,hp|ep|thp,delta)、api.modify(targetId,字段,delta,{rounds?})、api.summon(templateId,zoneId,count)、api.log。
+【属性修改】api.modify 可对任意数值属性即时增减（可带 rounds 回合到期自动还原），字段支持攻击/防御/检定全量：attack、magicAttack、attackModifier、defenseDC、initiativeDC、armor、resistance、tierCorrection、maxHp、maxEp、hp、ep、thp、speedMeters、visionMeters、exertion、attributes.strengthModifier/dexterityModifier/constitutionModifier/spiritModifier/charismaModifier。例如防御架势：api.modify(t.id, "defenseDC", 5, { rounds: 2 })。
+【状态条件加成】api.status 支持传对象以携带机械加成，如 api.status(t.id, { id:"stance", name:"御守架势", defenseBonus:8, vsMelee:true }, 3) 表示"被近战攻击时防御 DC +8，持续 3 回合"；条件字段：vsAttackType(physical|magical|hybrid|melee|ranged)、vsMelee(布尔)、vsAbilityId(能力 id 或 id 数组)；加成字段：defenseBonus(提防御 DC)、attackBonus(提攻击检定)、damagePerRound(每回合持续伤害)、healPerRound(每回合持续回复)。无条件字段时对所有攻击生效。示例（对任意敌我单位施放）：api.status(target.id, { id:"poison", damagePerRound: 3 }, 3)。
+信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责命中/护甲/死亡/碰撞结算。
 
 【被动技能（事件阶段脚本）】被动写在 combatant 的 passives 数组，每项含 id/name/trigger/script。当前支持的触发器：
-- trigger:"on_kill"：当该单位击杀任意敌人后立即触发。脚本里 api.state().actor 是击杀者（本被动拥有者），api.event() 返回 { type:"on_kill", target:<被击杀的敌人> }，可用 api.heal/api.status/api.damage 等发射效果。示例（击杀回复 10HP）：
+- trigger:"on_kill"：当该单位击杀任意敌人后立即触发。脚本里 api.state().actor 是击杀者（本被动拥有者），api.event() 返回 { type:"on_kill", target:<被击杀的敌人> }，可用 api.heal/api.status/api.modify/api.attack 等发射效果。示例（击杀回复 10HP）：
 passives:[{ "id":"bio-siphon","name":"生体噬元","trigger":"on_kill","script":"const a = api.state().actor; api.heal(a.id, 10); api.log('击杀回复 10 点生命值');" }]
+- 常驻/姿态型被动：用 api.modify 或 api.status 给自身或队友附加属性/条件加成。示例（被近战武器攻击时防御 DC +8；被特定武器 basic-attack 攻击时防御 DC +5）：
+passives:[{ "id":"iron-stance","name":"铁御","trigger":"on_kill","script":"const a = api.state().actor; api.status(a.id, { id:'stance', name:'铁御', defenseBonus:8, vsMelee:true }, 99); api.modify(a.id, 'defenseDC', 5, { rounds: 99 }); api.log('铁御展开，近战攻击防御提升');" }]
 被动脚本与能力脚本一样会进入本地沙箱审批，禁止 fetch/eval/DOM。
 
 【基础攻击·硬性要求（违反即被退回修复）】

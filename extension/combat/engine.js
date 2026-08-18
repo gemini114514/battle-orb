@@ -725,6 +725,13 @@ export class CombatEngine {
             // an explicit break or an action that reveals the unit.  Ordinary
             // combat effects retain the existing countdown semantics.
             unit.statuses = unit.statuses.map(status => status.duration === undefined ? status : ({ ...status, duration: Number(status.duration || 1) - 1 })).filter(status => status.duration === undefined || status.duration > 0);
+            if (Array.isArray(unit.statMods) && unit.statMods.length) {
+                for (const mod of unit.statMods) {
+                    mod.remaining = Number(mod.remaining) - 1;
+                    if (mod.remaining <= 0) this.changeStat(unit, mod.field, -Number(mod.delta));
+                }
+                unit.statMods = unit.statMods.filter(mod => mod.remaining > 0);
+            }
             for (const key of Object.keys(unit.cooldowns)) unit.cooldowns[key] = Math.max(0, Number(unit.cooldowns[key]) - 1);
             if (canonical(beforeStatuses) !== canonical(unit.statuses)) { this.event(state, 'status_refreshed', { unitId: unit.id, before: beforeStatuses, after: unit.statuses }); statusChanged.push(unit.id); }
             const wasSpent = Boolean(unit._spentExertionLastRound);
@@ -1247,8 +1254,8 @@ export class CombatEngine {
             // or an unseen balance multiplier; melee contact immediately
             // reveals the attacker afterwards through updateKnowledge above.
             const roll = rng.d100(evasive ? 'disadvantage' : ambush || actor.statuses.some(item => item.id === 'advantage') ? 'advantage' : actor.statuses.some(item => item.id === 'disadvantage') ? 'disadvantage' : 'normal');
-            const total = roll.selected + actor.attackModifier + actor.tierCorrection + ability.modifier;
-            const effectiveDefenseDC = target.defenseDC + target.statuses.reduce((sum, status) => sum + Number(status.defenseBonus || 0), 0);
+            const total = roll.selected + actor.attackModifier + actor.tierCorrection + ability.modifier + this.statusBonusSum(actor.statuses, ability, 'attackBonus');
+            const effectiveDefenseDC = target.defenseDC + this.statusBonusSum(target.statuses, ability, 'defenseBonus');
             const hit = total >= effectiveDefenseDC;
             let damage = null, applied = null;
             if (hit) {
@@ -1262,7 +1269,7 @@ export class CombatEngine {
                 }
                 this.checkBossPhase(state, target);
             }
-            const result = { targetId: target.id, rawRolls: roll.rolls, selected: roll.selected, rngIndex: roll.rngIndex, modifier: actor.attackModifier + actor.tierCorrection + ability.modifier, total, defenseDC: effectiveDefenseDC, ambush, outcome: roll.selected <= 5 ? 'disaster' : roll.selected >= 96 ? 'miracle' : hit ? 'hit' : 'miss', damage, applied };
+            const result = { targetId: target.id, rawRolls: roll.rolls, selected: roll.selected, rngIndex: roll.rngIndex, modifier: total - roll.selected, total, defenseDC: effectiveDefenseDC, ambush, outcome: roll.selected <= 5 ? 'disaster' : roll.selected >= 96 ? 'miracle' : hit ? 'hit' : 'miss', damage, applied };
             const attackBasis = {
                 actor: { id: actor.id, attack: actor.attack, magicAttack: actor.magicAttack, attackModifier: actor.attackModifier, tierCorrection: actor.tierCorrection },
                 ability: { id: ability.id, name: ability.name, type: ability.type, power: ability.power, modifier: ability.modifier, minRangeMeters: ability.minRangeMeters, maxRangeMeters: ability.maxRangeMeters, aoe: ability.aoe },
@@ -1308,8 +1315,8 @@ export class CombatEngine {
         this.emitNoise(state, actor, { reason: 'attack', radiusMeters: actor.intelProfile?.attackNoiseMeters, rng });
         const evasive = target.statuses.find(item => item.id === 'evasive' && Number(item.remainingAttacks || 0) > 0);
         const roll = rng.d100(evasive ? 'disadvantage' : ambush || actor.statuses.some(item => item.id === 'advantage') ? 'advantage' : actor.statuses.some(item => item.id === 'disadvantage') ? 'disadvantage' : 'normal');
-        const total = roll.selected + actor.attackModifier + actor.tierCorrection + ability.modifier;
-        const effectiveDefenseDC = target.defenseDC + target.statuses.reduce((sum, status) => sum + Number(status.defenseBonus || 0), 0);
+        const total = roll.selected + actor.attackModifier + actor.tierCorrection + ability.modifier + this.statusBonusSum(actor.statuses, ability, 'attackBonus');
+        const effectiveDefenseDC = target.defenseDC + this.statusBonusSum(target.statuses, ability, 'defenseBonus');
         const hit = total >= effectiveDefenseDC;
         let damage = null, applied = null;
         if (hit) {
@@ -1589,6 +1596,18 @@ export class CombatEngine {
         if (!this.afterAction(state)) await this.advanceUntilPause(state, state.mode === 'manual' ? 1000 : 10000);
     }
 
+    scriptUnitSnapshot(unit) {
+        return {
+            id: unit.id, name: unit.name, side: unit.side,
+            hp: unit.hp, maxHp: unit.maxHp, ep: unit.ep, maxEp: unit.maxEp, thp: unit.thp,
+            attack: unit.attack, magicAttack: unit.magicAttack, attackModifier: unit.attackModifier,
+            defenseDC: unit.defenseDC, initiativeDC: unit.initiativeDC, armor: unit.armor, resistance: unit.resistance,
+            tierCorrection: unit.tierCorrection, speedMeters: unit.speedMeters, visionMeters: unit.visionMeters,
+            exertion: unit.exertion, maxExertion: unit.maxExertion,
+            position: unit.position, statuses: unit.statuses, attributes: unit.attributes,
+        };
+    }
+
     async executeScriptAbility(state, actor, targets, ability) {
         const hash = ability.scriptHash || scriptHash(ability.script);
         if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) throw httpError(428, '脚本尚未审批');
@@ -1604,7 +1623,7 @@ export class CombatEngine {
                 ability: { ...ability, script: undefined },
                 actor: deepClone(actor),
                 targets: deepClone(targets),
-                units: state.combatants.filter(unit => unit.state !== 'dying').map(unit => ({ id: unit.id, name: unit.name, side: unit.side, hp: unit.hp, maxHp: unit.maxHp, ep: unit.ep, position: unit.position, statuses: unit.statuses })),
+                units: state.combatants.filter(unit => unit.state !== 'dying').map(unit => this.scriptUnitSnapshot(unit)),
                 battlefield: state.battlefield,
                 round: state.round,
                 zones: state.zones,
@@ -1666,7 +1685,7 @@ export class CombatEngine {
                         ability: { id: passive.id, name: passive.name || passive.id },
                         actor: deepClone(actor),
                         targets: [deepClone(target)],
-                        units: state.combatants.filter(unit => unit.state !== 'dying').map(unit => ({ id: unit.id, name: unit.name, side: unit.side, hp: unit.hp, maxHp: unit.maxHp, ep: unit.ep, position: unit.position, statuses: unit.statuses })),
+                        units: state.combatants.filter(unit => unit.state !== 'dying').map(unit => this.scriptUnitSnapshot(unit)),
                         battlefield: state.battlefield,
                         round: state.round,
                         zones: state.zones,
@@ -1696,8 +1715,9 @@ export class CombatEngine {
                 this.checkBossPhase(state, target);
             }
             else if (effect.type === 'heal' && target) { const beforeState = target.state; target.hp = Math.min(target.maxHp, target.hp + Math.max(0, Math.round(effect.amount))); if (target.hp > 0 && target.state === 'dying') target.state = 'active'; if (beforeState !== target.state) this.event(state, 'unit_state_changed', { unitId: target.id, from: beforeState, to: target.state }); }
-            else if (effect.type === 'status' && target) target.statuses.push({ id: effect.status, duration: Math.max(1, Math.round(effect.duration)) });
+            else if (effect.type === 'status' && target) target.statuses.push(typeof effect.status === 'object' && effect.status !== null ? { ...effect.status, duration: Math.max(1, Math.round(Number(effect.status.duration ?? 1))) } : { id: String(effect.status), duration: Math.max(1, Math.round(Number(effect.duration ?? 1))) });
             else if (effect.type === 'dispel' && target) target.statuses = target.statuses.filter(item => item.id !== effect.status);
+            else if (effect.type === 'modify' && target) this.applyStatMod(target, effect);
             else if (effect.type === 'move' && target && effect.position && Number.isFinite(Number(effect.position.x)) && Number.isFinite(Number(effect.position.y))) this.moveTo(state, target, effect.position, { ignoreBudget: true, source: 'script', disengageChecked: true });
             else if (effect.type === 'push' && target && Number.isFinite(Number(effect.dx)) && Number.isFinite(Number(effect.dy))) this.moveTo(state, target, { x: target.position.x + Number(effect.dx), y: target.position.y + Number(effect.dy) }, { ignoreBudget: true, source: 'script_push', disengageChecked: true });
             else if (effect.type === 'summon') { const created = this.summonFromTemplate(state, actor, effect); if (!created) throw httpError(400, `脚本召唤模板 ${effect.templateId || '未知'} 不存在`); }
@@ -1705,6 +1725,65 @@ export class CombatEngine {
             else if (!['log'].includes(effect.type)) throw httpError(400, `脚本效果 ${effect.type} 未通过核心校验`);
             this.event(state, 'script_effect_applied', { actorId: actor.id, effect });
         }
+    }
+
+    // api.modify：对任意数值属性做即时增减，可选回合数到期自动还原。
+    // 支持点号路径（如 attributes.strengthModifier），覆盖 MVU 属性与全部战斗 DC/攻防字段。
+    applyStatMod(target, effect) {
+        const field = String(effect.field || '');
+        const delta = Number(effect.delta) || 0;
+        if (!this.isModifiableStat(field)) throw httpError(400, `不支持的属性修改字段：${field}`);
+        this.changeStat(target, field, delta);
+        const rounds = Number(effect.rounds) || 0;
+        if (rounds > 0) {
+            target.statMods = Array.isArray(target.statMods) ? target.statMods : [];
+            target.statMods.push({ field, delta, remaining: rounds });
+        }
+    }
+
+    isModifiableStat(field) {
+        const top = ['attack', 'magicAttack', 'attackModifier', 'defenseDC', 'initiativeDC', 'armor', 'resistance', 'tierCorrection', 'maxHp', 'maxEp', 'hp', 'ep', 'thp', 'speedMeters', 'visionMeters', 'exertion'];
+        if (top.includes(field)) return true;
+        if (field.startsWith('attributes.') && ['strengthModifier', 'dexterityModifier', 'constitutionModifier', 'spiritModifier', 'charismaModifier'].includes(field.split('.')[1])) return true;
+        return false;
+    }
+
+    changeStat(target, field, delta) {
+        const getTarget = () => (field.includes('.') ? (target.attributes ||= {}) : target);
+        const key = field.includes('.') ? field.split('.')[1] : field;
+        const node = getTarget();
+        if (key === 'armor' || key === 'resistance') node[key] = Math.max(0, Math.min(95, Number(node[key] || 0) + delta));
+        else if (key === 'maxHp') { node[key] = Math.max(1, Number(node[key] || 0) + delta); target.hp = Math.min(target.hp, target.maxHp); }
+        else if (key === 'maxEp') { node[key] = Math.max(0, Number(node[key] || 0) + delta); target.ep = Math.min(target.ep, target.maxEp); }
+        else if (key === 'hp') node[key] = Math.max(0, Math.min(target.maxHp, Number(node[key] || 0) + delta));
+        else if (key === 'ep') node[key] = Math.max(0, Math.min(target.maxEp, Number(node[key] || 0) + delta));
+        else if (key === 'thp' || key === 'exertion') node[key] = Math.max(0, Number(node[key] || 0) + delta);
+        else node[key] = Math.max(-1000, Number(node[key] || 0) + delta);
+    }
+
+    // 状态条件加成：status 可带 defenseBonus/attackBonus，配合
+    // vsAttackType(physical|magical|hybrid|melee|ranged) / vsMelee / vsAbilityId
+    // 实现"被近战/特定武器攻击时防御 DC 提升"这类条件性效果。
+    statusApplies(status, ability) {
+        if (status?.vsAttackType) {
+            const t = String(status.vsAttackType);
+            if (t === 'melee' || t === 'ranged') { if ((t === 'melee') !== isMeleeAbility(ability)) return false; }
+            else if (ability.type !== t) return false;
+        }
+        if (status?.vsMelee !== undefined && Boolean(status.vsMelee) !== isMeleeAbility(ability)) return false;
+        if (status?.vsAbilityId) {
+            const ids = Array.isArray(status.vsAbilityId) ? status.vsAbilityId.map(String) : [String(status.vsAbilityId)];
+            if (!ids.includes(String(ability.id))) return false;
+        }
+        return true;
+    }
+
+    statusBonusSum(statuses, ability, key) {
+        return (statuses || []).reduce((sum, status) => {
+            const bonus = Number(status?.[key] || 0);
+            if (!bonus) return sum;
+            return this.statusApplies(status, ability) ? sum + bonus : sum;
+        }, 0);
     }
 
     afterAction(state) {
