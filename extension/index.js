@@ -1,4 +1,4 @@
-const VERSION = '0.17.0';
+const VERSION = '0.18.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -1911,18 +1911,35 @@ const attackEffectStyle = outcome => ATTACK_EFFECT_OUTCOMES[String(outcome || ''
 function spawnAttackEffects(state, events) {
     const now = Date.now();
     const knownIds = new Set((state?.combatants || []).map(unit => unit.id));
+    const queue = [];
     for (const event of events || []) {
-        if (event?.type !== 'action_resolved' && event?.type !== 'script_action_resolved') continue;
-        const attackerId = event.payload?.actorId;
-        if (!knownIds.has(attackerId)) continue;
-        for (const result of Array.isArray(event.payload?.results) ? event.payload.results : []) {
-            const targetId = result?.targetId;
-            if (!targetId || !knownIds.has(targetId)) continue;
-            const outcome = String(result?.outcome || result?.kind || 'hit').toLowerCase();
-            const style = attackEffectStyle(outcome);
-            attackEffects = attackEffects.filter(effect => !(effect.attackerId === attackerId && effect.targetId === targetId));
-            attackEffects.push({ attackerId, targetId, outcome, color: style.color, label: style.label, startedAt: now, duration: 2600 });
+        // 普通攻击 / 脚本攻击 / 反击都会先发出 attack_check（携带攻击者、目标与战果），
+        // 统一从这里收集，保证任何攻击都有对应特效。action_resolved 作为兜底（多目标合并结算）。
+        if (event?.type === 'attack_check') {
+            const payload = event.payload || {};
+            if (knownIds.has(payload.actorId) && knownIds.has(payload.targetId)) {
+                queue.push({ attackerId: payload.actorId, targetId: payload.targetId, outcome: String(payload.outcome || payload.kind || 'hit').toLowerCase() });
+            }
+        } else if (event?.type === 'action_resolved') {
+            const attackerId = event.payload?.actorId;
+            if (!knownIds.has(attackerId)) continue;
+            for (const result of Array.isArray(event.payload?.results) ? event.payload.results : []) {
+                const targetId = result?.targetId;
+                if (!targetId || !knownIds.has(targetId)) continue;
+                queue.push({ attackerId, targetId, outcome: String(result?.outcome || result?.kind || 'hit').toLowerCase() });
+            }
+        } else if (event?.type === 'damage_applied') {
+            // 脚本直接伤害（api.damage，如散射/火球）没有命中检定，也视为一次攻击特效。
+            const payload = event.payload || {};
+            if (knownIds.has(payload.actorId) && knownIds.has(payload.targetId)) {
+                queue.push({ attackerId: payload.actorId, targetId: payload.targetId, outcome: 'hit' });
+            }
         }
+    }
+    for (const item of queue) {
+        attackEffects = attackEffects.filter(effect => !(effect.attackerId === item.attackerId && effect.targetId === item.targetId));
+        const style = attackEffectStyle(item.outcome);
+        attackEffects.push({ attackerId: item.attackerId, targetId: item.targetId, outcome: item.outcome, color: style.color, label: style.label, startedAt: now, duration: 2600 });
     }
     if (attackEffects.length) animateCombatEffects();
 }

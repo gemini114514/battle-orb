@@ -1395,7 +1395,9 @@ export class CombatEngine {
         // 脚本能力自决射程：已过沙箱断言测试（100 轮种子）即可信任，min/maxRange
         // 只是大模型写的不稳定元数据，不应再按固定射程标准把贴脸目标判为“无合法目标”。
         // 前端仍互动选择主目标，脚本自己用 unitsInArea 等决定实际作用范围。
-        if (ability?.script) return true;
+        // 但脚本也不能完全无视距离隔山打牛（否则近战技能会在整张地图外命中）：
+        // 按声明射程判定，贴脸（≤1.5m 接触）始终合法作为兜底。
+        if (ability?.script) return rangeLegal(state, actor, target, ability) || edgeDistance(actor, target) <= 1.5 + 1e-6;
         if (!rangeLegal(state, actor, target, ability)) return false;
         if (!isMeleeAbility(ability)) return true;
         // A manually controlled player chooses the contact point at action
@@ -1729,6 +1731,7 @@ export class CombatEngine {
             if (effect.type === 'attack' && target) await this.resolveScriptAttack(state, actor, effect);
             else if (effect.type === 'damage' && target) {
                 const applied = applyDamage(target, Math.max(0, Math.round(effect.amount)));
+                this.event(state, 'damage_applied', { actorId: actor.id, targetId: target.id, amount: Math.max(0, Math.round(effect.amount)), applied });
                 if (target.state !== applied.before.state) this.event(state, 'unit_state_changed', { unitId: target.id, from: applied.before.state, to: target.state });
                 if (target.state === 'dying' && applied.before.state === 'active') {
                     actor.kills += 1;
