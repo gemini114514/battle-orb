@@ -102,6 +102,39 @@ export function positionInsideBattlefield(position, radiusMeters, battlefield) {
     return position.x - radiusMeters >= battlefield.center.x - halfWidth && position.x + radiusMeters <= battlefield.center.x + halfWidth && position.y - radiusMeters >= battlefield.center.y - halfHeight && position.y + radiusMeters <= battlefield.center.y + halfHeight;
 }
 
+// 大模型没有"战场边界"的空间概念，给出的坐标可能落在边界之外。这里不再报致命
+// 错误，而是把落点钳制回战场内部：圆形战场按方向缩回半径内，矩形战场按边界裁剪。
+function clampToBattlefield(point, radiusMeters, battlefield) {
+    if (battlefield.shape === 'circle') {
+        const dx = point.x - battlefield.center.x, dy = point.y - battlefield.center.y;
+        const distance = Math.hypot(dx, dy);
+        const max = Math.max(radiusMeters, battlefield.radiusMeters - radiusMeters);
+        if (distance <= max) return { x: round(point.x), y: round(point.y) };
+        const scale = distance ? max / distance : 0;
+        return { x: round(battlefield.center.x + dx * scale), y: round(battlefield.center.y + dy * scale) };
+    }
+    const halfWidth = battlefield.widthMeters / 2, halfHeight = battlefield.heightMeters / 2;
+    const minX = battlefield.center.x - halfWidth + radiusMeters, maxX = battlefield.center.x + halfWidth - radiusMeters;
+    const minY = battlefield.center.y - halfHeight + radiusMeters, maxY = battlefield.center.y + halfHeight - radiusMeters;
+    return { x: round(Math.max(minX, Math.min(maxX, point.x))), y: round(Math.max(minY, Math.min(maxY, point.y))) };
+}
+
+// 依据阵营线索给出一个必然在边界内的基准落点：玩家在左（或圆形战场朝 180°），
+// 敌方在右（朝 0°），中立在中心。这是模型坐标完全不可信时的兜底线索。
+function sideAnchor(battlefield, side, radiusMeters = .5) {
+    if (battlefield.shape === 'circle') {
+        const angle = side === 'enemy' ? 0 : side === 'neutral' ? Math.PI / 2 : Math.PI;
+        const max = Math.max(radiusMeters, battlefield.radiusMeters - radiusMeters);
+        const distance = Math.max(radiusMeters, Math.min(max, battlefield.radiusMeters * .8));
+        return { x: round(battlefield.center.x + Math.cos(angle) * distance), y: round(battlefield.center.y + Math.sin(angle) * distance) };
+    }
+    const halfWidth = battlefield.widthMeters / 2, halfHeight = battlefield.heightMeters / 2;
+    const margin = radiusMeters;
+    if (side === 'enemy') return { x: round(battlefield.center.x + halfWidth - margin), y: round(battlefield.center.y) };
+    if (side === 'player') return { x: round(battlefield.center.x - halfWidth + margin), y: round(battlefield.center.y) };
+    return { x: round(battlefield.center.x), y: round(battlefield.center.y) };
+}
+
 function distributionSpec(source = {}) {
     const raw = source.distribution ?? source.formation ?? null;
     if (!raw) return null;
@@ -138,7 +171,7 @@ function distributedPosition(source, index, battlefield, sourceIndex, spec) {
     const count = Math.max(1, Number(source.count || 1));
     const groupExtent = Math.max(spec.radiusMeters, Math.ceil(Math.sqrt(count)) * spec.spacingMeters / 2);
     const legacyOffset = source.side === 'enemy' ? Math.max(1, groupExtent + 1) : source.side === 'neutral' ? 0 : -1;
-    const anchor = point(source.position || { x: battlefield.center.x + legacyOffset, y: battlefield.center.y + (count > 1 ? (sourceIndex % 2 ? 6 : -6) : 0) });
+    const anchor = clampToBattlefield(point(source.position || { x: battlefield.center.x + legacyOffset, y: battlefield.center.y + (count > 1 ? (sourceIndex % 2 ? 6 : -6) : 0) }), Number(source.radiusMeters || .5), battlefield);
     const jitterSeed = `${source.id || source.name || sourceIndex}:${index}:${spec.style}`;
     const jitter = Math.min(spec.jitterMeters, spec.spacingMeters * .22);
     const angleJitter = (deterministicUnit(`${jitterSeed}:a`) - .5) * Math.min(.12, spec.spacingMeters / Math.max(spec.radiusMeters, 1) * .35);
@@ -203,7 +236,7 @@ function groupPosition(source, index, battlefield, sourceIndex = 0) {
     const memberCount = Number(source.count || 1);
     const groupExtent = memberCount > 1 ? Math.ceil(Math.sqrt(memberCount)) * Math.max(Number(source.formationSpacingMeters || source.radiusMeters || .5) * 2 + .2, .5) / 2 : 0;
     const legacyOffset = source.side === 'enemy' ? Math.max(1, groupExtent + 1) : source.side === 'neutral' ? 0 : -1;
-    const anchor = point(source.position || { x: battlefield.center.x + legacyOffset, y: battlefield.center.y + (memberCount > 1 ? (sourceIndex % 2 ? 6 : -6) : 0) });
+    const anchor = clampToBattlefield(point(source.position || { x: battlefield.center.x + legacyOffset, y: battlefield.center.y + (memberCount > 1 ? (sourceIndex % 2 ? 6 : -6) : 0) }), Number(source.radiusMeters || .5), battlefield);
     const spacing = Math.max(Number(source.formationSpacingMeters || source.radiusMeters || .5) * 2 + .2, .5);
     const columns = Math.max(1, Math.ceil(Math.sqrt(Number(source.count || 1))));
     const row = Math.floor(index / columns), column = index % columns;
@@ -347,15 +380,78 @@ export function validUnitAttributes(attributes = {}) {
     return ['strengthModifier', 'dexterityModifier', 'constitutionModifier', 'spiritModifier', 'charismaModifier'].every(key => finite(attributes[key]));
 }
 
+// 大模型的坐标不可信（它没有战场边界的空间概念），因此这里不再抛致命错误。
+// 越界单位按可用线索重新分配位置：homePosition（若有效）→ 阵营锚点 → 战场中心；
+// 重叠单位做迭代推开。只有当真到所有候选都无法安放时才会抛错（实际不会发生）。
+function reassignedPosition(unit, units, battlefield) {
+    const radius = Number(unit.radiusMeters || .5);
+    const candidates = [];
+    if (unit.homePosition && positionInsideBattlefield(unit.homePosition, radius, battlefield)) candidates.push(point(unit.homePosition));
+    candidates.push(sideAnchor(battlefield, unit.side, radius));
+    candidates.push(point(battlefield.center));
+    for (const candidate of candidates) {
+        const conflict = units.some(other => other !== unit && Math.hypot(candidate.x - other.position.x, candidate.y - other.position.y) + 1e-6 < radius + Number(other.radiusMeters || .5));
+        if (!conflict) return candidate;
+    }
+    return clampToBattlefield(candidates[1], radius, battlefield);
+}
+
+// 兜底：把仍重叠的单位放到战场中心外围的空位环上（确定性、必然在界内）。
+function placeOnFreeRing(unit, units, battlefield) {
+    const radius = Number(unit.radiusMeters || .5);
+    const base = point(battlefield.center);
+    const max = battlefield.shape === 'circle' ? Math.max(radius, battlefield.radiusMeters - radius) : Math.min(battlefield.widthMeters, battlefield.heightMeters) / 2 - radius;
+    const spacing = radius * 2 + .4;
+    for (let ring = 0; ring < 8; ring += 1) {
+        const ringRadius = Math.min(max, (ring + 1) * spacing);
+        const steps = Math.max(6, Math.ceil(2 * Math.PI * ringRadius / spacing));
+        for (let step = 0; step < steps; step += 1) {
+            const angle = step / steps * Math.PI * 2;
+            const candidate = { x: round(base.x + Math.cos(angle) * ringRadius), y: round(base.y + Math.sin(angle) * ringRadius) };
+            if (!positionInsideBattlefield(candidate, radius, battlefield)) continue;
+            const conflict = units.some(other => other !== unit && Math.hypot(candidate.x - other.position.x, candidate.y - other.position.y) + 1e-6 < radius + Number(other.radiusMeters || .5));
+            if (!conflict) return candidate;
+        }
+    }
+    return clampToBattlefield(point({ x: base.x + spacing, y: base.y }), radius, battlefield);
+}
+
 export function validateSpatialEncounter(encounter) {
     const battlefield = encounter.battlefield;
-    for (const unit of encounter.combatants) {
-        if (!positionInsideBattlefield(unit.position, unit.radiusMeters, battlefield)) throw new Error(`单位 ${unit.id} 位于战场边界之外`);
+    const units = encounter.combatants;
+    for (const unit of units) {
+        if (!positionInsideBattlefield(unit.position, unit.radiusMeters, battlefield)) unit.position = reassignedPosition(unit, units, battlefield);
     }
-    for (let index = 0; index < encounter.combatants.length; index += 1) for (let other = index + 1; other < encounter.combatants.length; other += 1) {
-        const a = encounter.combatants[index], b = encounter.combatants[other];
-        if (centerDistance(a, b) + 1e-6 < a.radiusMeters + b.radiusMeters) throw new Error(`单位 ${a.id} 与 ${b.id} 初始重叠`);
+    // 重叠：双方对称推开（各移动一半），最多 40 轮。
+    for (let pass = 0; pass < 40; pass += 1) {
+        let moved = false;
+        for (let index = 0; index < units.length; index += 1) for (let other = index + 1; other < units.length; other += 1) {
+            const a = units[index], b = units[other];
+            const min = Number(a.radiusMeters || .5) + Number(b.radiusMeters || .5) + 1e-6;
+            const dx = b.position.x - a.position.x, dy = b.position.y - a.position.y;
+            const d = Math.hypot(dx, dy) || .001;
+            if (d >= min) continue;
+            const push = (min - d) / 2;
+            const ox = dx / d * push, oy = dy / d * push;
+            a.position = clampToBattlefield({ x: a.position.x - ox, y: a.position.y - oy }, Number(a.radiusMeters || .5), battlefield);
+            b.position = clampToBattlefield({ x: b.position.x + ox, y: b.position.y + oy }, Number(b.radiusMeters || .5), battlefield);
+            moved = true;
+        }
+        if (!moved) break;
     }
+    // 兜底：把仍重叠的单位放到空位环上，避免完全重合时推不开。
+    for (let pass = 0; pass < 8; pass += 1) {
+        let stillOverlapping = false;
+        for (let index = 0; index < units.length; index += 1) {
+            const a = units[index];
+            const conflict = units.some((b, other) => other !== index && Math.hypot(a.position.x - b.position.x, a.position.y - b.position.y) + 1e-6 < Number(a.radiusMeters || .5) + Number(b.radiusMeters || .5));
+            if (!conflict) continue;
+            stillOverlapping = true;
+            a.position = placeOnFreeRing(a, units, battlefield);
+        }
+        if (!stillOverlapping) break;
+    }
+    for (const unit of units) if (!positionInsideBattlefield(unit.position, unit.radiusMeters, battlefield)) unit.position = reassignedPosition(unit, units, battlefield);
     return true;
 }
 
