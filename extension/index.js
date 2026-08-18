@@ -1,4 +1,4 @@
-const VERSION = '0.8.7';
+const VERSION = '0.8.8';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -418,7 +418,192 @@ function normalizeDeclaration(input) {
 }
 
 const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。contactPairs 必须写成"每个子数组恰好两个参战实体 id"的数组，例如 [["alice","zombie_group_01"]]；绝不能写成对象（如 {"attackerId":..,"targetId":..}），也不能用别的字段名。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition；已有 MVU 实体 source=existing 并填写 reference，新敌人 source=create。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
-const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)。每个 combatant 必须含 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/position/visionMeters/intelProfile/tacticalProfile/abilities。thp（临时生命/护盾）是一种**临时算法**：表示"短暂额外承受"的一次性吸收护盾（如冰霜护盾、临时石肤、群体意志聚合），命中先扣 thp 再扣 hp，之后消散，不是单位固有属性。thp 默认 0，只在声明或剧情有明确"临时防护/护盾"描述时才声明非零且数值与描述相称，严禁凭空给任何单位（尤其是群体单位）发明 thp。必须保持 declaration 中的 participant 都出现：玩家 combatant 用原 declarationId，controller=player；敌方可把声明中的群体（count>1）展开成多个独立单位，id 用 原id+序号（如 corpse_01/corpse_02）但 name 保持可识别。
+const BATTLE_PROTOCOL_V326 = `<战斗协议>
+  system_base: 基于D&D规则改编的d100战斗系统，强调战术行动和资源管理，采取回合制战斗模式
+  core_mechanics:
+    继承<行为判定>中的优劣势规则
+        
+    生命状态:
+      健康: HP>0，正常行动
+      濒死: HP≤0，失去意识，被攻击时敌人获得优势
+      死亡: 濒死受攻击，永久离场
+
+  战斗流程 (核心状态机):
+    准备阶段(首回合):
+      - 加载参战单位最终属性
+      - 输出初始 HP/EP/状态
+
+    每回合固定执行:
+      Step1 状态刷新:
+        - 依次结算:
+          控制判定 → 持续伤害 → 持续恢复 → 冷却减少
+        - 输出当前全体单位 HP/EP/状态
+      Step2 先攻排序:
+        - 当前存活且具备行动资格单位:
+          1d100 + 先攻DC
+        - 按结果降序生成行动顺位并输出
+        - 顺位锁定，本回合不因死亡/控制/位移改变
+      Step3 行动循环:
+        - 按顺位逐单位执行，不允许合并行动
+        - 每个单位:
+            a. 检查行动资格
+            b. 声明行动并消耗资源
+            c. 立即完成判定
+            d. 输出独立 <CheckResult>(即便敌方/NPC行动也必须独立输出，严禁纯叙事带过)
+            e. 立即更新 HP/EP/状态/位置
+        - 无法行动:
+            输出跳过行动及原因
+        - 行动失败:
+            输出行动无效，并消耗对应行动资源
+      Step4 回合结束:
+        - 所有单位完成顺位后进入下一回合
+
+    资源:
+      - 每回合:
+          主要行动×1
+          移动×1
+          次要行动×1
+      
+    行动阶段:
+      默认武器属性:
+        重型: 力量修正
+        远程: 敏捷修正
+        法杖: 精神修正
+        圣物: 魅力修正
+        
+      检定类型:
+        攻击检定:
+          流程: 1d100+属性修正+跨级修正 vs 目标防御DC
+          命中: ≥DC则命中，进入伤害结算
+          属性修正规则:
+            - 所有骰点判定必须使用“属性修正值”
+            - 基础五维不得直接参与检定
+            - 属性修正值由系统根据血统、装备、技能、状态自动计算
+          
+        豁免检定:
+          DC: 50+施法者属性修正
+          豁免: 1d100+豁免修正+跨级修正
+          结果: 
+            成功: 伤害减半或免疫控制
+            失败: 全额伤害或被控制
+            
+        必中技能: 跳过命中检定，直接进入伤害结算
+        自动生效: 验证目标→消耗资源→直接生效
+        限制:
+          - 必中不等于无视防御
+          - 自动生效不等于无视层级压制
+        
+      驱散机制:
+        - 驱散与净化必须遵循<状态协议>中的层级压制规则
+        - 低品质驱散绝对无法移除高品质状态
+        
+      多目标规则:
+        消耗倍率: {2目标: ×1.5, 3目标: ×2.0, 4目标: ×2.5, 5+目标: ×3.0}
+        伤害分配: {主目标: 100%, 副目标: 70%}
+        范围爆炸: 所有目标100%
+        
+      伤害结算:
+        武器读取法则 (绝对铁律):
+          - 最终属性已分别提供每把已装备武器独立的 ATK/MATK
+          - AI必须根据本次动作描述，读取对应武器的 ATK/MATK 参与伤害计算
+          - 未参与本次动作的武器，其 ATK/MATK 绝对禁止参与任何计算
+          - 同一动作若描述使用多把武器，则每把武器均视为独立攻击段分别结算，最终仅累加结算结果
+          武器动作合法性:
+            - AI必须依据武器类型与动作描述判断动作是否合法。
+            - 若动作违反武器结构或基础物理常识，则必须判定动作失败或给予合理惩罚。
+            例如:
+              - 单手挥舞超重双手武器
+              - 同时拉开两把重弩
+              - 双手均持武器却徒手结印
+            例外:
+              - 若使用者生命层级 ≥ 武器品质，则默认具备正常驾驭能力，可无视常规重量限制
+              - 若生命层级不足，但存在明确声明可突破限制的技能、血统、装备或特殊状态，则允许突破限制
+            禁止自由判断:
+              - AI绝对禁止依据主观印象、剧情表现或基础属性，自行判定是否能够突破武器限制
+
+        计算流程:
+          1_识别类型: 确定物理/魔法/真实或元素伤害构成
+          2_物理部分: 
+            - 固定伤害型: (固定伤害 + ATK)
+            - 属性倍率型: (基础属性 × 倍率) + ATK
+          3_魔法部分: 
+            - 固定伤害型: (固定伤害 + MATK) × (1 + AP%)
+            - 属性倍率型: (基础属性 × 倍率) × (1 + AP%) + MATK
+          4_全局加成与要害: 
+            - 状态修正: 应用所有影响伤害结算的Buff/Debuff(增伤/易伤/减伤等)
+            - 要害判定: 根据目标类型和攻击描述判断是否命中要害。若命中，对应伤害部分先×1.5倍，再进入伤害减免计算。附加合理后果时，仅允许生成符合攻击类型与目标结构的局部创伤，绝不得创造未定义机制(如永久失忆/核心永久损毁等)
+          5_伤害减免: 
+            - 单段最终物理 = 物理部分 × (1 - 目标的物理减伤率)
+            - 单段最终魔法 = 魔法部分 × (1 - 目标的魔法减伤率)
+            - 单段真实伤害 = 无视任何减伤与防御，全额结算
+          6_连击与汇总结算:
+            - 连击独立原则: 每段攻击均可独立进行命中、格挡、闪避、暴击、要害判定及附加状态结算。若存在多段/连击攻击，每段必须独立完成上述伤害计算，最终累加所有段数伤害
+            - 总伤害 = 所有最终伤害相加，最少1点
+          7_群体单位攻击:
+            - 群体数量不等于攻击段数；不得因人数众多直接按数量进行连击
+            - 根据本轮叙事中实际能够接触、瞄准或参与攻击的成员数量，合理确定连击段数
+            - 未实际参与攻击的成员可形成包围、阻挡、压迫或后续增援，但不造成伤害
+            - 每个实际攻击段仍遵循连击独立原则，分别进行命中与伤害结算
+          
+        生命更新:
+          扣血: 优先扣减THP，若伤害溢出，剩余部分继续扣减HP
+          状态: HP≤0→濒死
+          
+      叙事对应:
+        轻微[1-10%]: 挠痒痒般的攻击
+        中等[11-49%]: 有效攻击，明显伤口
+        严重[50%+]: 重创，鲜血飞溅
+
+      形态、召唤与载具介入协议:
+        个人形态 (变身/单兵外骨骼):
+          - 数据读取: 变身期间，直接使用 <user_status_readonly> 中系统已聚合的最终属性，禁止分离计算
+          - 承伤法则: 严格执行同生共死，无独立血条，一切消耗与承伤直扣本体 HP/EP
+
+        召唤物系统:
+          - 独立单位: 召唤物拥有独立判定与行动顺序，绝对不可与玩家面板混合结算
+          - UI排版: 战斗结算必须另起一行独立展示（如：【友方】火元素 → 哥布林）
+
+        资产载具双轨机制 (大型机甲/战舰等):
+          - 数据锚定: 载具属于【资产】系统，不具备 HP/EP，而是拥有独立的【完整度】与【能源】
+          - 【直接驾驶】: 载具视同独立作战装甲替代玩家参战。受到常规攻击时，仅扣减载具【完整度】，玩家本体 HP 受物理保护不扣血（除非遭遇精神同调反噬、驾驶舱被贯穿等特殊剧情）
+          - 载具坠毁与逃生: 载具【完整度】归零报废时，允许触发弹射舱/空间传送等逃生机制，在剧情上可作为玩家的“第二条命”
+          - 【战损量化】: 只有同阶/高阶超凡攻击、重型反装甲火力(如主炮/穿甲弹/高阶魔法)或内部破坏，才能扣减【完整度】。单次有效攻击扣减量应在 1%~25% 之间（视威力差距而定）
+          - 【场外支援】: 载具不下场，需玩家消耗特定资源(指令/消耗单元)呼叫火力，以【环境打击/场景效果】切入战局
+
+  unified_check_interface: |
+    <CheckResult>
+    > [\${类型：攻击/施法/必中/支援等}] \${行动方} → \${目标}
+    > 行动: \${武器/技能/指令名称} $(如有消耗则显示: [消耗: -\${数值} \${资源名}])
+    > 推演: D100(\${骰值}) + [\${属性}]\${属性修正} + [\${属性}]\${其他修正} = \${判定结果} vs DC\${防御/豁免DC} ｜ \${✅成功/❌失败/💥极值}
+    > 伤害构成:
+    >   $(若存在物理伤害则显示: - 物理: [$(如有效果固定/倍率伤害则显示: 效果 \${数值} | )ATK \${ATK} | 减伤 \${物理减伤率}% $(如有破甲/穿透则显示: | 穿透 \${穿透比例}%) ] = \${单次结果} $(若存在多段攻击则显示: × \${连击数}段 = \${最终物理}))
+    >   $(若存在魔法伤害则显示: - 魔法: [$(如有效果固定/倍率伤害则显示: 效果 \${数值} | )MATK \${MATK} | AP \${AP}% | 减伤 \${魔法减伤率}% $(如有法穿则显示: | 穿透 \${穿透比例}%) ] = \${单次结果} $(若存在多段攻击则显示: × \${连击数}段 = \${最终魔法}))
+    >   $(若存在真实伤害则显示: - 真实: \${真实结果})
+    >   $(若存在其他伤害类型如火焰/冰霜/雷电/毒素等，按相同格式增列)
+    > 结算:
+    >   总伤害: 💥 \${总计伤害}点
+    >   THP吸收: \${实际扣THP}   $(若无THP或不扣则整行省略)
+    >   HP吸收:  \${实际扣HP}    $(若无溢出到HP则整行省略)
+    >   $(仅当数量发生变化: 数量: \${旧数量} → \${新数量} ｜ 规则: 新数量 = 1 + ceil(新THP / HP_MAX)，THP耗尽后数量=1，再扣HP)
+    >
+    > 变化: $(THP变化才写: THP \${旧} → \${新} |) $(HP变化才写: HP \${旧} → \${新} |) $(都不变: 无)
+    > 附加状态: \${新增buff/debuff/部位破坏等，标注持续回合。若无则写 无}
+    > $(若存在特殊机制则显示: 备注: \${装备特效触发 / 跨级压制 / 致命要害 / 属性克制等})
+    </CheckResult>
+</战斗协议>
+`;
+
+const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)。每个 combatant 必须含 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/position/visionMeters/intelProfile/tacticalProfile/abilities。必须保持 declaration 中的 participant 都出现：玩家 combatant 用原 declarationId，controller=player。
+
+【世界书战斗协议背景（V3.2.6 · 仅作世界观背景理解，勿直接照抄机制）】
+${BATTLE_PROTOCOL_V326}
+以上协议是**正文剧情模型**用的叙事规则，供你理解世界观设定（群体、THP、连击、多目标等概念从何而来）。你生成**战术 CombatModel** 时必须把协议里的叙事机制翻译成下方【战术字段规则】，二者冲突一律以战术字段规则为准：
+- THP（临时生命/护盾/群体血池）是给正文叙事简化理解用的，**战术战场禁用**：所有 combatant 的 thp 必须恒为 0，严禁用 thp 表示护盾、临时防护或群体总血量，严禁凭空给任何单位（尤其是群体单位）发明 thp。
+- 群体（count>1）：协议中"群体=单单位+THP 血池（数量=1+ceil(THP/HP_MAX)）"在战术战场必须翻译成 count 字段——把声明 participant 的 count 原样写入对应 combatant 的 count 字段，引擎会自动把该 combatant 展开成 count 个独立成员，每个成员独立 HP/行动/可被独立选为目标。严禁把群体压成单个 combatant（严禁用 thp 当群体血池、严禁用 groupCount 假装数量、严禁把整个群体的总血量塞进一个 hp）。
+- 连击/多目标/伤害分配/消耗倍率/武器读取等：由本地战术引擎按下方规则与真实检定裁定，你无需在 CombatModel 中实现这些叙事机制。
+
+【战术字段规则】
+
 
 【能力两种写法】
 1) 声明式：每个 ability 含 id/name/type(physical|hybrid)/actionType(main|minor)/power/modifier/epCost/minRangeMeters/maxRangeMeters/cooldownRounds/targetCount/aoe；用于基础攻击/普通攻击。远程武器（弓弩/枪械/法杖/投掷/射击）的 maxRangeMeters 必须 ≥ 6m，近战 ≤ 2.5m；远程武器的 minRangeMeters 一律填 0（弓弩枪械可贴脸射击，除非确实有最小开火距离才填非零）。
@@ -429,8 +614,8 @@ const other = api.state().enemies.find(u => u.id !== t.id && u.hp > 0);
 api.attack((other || t).id);                     // 第二击：优先另一存活敌人，否则连击同一目标
 【连击/连射（固定多发）铁律】装备词条或技能效果承诺"每回合/每次使用连射 N 发/连击 N 次"时，脚本必须在每次激活中**无条件发射恰好 N 发**（N 次独立的 api.attack，各自走完整权威检定）。**严禁把攻击次数绑定到 api.state().targets 的长度上**——"有几个目标就打几发"（如 if (targets.length > 1) 才射第二发）会把固定 N 发退化成 1 发，属于弱化实现。目标选择遵循最有利写法：第 1 发打所选主目标 targets[0]；后续每一发优先改打**另一存活敌人**（用 api.state().enemies 里 hp>0 且 id 不同的单位），场上没有其它存活敌人时才连击同一目标。每一发都是独立检定，引擎按顺序结算命中/护甲/死亡，前一发已击杀的目标不会吃下后一发。
 【攻击检定铁律】对敌人造成伤害的攻击必须用 api.attack（与普通攻击完全一致的权威检定：D100+攻击修正+位阶修正+能力修正 vs 目标防御DC，原始 96-100 奇迹、1-5 灾难，命中后经护甲/抗性减伤由引擎结算伤害）。严禁用 api.d100 手搓"命中率/暴击"再 api.damage 补伤害——那是绕过防御 DC 的非法攻击检定；api.damage 只用于不经过战斗检定的直接效果（持续伤害 DoT、环境伤害、自伤、固定扣血等）。
-可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies，单位对象含 id/name/side/hp/maxHp/ep/maxEp/thp/attack/magicAttack/attackModifier/defenseDC/initiativeDC/armor/resistance/tierCorrection/speedMeters/visionMeters/exertion/position/statuses/attributes，可直接读取判定属性做条件）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（返回半径 r 内单位对象数组，字段同上）、api.d100()/api.d(n)（确定性骰，仅用于非检定的脚本判定）、api.attack(targetId, options?)、api.damage(targetId,amount,type?)、api.heal(targetId,amount)、api.status(targetId,status,时长)、api.dispel(targetId,status)、api.move、api.push(targetId,dx,y)、api.resource(targetId,hp|ep|thp,delta)、api.modify(targetId,字段,delta,{rounds?})、api.summon(templateId,zoneId,count)、api.log。
-【属性修改】api.modify 可对任意数值属性即时增减（可带 rounds 回合到期自动还原），字段支持攻击/防御/检定全量：attack、magicAttack、attackModifier、defenseDC、initiativeDC、armor、resistance、tierCorrection、maxHp、maxEp、hp、ep、thp、speedMeters、visionMeters、exertion、attributes.strengthModifier/dexterityModifier/constitutionModifier/spiritModifier/charismaModifier。例如防御架势：api.modify(t.id, "defenseDC", 5, { rounds: 2 })。
+可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies，单位对象含 id/name/side/hp/maxHp/ep/maxEp/attack/magicAttack/attackModifier/defenseDC/initiativeDC/armor/resistance/tierCorrection/speedMeters/visionMeters/exertion/position/statuses/attributes，可直接读取判定属性做条件）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（返回半径 r 内单位对象数组，字段同上）、api.d100()/api.d(n)（确定性骰，仅用于非检定的脚本判定）、api.attack(targetId, options?)、api.damage(targetId,amount,type?)、api.heal(targetId,amount)、api.status(targetId,status,时长)、api.dispel(targetId,status)、api.move、api.push(targetId,dx,y)、api.resource(targetId,hp|ep,delta)、api.modify(targetId,字段,delta,{rounds?})、api.summon(templateId,zoneId,count)、api.log。
+【属性修改】api.modify 可对任意数值属性即时增减（可带 rounds 回合到期自动还原），字段支持攻击/防御/检定全量：attack、magicAttack、attackModifier、defenseDC、initiativeDC、armor、resistance、tierCorrection、maxHp、maxEp、hp、ep、speedMeters、visionMeters、exertion、attributes.strengthModifier/dexterityModifier/constitutionModifier/spiritModifier/charismaModifier。例如防御架势：api.modify(t.id, "defenseDC", 5, { rounds: 2 })。
 【状态条件加成】api.status 支持传对象以携带机械加成，如 api.status(t.id, { id:"stance", name:"御守架势", defenseBonus:8, vsMelee:true }, 3) 表示"被近战攻击时防御 DC +8，持续 3 回合"；条件字段：vsAttackType(physical|magical|hybrid|melee|ranged)、vsMelee(布尔)、vsAbilityId(能力 id 或 id 数组)；加成字段：defenseBonus(提防御 DC)、attackBonus(提攻击检定)、damagePerRound(每回合持续伤害)、healPerRound(每回合持续回复)。无条件字段时对所有攻击生效。示例（对任意敌我单位施放）：api.status(target.id, { id:"poison", damagePerRound: 3 }, 3)。
 信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责命中/护甲/死亡/碰撞结算。
 
@@ -455,7 +640,7 @@ const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据审查 AI（�
 
 【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。带 script 的脚本能力：脚本内容由本地沙箱校验（100 轮种子测试），除第 8 条标注的"固定多发保真修复"外，你**绝不允许**修改、重写或删除 script 字段，也禁止输出脚本内容。
 
-【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能开销合理性（对抗性判断，绝不机械地把所有基础攻击改成 0）：结合该攻击模式的实际设定判断 EP 消耗是否合理——凭空给普通攻击/基础攻击加了 EP、或明显不消耗资源的攻击被加了 EP → 输出 set_ability 建议把 epCost 改为 0；若设定明确需要资源（如每次射击消耗 EP/弹药），应保留合理的 epCost，基础攻击同样允许合理 EP 消耗。若某单位完全没有普通攻击（没有任何声明式主行动攻击）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（名称与射程按武器类型调整，epCost 按实际设定）。7) 数值来源（thp 临时生命/护盾）对抗性检查：thp 只能来自声明或剧情明确描述的护盾/临时防护（如 participant.state 里写"裹着冰霜护盾/厚甲壳/石化外壳"），且数值应与描述强度相称。模型凭空给单位加 thp（声明与剧情均无护盾依据）→ 输出 {"op":"set_combatant","declarationId":"..","field":"thp","value":0}；玩家单位同样适用，绝不默认给任何单位加护盾。8) 固定多发脚本保真（对抗性检查，唯一允许改写 script 的情形）：能力名或效果承诺"连射/连击/双发/二连/多段/连续 N 发"等固定次数攻击时，检查脚本是否在每次激活中无条件发射恰好 N 发 api.attack。若脚本把攻击次数绑定到 api.state().targets 的长度上（例如 if (targets.length > 1) api.attack(targets[1].id)、或仅对已选目标逐个发射），导致选少目标就少打几发——不符合"固定 N 发"效果 → 输出 {"op":"set_ability_script","declarationId":"..","abilityId":"..","script":"<修复后的固定 N 发脚本>"}，遵循最有利写法：第 1 发打 api.state().targets[0]，后续每一发优先改打另一存活敌人（api.state().enemies 里 hp>0 且 id 不同），无其它存活敌人则连击同一目标。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
+【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能开销合理性（对抗性判断，绝不机械地把所有基础攻击改成 0）：结合该攻击模式的实际设定判断 EP 消耗是否合理——凭空给普通攻击/基础攻击加了 EP、或明显不消耗资源的攻击被加了 EP → 输出 set_ability 建议把 epCost 改为 0；若设定明确需要资源（如每次射击消耗 EP/弹药），应保留合理的 epCost，基础攻击同样允许合理 EP 消耗。若某单位完全没有普通攻击（没有任何声明式主行动攻击）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（名称与射程按武器类型调整，epCost 按实际设定）。7) THP/群体（对抗性检查）：战术战场**不使用 THP**——thp 是正文叙事简化概念（护盾、临时防护、群体血池都不属于战术战场）。任何 combatant 的 thp>0，无论是否有护盾/临时防护描述，一律输出 {"op":"set_combatant","declarationId":"..","field":"thp","value":0}；玩家单位同样适用，绝不默认给任何单位加护盾。群体（count>1）：declaration 中 count>1 的 participant，其对应 combatant 必须带 count 字段且等于声明值（引擎自动把该 combatant 展开成 count 个独立成员，每个成员独立 HP/行动）。若 combatant 缺失 count、count 与声明不符、或把群体压成单个单位（如用 thp 当群体血池、用 groupCount 假装数量、把整个群体的总血量塞进一个 hp）→ 输出 {"op":"set_combatant","declarationId":"..","field":"count","value":<声明 count>}；若该 combatant 的 thp>0 一并输出 thp→0。8) 固定多发脚本保真（对抗性检查，唯一允许改写 script 的情形）：能力名或效果承诺"连射/连击/双发/二连/多段/连续 N 发"等固定次数攻击时，检查脚本是否在每次激活中无条件发射恰好 N 发 api.attack。若脚本把攻击次数绑定到 api.state().targets 的长度上（例如 if (targets.length > 1) api.attack(targets[1].id)、或仅对已选目标逐个发射），导致选少目标就少打几发——不符合"固定 N 发"效果 → 输出 {"op":"set_ability_script","declarationId":"..","abilityId":"..","script":"<修复后的固定 N 发脚本>"}，遵循最有利写法：第 1 发打 api.state().targets[0]，后续每一发优先改打另一存活敌人（api.state().enemies 里 hp>0 且 id 不同），无其它存活敌人则连击同一目标。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动（第 7 条的 thp/count 修复除外）。
 
 【输出格式】只输出一个 JSON 数组 suggestions，不要 Markdown。每项形如：
 {"op":"set_ability","declarationId":"..","abilityId":"..","field":"maxRangeMeters","value":15}
@@ -750,7 +935,7 @@ function fallbackModel(input) {
         combatants: participants.map((item, index) => {
             const player = item.side === 'player'; const hp = player ? playerHp : Math.max(20, 55 - index * 3); const maxHp = player ? playerMaxHp : hp;
             return {
-                id: item.id, declarationId: item.id, name: item.name, side: item.side, controller: player ? 'player' : 'ai', hp, maxHp,
+                id: item.id, declarationId: item.id, name: item.name, side: item.side, controller: player ? 'player' : 'ai', count: Math.max(1, Number(item.count) || 1), hp, maxHp,
                 ep: player ? playerEp : 0, maxEp: player ? playerMaxEp : 0, attack: player ? 20 : 8, magicAttack: 0, attackModifier: player ? 2 : -1,
                 defenseDC: player ? 50 : 45, initiativeDC: player ? 55 : 45, armor: 0, resistance: 0, radiusMeters: .5, speedMeters: 4,
                 position: { x: player ? -12 : 12, y: player ? (index % 3) * 2 : (index % 3) * 2 }, facingDegrees: player ? 0 : 180, fovDegrees: 120, visionMeters: 30,
@@ -824,7 +1009,7 @@ function normalizeCombatant(unit, base) {
         name: String(source.name || baseUnit.name || '单位'),
         side,
         controller: side === 'player' ? 'player' : 'ai',
-        hp, maxHp, ep, maxEp,
+        hp, maxHp, ep, maxEp, thp: 0,
         armor: clampPercent(source.armor, 'physicalDamageReductionPercent', 'physicalReduction', 'physical'),
         resistance: clampPercent(source.resistance, 'magicalDamageReductionPercent', 'magicalReduction', 'magical') || clampPercent(source.armor, 'magicalDamageReductionPercent', 'magicalReduction', 'magical'),
         attack: Math.max(0, Number(source.attack ?? source.attackPower ?? baseUnit.attack ?? 0)),
@@ -904,6 +1089,19 @@ function mergeModel(candidate, input) {
         if (modelCounts[side] >= fallbackCounts[side]) continue;
         combatants.push(normalizeCombatant({ declarationId: base.declarationId, id: base.declarationId, name: base.name, side: base.side, count: base.count }, base));
     }
+    // 群体（count>1）：声明中 count>1 的 participant，若其对应 combatant 是唯一代表且缺失/为 1 的
+    // count，则把声明的 count 原样补齐（信封翻译）——引擎会自动展开成 count 个独立成员。
+    const declaredCount = new Map((Array.isArray(input.participants) ? input.participants : []).filter(participant => Number(participant?.count) > 1).map(participant => [String(participant.id), Number(participant.count)]));
+    if (declaredCount.size) {
+        const occurrences = new Map();
+        for (const unit of combatants) { const key = String(unit.declarationId || unit.id); occurrences.set(key, (occurrences.get(key) || 0) + 1); }
+        for (let index = 0; index < combatants.length; index += 1) {
+            const unit = combatants[index];
+            const key = String(unit.declarationId || unit.id);
+            const declared = declaredCount.get(key);
+            if (declared && occurrences.get(key) === 1 && (unit.count === undefined || unit.count === null || Number(unit.count) === 1)) combatants[index] = { ...unit, count: declared };
+        }
+    }
     const output = {
         ...fallback,
         ...candidate,
@@ -916,7 +1114,7 @@ function mergeModel(candidate, input) {
 
 function applyModelSuggestions(model, declaration, suggestions) {
     if (!Array.isArray(suggestions) || !suggestions.length) return model;
-    const numericFields = new Set(['maxRangeMeters', 'minRangeMeters', 'power', 'modifier', 'epCost', 'cooldownRounds', 'targetCount', 'hp', 'maxHp', 'ep', 'maxEp']);
+    const numericFields = new Set(['maxRangeMeters', 'minRangeMeters', 'power', 'modifier', 'epCost', 'cooldownRounds', 'targetCount', 'hp', 'maxHp', 'ep', 'maxEp', 'thp', 'count']);
     let changed = false;
     const combatants = (model.combatants || []).map(unit => {
         let unitChanged = false;
@@ -2267,6 +2465,9 @@ function bindPanel() {
         if (event.target.closest('#battle-orb-llm-cancel')) { llmCancel(); return; }
         if (event.target.closest('#battle-orb-tool-bench-inline')) { void runBenchmark(); return; }
     });
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && actionPreview) { cancelActionPreview(); }
+    });
     document.addEventListener('click', event => {
         if (event.target.closest('#battle-orb-script-run-test')) {
             const state = publicBattle();
@@ -2592,6 +2793,7 @@ globalThis.__battleOrbDebug = {
     flowError: () => flowError ? { ...flowError } : null,
     state: () => publicBattle(),
     applyModelSuggestions: (model, declaration, suggestions) => applyModelSuggestions(model, declaration, suggestions),
+    mergeModel: (candidate, input) => mergeModel(candidate, input),
 };
 } catch (error) {
     bootTrace('bootstrap-fatal', { message: error?.message || String(error), stack: error?.stack || '' });
