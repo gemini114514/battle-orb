@@ -83,7 +83,7 @@ export async function runScript(source, input) {
             const api = Object.freeze({
               state: () => ({ round: input.round || 0, battlefield: input.battlefield || null, actor: input.actor || null, targets: input.targets || [], units: input.units || [], enemies: (input.units || []).filter(u => u.id !== (input.actor && input.actor.id) && sideOf(u) !== actorSide), allies: (input.units || []).filter(u => u.id !== (input.actor && input.actor.id) && sideOf(u) === actorSide) }),
               distance: (aId, bId) => { const a = unitsById.get(String(aId)), b = unitsById.get(String(bId)); if (!a || !b || !a.position || !b.position) return NaN; return Math.hypot(a.position.x - b.position.x, a.position.y - b.position.y); },
-              unitsInArea: (x, y, radius) => (input.units || []).filter(u => u.position && Math.hypot(u.position.x - Number(x), u.position.y - Number(y)) <= Number(radius)).map(u => u.id),
+              unitsInArea: (x, y, radius) => (input.units || []).filter(u => u.position && Math.hypot(u.position.x - Number(x), u.position.y - Number(y)) <= Number(radius)).map(u => ({ id: u.id, name: u.name, side: u.side, hp: u.hp, maxHp: u.maxHp, position: u.position, statuses: u.statuses })),
               d100: () => 1 + Math.floor(rand() * 100),
               d: n => 1 + Math.floor(rand() * Math.max(1, Number(n))),
               damage: (targetId, amount, damageType = "physical") => emit("damage", { targetId: String(targetId), amount: Number(amount), damageType: String(damageType) }),

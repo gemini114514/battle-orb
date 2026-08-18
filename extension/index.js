@@ -1,4 +1,4 @@
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -419,14 +419,14 @@ const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆�
 const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)。每个 combatant 必须含 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/position/visionMeters/intelProfile/tacticalProfile/abilities。必须保持 declaration 中的 participant 都出现：玩家 combatant 用原 declarationId，controller=player；敌方可把声明中的群体（count>1）展开成多个独立单位，id 用 原id+序号（如 corpse_01/corpse_02）但 name 保持可识别。
 
 【能力两种写法】
-1) 声明式：每个 ability 含 id/name/type(physical|hybrid)/actionType(main|minor)/power/modifier/epCost/minRangeMeters/maxRangeMeters/cooldownRounds/targetCount/aoe；用于基础攻击/普通攻击。远程武器（弓弩/枪械/法杖/投掷/射击）的 maxRangeMeters 必须 ≥ 6m，近战 ≤ 2.5m。
+1) 声明式：每个 ability 含 id/name/type(physical|hybrid)/actionType(main|minor)/power/modifier/epCost/minRangeMeters/maxRangeMeters/cooldownRounds/targetCount/aoe；用于基础攻击/普通攻击。远程武器（弓弩/枪械/法杖/投掷/射击）的 maxRangeMeters 必须 ≥ 6m，近战 ≤ 2.5m；远程武器的 minRangeMeters 一律填 0（弓弩枪械可贴脸射击，除非确实有最小开火距离才填非零）。
 2) 脚本式（推荐用于具名特殊技能/装备技能/战术技能）：在声明式信封字段基础上加 script 字段。脚本运行于沙箱（禁网络/禁 eval/禁 DOM），可读取战场并发射效果，示例：
 const t = api.state().targets[0];
 const roll = api.d100();
 api.damage(t.id, 20 + (roll > 75 ? 10 : 0));   // 暴击
 if (roll > 50) api.status(t.id, "bleed", 2);    // 出血 DoT
 api.push(t.id, 1.5, 0);                          // 击退
-可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（地面 AoE 范围查询）、api.d100()/api.d(n)（确定性骰）、api.damage(targetId,amount,type?)、api.heal、api.status、api.dispel、api.move、api.push(targetId,dx,y)、api.resource、api.summon(templateId,zoneId,count)、api.log。信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责护甲/死亡/碰撞结算。
+可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（返回半径 r 内单位对象数组，每项含 id/name/side/hp/position，可直接遍历 unit.id/unit.side/unit.position 等）、api.d100()/api.d(n)（确定性骰）、api.damage(targetId,amount,type?)、api.heal、api.status、api.dispel、api.move、api.push(targetId,dx,y)、api.resource、api.summon(templateId,zoneId,count)、api.log。信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责护甲/死亡/碰撞结算。
 
 【被动技能（事件阶段脚本）】被动写在 combatant 的 passives 数组，每项含 id/name/trigger/script。当前支持的触发器：
 - trigger:"on_kill"：当该单位击杀任意敌人后立即触发。脚本里 api.state().actor 是击杀者（本被动拥有者），api.event() 返回 { type:"on_kill", target:<被击杀的敌人> }，可用 api.heal/api.status/api.damage 等发射效果。示例（击杀回复 10HP）：

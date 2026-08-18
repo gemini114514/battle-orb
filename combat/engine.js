@@ -804,7 +804,7 @@ export class CombatEngine {
             { id: 'hide', name: this.isStealthed(actor) ? '结束潜行' : '隐蔽 / 切断追踪', actionType: 'minor', type: 'maneuver', legalTargetIds: [], affordable: true, actionAvailable: budget.minor > 0 && (this.isStealthed(actor) || Number(budget.movedMeters || 0) > 0 || actor.intelProfile?.presence === 'concealed'), detail: this.isStealthed(actor) ? '解除潜行状态' : '移动后尝试切断敌方追踪' },
             { id: 'lure', name: '诱导', actionType: 'minor', type: 'maneuver', legalTargetIds: [], affordable: true, actionAvailable: budget.minor > 0, detail: `在 ${6 + Math.max(0, Number(actor.attributes?.charismaModifier || 0)) * 2}m 内制造局部声源` },
         ];
-        return [...actor.abilities.map(ability => ({ ...ability, script: undefined, legalTargetIds: targets.filter(target => rangeLegal(state, actor, target, ability) && this.canEngage(state, actor, target, ability)).map(target => target.id), affordable: actor.ep >= ability.epCost, actionAvailable: budget[ability.actionType || 'main'] > 0 && !actor.cooldowns?.[ability.id], cooldownRemaining: Number(actor.cooldowns?.[ability.id] || 0), budget })), ...maneuvers.map(item => ({ ...item, budget }))];
+        return [...actor.abilities.map(ability => ({ ...ability, script: undefined, legalTargetIds: targets.filter(target => this.canEngage(state, actor, target, ability)).map(target => target.id), affordable: actor.ep >= ability.epCost, actionAvailable: budget[ability.actionType || 'main'] > 0 && !actor.cooldowns?.[ability.id], cooldownRemaining: Number(actor.cooldowns?.[ability.id] || 0), budget })), ...maneuvers.map(item => ({ ...item, budget }))];
     }
 
     selectTarget(state, actor) {
@@ -889,7 +889,7 @@ export class CombatEngine {
             else this.event(state, 'unit_waited', { actorId: actor.id, reason: 'no_detected_target' });
             state.cursor += 1; return;
         }
-        let available = actor.abilities.filter(ability => actor.ep >= ability.epCost && !actor.cooldowns?.[ability.id] && rangeLegal(state, actor, target, ability) && this.canEngage(state, actor, target, ability) && (!ability.script || this.repository.isScriptApproved(ability.scriptHash || scriptHash(ability.script), state.rulesetVersion)));
+        let available = actor.abilities.filter(ability => actor.ep >= ability.epCost && !actor.cooldowns?.[ability.id] && this.canEngage(state, actor, target, ability) && (!ability.script || this.repository.isScriptApproved(ability.scriptHash || scriptHash(ability.script), state.rulesetVersion)));
         if (!available.length && this.movementRemaining(state, actor) > 0 && actor.tacticalProfile?.objective !== 'hold') {
             const moved = this.moveToward(state, actor, target);
             if (moved) this.consumeMovement(state, actor, moved);
@@ -897,11 +897,11 @@ export class CombatEngine {
             // contact ledger. Use the current legal target, not the stale
             // pre-move choice that may no longer own the melee slot.
             target = this.selectTarget(state, actor) || target;
-            available = actor.abilities.filter(ability => actor.ep >= ability.epCost && !actor.cooldowns?.[ability.id] && rangeLegal(state, actor, target, ability) && this.canEngage(state, actor, target, ability) && (!ability.script || this.repository.isScriptApproved(ability.scriptHash || scriptHash(ability.script), state.rulesetVersion)));
+            available = actor.abilities.filter(ability => actor.ep >= ability.epCost && !actor.cooldowns?.[ability.id] && this.canEngage(state, actor, target, ability) && (!ability.script || this.repository.isScriptApproved(ability.scriptHash || scriptHash(ability.script), state.rulesetVersion)));
         }
         const ability = available.find(item => item.id !== 'basic-attack') || available[0];
         if (!ability) { state.flags.noLegalAction = true; this.event(state, 'unit_waited', { actorId: actor.id, reason: 'no_legal_action', targetId: target?.id || null, targetDistance: target ? edgeDistance(actor, target) : null, movementRemaining: this.movementRemaining(state, actor), knownTargetIds: this.knownTargets(state, actor).map(unit => unit.id).slice(0, 24), abilityDiagnostics: actor.abilities.map(item => ({ id: item.id, affordable: actor.ep >= item.epCost, cooldown: Number(actor.cooldowns?.[item.id] || 0), inRange: target ? rangeLegal(state, actor, target, item) : false, canEngage: target ? this.canEngage(state, actor, target, item) : false })) }); state.cursor += 1; return; }
-        const targets = (ability.aoe || ability.targetCount > 1) ? this.knownTargets(state, actor).filter(item => rangeLegal(state, actor, item, ability) && this.canEngage(state, actor, item, ability)).slice(0, ability.targetCount) : [target];
+        const targets = (ability.aoe || ability.targetCount > 1) ? this.knownTargets(state, actor).filter(item => this.canEngage(state, actor, item, ability)).slice(0, ability.targetCount) : [target];
         while (!ability.aoe && targets.length > 1 && actor.ep < Math.ceil(ability.epCost * targetCostMultiplier(targets.length))) targets.pop();
         if (ability.script) { if (!await this.executeScriptAbility(state, actor, targets, ability)) return; }
         else await this.resolveAttack(state, actor, targets, ability);
@@ -1311,7 +1311,12 @@ export class CombatEngine {
     }
 
     canEngage(state, actor, target, ability) {
-        if (!this.canTarget(state, actor, target) || !rangeLegal(state, actor, target, ability)) return false;
+        if (!this.canTarget(state, actor, target)) return false;
+        // 脚本能力自决射程：已过沙箱断言测试（100 轮种子）即可信任，min/maxRange
+        // 只是大模型写的不稳定元数据，不应再按固定射程标准把贴脸目标判为“无合法目标”。
+        // 前端仍互动选择主目标，脚本自己用 unitsInArea 等决定实际作用范围。
+        if (ability?.script) return true;
+        if (!rangeLegal(state, actor, target, ability)) return false;
         if (!isMeleeAbility(ability)) return true;
         // A manually controlled player chooses the contact point at action
         // time. Do not make that choice depend on a stale or policy-selected
@@ -1641,8 +1646,8 @@ export class CombatEngine {
             else if (effect.type === 'heal' && target) { const beforeState = target.state; target.hp = Math.min(target.maxHp, target.hp + Math.max(0, Math.round(effect.amount))); if (target.hp > 0 && target.state === 'dying') target.state = 'active'; if (beforeState !== target.state) this.event(state, 'unit_state_changed', { unitId: target.id, from: beforeState, to: target.state }); }
             else if (effect.type === 'status' && target) target.statuses.push({ id: effect.status, duration: Math.max(1, Math.round(effect.duration)) });
             else if (effect.type === 'dispel' && target) target.statuses = target.statuses.filter(item => item.id !== effect.status);
-            else if (effect.type === 'move' && target && effect.position && Number.isFinite(Number(effect.position.x)) && Number.isFinite(Number(effect.position.y))) this.moveTo(state, target, effect.position, { ignoreBudget: true, source: 'script' });
-            else if (effect.type === 'push' && target && Number.isFinite(Number(effect.dx)) && Number.isFinite(Number(effect.dy))) this.moveTo(state, target, { x: target.position.x + Number(effect.dx), y: target.position.y + Number(effect.dy) }, { ignoreBudget: true, source: 'script_push' });
+            else if (effect.type === 'move' && target && effect.position && Number.isFinite(Number(effect.position.x)) && Number.isFinite(Number(effect.position.y))) this.moveTo(state, target, effect.position, { ignoreBudget: true, source: 'script', disengageChecked: true });
+            else if (effect.type === 'push' && target && Number.isFinite(Number(effect.dx)) && Number.isFinite(Number(effect.dy))) this.moveTo(state, target, { x: target.position.x + Number(effect.dx), y: target.position.y + Number(effect.dy) }, { ignoreBudget: true, source: 'script_push', disengageChecked: true });
             else if (effect.type === 'summon') { const created = this.summonFromTemplate(state, actor, effect); if (!created) throw httpError(400, `脚本召唤模板 ${effect.templateId || '未知'} 不存在`); }
             else if (effect.type === 'resource' && target && ['hp', 'ep', 'thp'].includes(effect.resource)) target[effect.resource] = Math.max(0, Math.min(effect.resource === 'ep' ? target.maxEp : effect.resource === 'hp' ? target.maxHp : Infinity, target[effect.resource] + effect.delta));
             else if (!['log'].includes(effect.type)) throw httpError(400, `脚本效果 ${effect.type} 未通过核心校验`);
