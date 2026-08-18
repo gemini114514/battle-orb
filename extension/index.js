@@ -1,4 +1,4 @@
-const VERSION = '0.7.8';
+const VERSION = '0.7.9';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -389,7 +389,22 @@ function normalizeDeclaration(input) {
     output.participants = Array.isArray(output.participants) ? output.participants : [];
     const players = output.participants.filter(item => item?.side === 'player').map(item => item.id).filter(Boolean);
     const enemies = output.participants.filter(item => item?.side === 'enemy').map(item => item.id).filter(Boolean);
-    output.contactPairs ||= players.flatMap(player => enemies.map(enemy => [player, enemy]));
+    // contactPairs 只做格式归一到 `[["a","b"], …]`（纯信封翻译，不发明内容）：
+    // 兼容 AI 偶发的 `{attackerId,targetId}` 对象写法，避免因此把整场识别判死。
+    const normalizedPairs = (value => {
+        if (!Array.isArray(value)) return null;
+        const pairs = value.map(pair => {
+            if (Array.isArray(pair) && pair.length === 2 && typeof pair[0] === 'string' && typeof pair[1] === 'string') return [pair[0], pair[1]];
+            if (pair && typeof pair === 'object' && !Array.isArray(pair)) {
+                const a = pair.attackerId ?? pair.playerId ?? pair.sourceId ?? pair.targetId ?? pair.enemyId;
+                const b = pair.targetId ?? pair.enemyId ?? pair.attackerId ?? pair.playerId ?? pair.sourceId;
+                if (typeof a === 'string' && typeof b === 'string') return [a, b];
+            }
+            return null;
+        }).filter(Boolean);
+        return pairs.length ? pairs : null;
+    })(output.contactPairs);
+    output.contactPairs = normalizedPairs || players.flatMap(player => enemies.map(enemy => [player, enemy]));
     output.battlefield ||= { kind: '未知场景', shapeHint: 'unknown', description: '由本地二维战场承载' };
     output.battlefield.shapeHint = ['rectangle', 'circle', 'unknown'].includes(output.battlefield.shapeHint) ? output.battlefield.shapeHint : 'unknown';
     output.participants = output.participants.map((item, index) => ({
@@ -400,7 +415,7 @@ function normalizeDeclaration(input) {
     return output;
 }
 
-const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition；已有 MVU 实体 source=existing 并填写 reference，新敌人 source=create。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
+const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。contactPairs 必须写成"每个子数组恰好两个参战实体 id"的数组，例如 [["alice","zombie_group_01"]]；绝不能写成对象（如 {"attackerId":..,"targetId":..}），也不能用别的字段名。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition；已有 MVU 实体 source=existing 并填写 reference，新敌人 source=create。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
 const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)。每个 combatant 必须含 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/position/visionMeters/intelProfile/tacticalProfile/abilities。必须保持 declaration 中的 participant 都出现：玩家 combatant 用原 declarationId，controller=player；敌方可把声明中的群体（count>1）展开成多个独立单位，id 用 原id+序号（如 corpse_01/corpse_02）但 name 保持可识别。
 
 【能力两种写法】
