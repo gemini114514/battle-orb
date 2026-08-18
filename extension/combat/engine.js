@@ -1787,13 +1787,15 @@ export class CombatEngine {
     }
 
     afterAction(state) {
+        // 胜负已定时先结算（无存活敌人 → 玩家胜，即使我方也有濒死单位），
+        // 否则会被 player_dying 接管暂停卡死，战斗永远到不了 completed（回写主AI 按钮不出现）。
+        const winner = this.winner(state);
+        if (winner) { this.complete(state, winner); return true; }
         const dyingPlayer = state.combatants.find(unit => unit.side === 'player' && unit.state === 'dying');
         // A real encounter protects the player with a takeover pause.  A
         // transient auto simulator is intentionally a full-run benchmark, so
         // it proceeds to a terminal winner instead of stopping at that guard.
         if (dyingPlayer && !(state.transient && state.mode === 'auto')) { this.pause(state, { type: 'player_dying', unitId: dyingPlayer.id }); return true; }
-        const winner = this.winner(state);
-        if (winner) { this.complete(state, winner); return true; }
         if (state.pendingReaction) {
             if (state.transient && state.mode === 'auto') { this.resolveAutoReaction(state); return false; }
             this.pause(state, { type: 'reaction_window', ...state.pendingReaction }); return true;
