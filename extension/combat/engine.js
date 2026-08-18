@@ -1978,11 +1978,11 @@ export class CombatEngine {
         const bench = state.participantBench || (state.participantBench = []);
         const benchById = new Map(bench.map(unit => [String(unit.id), unit]));
         const unit = state.combatants.find(item => String(item.id) === unitId) || benchById.get(unitId);
-        if (!unit || unit.side !== 'player') throw httpError(404, '找不到可调整的友方单位');
+        if (!unit || (unit.side !== 'player' && unit.side !== 'neutral')) throw httpError(404, '找不到可调整的友方/中立单位');
         const participates = input.participates === true;
         const activePlayerCount = state.combatants.filter(item => item.side === 'player').length;
         if (!participates) {
-            if (activePlayerCount <= 1) throw httpError(400, '至少保留一名友方单位参战');
+            if (unit.side === 'player' && activePlayerCount <= 1) throw httpError(400, '至少保留一名友方单位参战');
             state.combatants = state.combatants.filter(item => item.id !== unit.id);
             bench.push(unit);
         } else if (benchById.has(unitId)) {

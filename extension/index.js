@@ -1,4 +1,4 @@
-const VERSION = '0.14.0';
+const VERSION = '0.15.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -433,7 +433,7 @@ function normalizeDeclaration(input) {
     return output;
 }
 
-const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。contactPairs 必须写成"每个子数组恰好两个参战实体 id"的数组，例如 [["alice","zombie_group_01"]]；绝不能写成对象（如 {"attackerId":..,"targetId":..}），也不能用别的字段名。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition。side 只能是 player、enemy、neutral 三者之一：玩家或玩家可控角色用 player；敌对单位用 enemy；其它角色（友方 NPC、同伴、旁观者、中立者）一律用 neutral。禁止使用 ally、friendly、friend、npc、ally_npc 等其它取值。source 只能填 existing 或 create：只有当你确实能从当前 MVU 或关系列表对应到具体已有实体时，才用 existing，且必须同时填写 reference（该已有实体的相对路径或唯一 id）；无法对应任何已有实体时一律用 create。绝不允许写 source=existing 却缺少 reference。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
+const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。contactPairs 必须写成"每个子数组恰好两个参战实体 id"的数组，例如 [["alice","zombie_group_01"]]；绝不能写成对象（如 {"attackerId":..,"targetId":..}），也不能用别的字段名。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition。side 只能是 player、enemy、neutral 三者之一：玩家或玩家可控角色用 player；敌对单位用 enemy；其它角色（友方 NPC、同伴、旁观者、中立者）一律用 neutral。禁止使用 ally、friendly、friend、npc、ally_npc 等其它取值。side 的语义决定该角色是否参战：**只有 side=player 与 side=enemy 的角色会进入战斗；side=neutral 表示"在场但绝不参战"（留守、旁观、治疗后方、不进入战斗区），neutral 绝不参与任何战斗行动。** 必须严格执行玩家的额外提示安排：若玩家提示或剧情明确要求某个角色"不参与战斗/留守/不参战/不在场"，该角色必须标记为 side=neutral（禁止标成 player 或 enemy），并在 state 中写明"不参与战斗"的安排。source 只能填 existing 或 create：只有当你确实能从当前 MVU 或关系列表对应到具体已有实体时，才用 existing，且必须同时填写 reference（该已有实体的相对路径或唯一 id）；无法对应任何已有实体时一律用 create。绝不允许写 source=existing 却缺少 reference。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
 const BATTLE_PROTOCOL_V326 = `<战斗协议>
   system_base: 基于D&D规则改编的d100战斗系统，强调战术行动和资源管理，采取回合制战斗模式
   core_mechanics:
@@ -655,6 +655,8 @@ passives:[{ "id":"iron-stance","name":"铁御","trigger":"on_kill","script":"con
 
 ${SCRIPT_LIBRARY_PROMPT_TEXT}
 
+【参战名单铁律（违反即被退回修复）】只有 declaration 中 side=player 与 side=enemy 的 participant 才会成为 combatant。side=neutral（或 state 写明"不参与战斗/留守/旁观/不参战"）的角色**绝不允许写入 combatants**，即使它就在战场附近、即使是友方 NPC——它在场但不参战，绝不建模进战场、绝不给它生成任何能力或属性。玩家额外提示里点名"不参与战斗"的角色同样必须被排除在 combatants 之外。
+
 【基础攻击·硬性要求（违反即被退回修复）】
 - 每个单位必须至少有 1 个基础攻击（普通攻击）：声明式（禁止 script，无需审批即可使用）、actionType=main、power=0、modifier=0（直接使用单位攻击力）、cooldownRounds=0、targetCount=1、aoe=false。
 - 请结合单位实际武器装备与战场声明自行作答攻击模式与资源消耗：单位有几个攻击模式/武器就给几个基础攻击（如持弩又架盾 → 弩基础攻击 + 盾基础攻击各一个）。基础攻击默认免费（epCost=0），但若该攻击模式本身有明确的资源消耗设定（如每次射击消耗 EP/弹药），请保留合理的 EP 消耗。判断标准是"实际设定需要消耗多少"：凭空给普通攻击加 EP、或明显不消耗资源的攻击被加了 EP，都是错误；有明确消耗设定的则必须保留。攻击类型（type）与射程也由你根据实际武器装备判断：远程武器（弓/弩/枪械/法杖/投掷/射击）maxRangeMeters ≥ 6m，近战武器（剑/盾/徒手/棍）≤ 2.5m。不要套用模板。
@@ -669,7 +671,7 @@ const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据审查 AI（�
 
 【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。带 script 的脚本能力：脚本内容由本地沙箱校验（100 轮种子测试），除第 8 条标注的"固定多发保真修复"外，你**绝不允许**修改、重写或删除 script 字段，也禁止输出脚本内容。**脚本能力可能来自本地脚本库**（模型用 scriptLibrary 字段引用，本地已实例化为稳定源码，效果视为已实现）：这类能力你只需要补齐缺失的信封字段（epCost/maxRangeMeters/actionType 等），**绝不改动其 script**，更不要建议重新发明脚本。
 
-【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能开销合理性（对抗性判断，绝不机械地把所有基础攻击改成 0）：结合该攻击模式的实际设定判断 EP 消耗是否合理——凭空给普通攻击/基础攻击加了 EP、或明显不消耗资源的攻击被加了 EP → 输出 set_ability 建议把 epCost 改为 0；若设定明确需要资源（如每次射击消耗 EP/弹药），应保留合理的 epCost，基础攻击同样允许合理 EP 消耗。若某单位完全没有普通攻击（没有任何声明式主行动攻击）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（名称与射程按武器类型调整，epCost 按实际设定）。7) THP/群体（对抗性检查）：战术战场**不使用 THP**——thp 是正文叙事简化概念（护盾、临时防护、群体血池都不属于战术战场）。任何 combatant 的 thp>0，无论是否有护盾/临时防护描述，一律输出 {"op":"set_combatant","declarationId":"..","field":"thp","value":0}；玩家单位同样适用，绝不默认给任何单位加护盾。群体（count>1）：declaration 中 count>1 的 participant，其对应 combatant 必须带 count 字段且等于声明值（引擎自动把该 combatant 展开成 count 个独立成员，每个成员独立 HP/行动）。若 combatant 缺失 count、count 与声明不符、或把群体压成单个单位（如用 thp 当群体血池、用 groupCount 假装数量、把整个群体的总血量塞进一个 hp）→ 输出 {"op":"set_combatant","declarationId":"..","field":"count","value":<声明 count>}；若该 combatant 的 thp>0 一并输出 thp→0。8) 固定多发脚本保真（对抗性检查，唯一允许改写 script 的情形）：能力名或效果承诺"连射/连击/双发/二连/多段/连续 N 发"等固定次数攻击时，检查脚本是否在每次激活中无条件发射恰好 N 发 api.attack。若脚本把攻击次数绑定到 api.state().targets 的长度上（例如 if (targets.length > 1) api.attack(targets[1].id)、或仅对已选目标逐个发射），导致选少目标就少打几发——不符合"固定 N 发"效果 → 输出 {"op":"set_ability_script","declarationId":"..","abilityId":"..","script":"<修复后的固定 N 发脚本>"}，遵循最有利写法：第 1 发打 api.state().targets[0]，后续每一发优先改打另一存活敌人（api.state().enemies 里 hp>0 且 id 不同），无其它存活敌人则连击同一目标。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动（第 7 条的 thp/count 修复除外）。
+【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。**例外：side=neutral 的参与者绝不视为"缺失"，绝不要 add_combatant 补齐它**——neutral 表示在场但不参战，不属于战斗名单；也不要在任何整改建议里引用（set_ability/set_combatant）声明中未建模的 combatant，尤其是 neutral 角色。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能开销合理性（对抗性判断，绝不机械地把所有基础攻击改成 0）：结合该攻击模式的实际设定判断 EP 消耗是否合理——凭空给普通攻击/基础攻击加了 EP、或明显不消耗资源的攻击被加了 EP → 输出 set_ability 建议把 epCost 改为 0；若设定明确需要资源（如每次射击消耗 EP/弹药），应保留合理的 epCost，基础攻击同样允许合理 EP 消耗。若某单位完全没有普通攻击（没有任何声明式主行动攻击）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（名称与射程按武器类型调整，epCost 按实际设定）。7) THP/群体（对抗性检查）：战术战场**不使用 THP**——thp 是正文叙事简化概念（护盾、临时防护、群体血池都不属于战术战场）。任何 combatant 的 thp>0，无论是否有护盾/临时防护描述，一律输出 {"op":"set_combatant","declarationId":"..","field":"thp","value":0}；玩家单位同样适用，绝不默认给任何单位加护盾。群体（count>1）：declaration 中 count>1 的 participant，其对应 combatant 必须带 count 字段且等于声明值（引擎自动把该 combatant 展开成 count 个独立成员，每个成员独立 HP/行动）。若 combatant 缺失 count、count 与声明不符、或把群体压成单个单位（如用 thp 当群体血池、用 groupCount 假装数量、把整个群体的总血量塞进一个 hp）→ 输出 {"op":"set_combatant","declarationId":"..","field":"count","value":<声明 count>}；若该 combatant 的 thp>0 一并输出 thp→0。8) 固定多发脚本保真（对抗性检查，唯一允许改写 script 的情形）：能力名或效果承诺"连射/连击/双发/二连/多段/连续 N 发"等固定次数攻击时，检查脚本是否在每次激活中无条件发射恰好 N 发 api.attack。若脚本把攻击次数绑定到 api.state().targets 的长度上（例如 if (targets.length > 1) api.attack(targets[1].id)、或仅对已选目标逐个发射），导致选少目标就少打几发——不符合"固定 N 发"效果 → 输出 {"op":"set_ability_script","declarationId":"..","abilityId":"..","script":"<修复后的固定 N 发脚本>"}，遵循最有利写法：第 1 发打 api.state().targets[0]，后续每一发优先改打另一存活敌人（api.state().enemies 里 hp>0 且 id 不同），无其它存活敌人则连击同一目标。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动（第 7 条的 thp/count 修复除外）。
 
 【输出格式】只输出一个 JSON 数组 suggestions，不要 Markdown。每项形如：
 {"op":"set_ability","declarationId":"..","abilityId":"..","field":"maxRangeMeters","value":15}
@@ -952,7 +954,7 @@ function fallbackModel(input) {
     const battlefield = shape === 'circle'
         ? { shape, name: input.battlefield.kind || '交战区域', radiusMeters: 24, center: { x: 0, y: 0 } }
         : { shape, name: input.battlefield.kind || '交战区域', widthMeters: 60, heightMeters: 36, center: { x: 0, y: 0 } };
-    const participants = input.participants || [];
+    const participants = (input.participants || []).filter(item => item.side === 'player' || item.side === 'enemy');
     const playerHp = Math.max(1, Number(playerMvu.HP || 100));
     const playerMaxHp = Math.max(playerHp, Number(playerMvu.HP_MAX || playerHp));
     const playerEp = Math.max(0, Number(playerMvu.EP || 0));
@@ -1416,6 +1418,10 @@ async function createBattleCore() {
         const created = engine.create({ seed: id('tavern'), mode: 'manual', storySessionId: tavernSnapshot.chatId, encounter: model, assetProfiles: model.assetProfiles || [], preparation: { declaration, source: 'tavern-injected' } });
         battle = repository.get(created.id);
         battle.__combatBenchmark = { spans: {} };
+        // 中立/非参战角色默认不进入场景战斗（留在板凳名单），可在战前战术界面重新勾选。
+        for (const unit of [...(battle.combatants || [])]) {
+            if (unit.side !== 'player') { try { engine.setParticipate(battle, { unitId: unit.id, participates: false }); } catch { /* 忽略无法下场的单位 */ } }
+        }
         deployState = { strategyText: '', activePreset: null, assignments: {} };
         mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
         stageOverride = null;
@@ -1513,9 +1519,9 @@ async function runFullAuto() {
 function publicBattle() { return battle && engine ? engine.publicState(battle) : null; }
 
 function deployRosterMarkup(state) {
-    const units = [...(state?.combatants || []), ...(state?.participantBench || [])].filter(unit => unit.side === 'player');
+    const units = [...(state?.combatants || []), ...(state?.participantBench || [])].filter(unit => unit.side === 'player' || unit.side === 'neutral');
     const unitById = new Map(units.map(unit => [String(unit.id), unit]));
-    const participatingIds = new Set((state?.combatants || []).filter(unit => unit.side === 'player').map(unit => String(unit.id)));
+    const participatingIds = new Set((state?.combatants || []).filter(unit => unit.side === 'player' || unit.side === 'neutral').map(unit => String(unit.id)));
     if (!units.length) return '<div class="bo-deploy-empty">没有可配置的友方单位</div>';
     const strategySelect = (unitId, selected) => `<select class="bo-deploy-strategy-select" data-deploy-unit-strategy="${escapeHtml(unitId)}"><option value="inherit" ${selected === 'inherit' || !selected ? 'selected' : ''}>跟随上方策略</option>${Object.entries(COMBAT_STRATEGY_PRESETS).map(([id, preset]) => `<option value="${id}" ${selected === id ? 'selected' : ''}>${escapeHtml(preset.label)}</option>`).join('')}</select>`;
     const modeSelect = (unitId, controlMode) => `<select class="bo-deploy-mode-select" data-deploy-unit-mode="${escapeHtml(unitId)}"><option value="follow" ${!controlMode ? 'selected' : ''}>跟随全局</option><option value="manual" ${controlMode === 'manual' ? 'selected' : ''}>本单位手操</option><option value="auto" ${controlMode === 'auto' ? 'selected' : ''}>本单位自动</option></select>`;
