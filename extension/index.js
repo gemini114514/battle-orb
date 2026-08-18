@@ -1,4 +1,4 @@
-const VERSION = '0.7.9';
+const VERSION = '0.8.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -1032,7 +1032,7 @@ async function recognize() {
         stageOverride = 'recognize';
         render();
         setStatus(tagged ? '已从当前楼层读取 BattleDeclaration' : '已由酒馆当前 AI 草拟战场声明', 'ok');
-    } catch (error) { flowError = { step: 'recognize', message: error.message || '识别失败' }; notify(`识别战场失败：${error.message}`, 'error'); }
+    } catch (error) { flowError = { step: 'recognize', message: error.message || '识别失败' }; notify(`识别战场失败：${error.message}`, 'error'); stageOverride = 'recognize'; }
     finally { busy = false; render(); }
 }
 
@@ -1115,7 +1115,7 @@ async function createBattle() {
         recordDebug('battle_created', { battleId: battle.id, combatants: model.combatants?.length || 0, title: model.title, ruleset: battle.rulesetVersion, mode: modeNote || phaseOneNote });
         setStatus(`战场已创建${modeNote}${phaseOneNote}；骰点、伤害、状态、位置和胜负由本地引擎裁定`, 'ok');
         render();
-    } catch (error) { flowError = { step: 'create', message: error.message || '创建失败' }; notify(`创建战场失败：${error.message}`, 'error'); }
+    } catch (error) { flowError = { step: 'create', message: error.message || '创建失败' }; notify(`创建战场失败：${error.message}`, 'error'); stageOverride = 'create'; }
     finally { busy = false; render(); }
 }
 
@@ -1986,7 +1986,7 @@ function bindPanel() {
                 stageOverride = null;
                 render();
                 setStatus(`已读取 ${tavernSnapshot.messages.length} 楼与 ${tavernSnapshot.mvu.applied} 条 MVU Patch（${tavernSnapshot.mvu.source}）`, 'ok');
-            } catch (error) { flowError = { step: 'read', message: error.message || '读取失败' }; notify(`读取失败：${error.message}`, 'error'); render(); }
+            } catch (error) { flowError = { step: 'read', message: error.message || '读取失败' }; notify(`读取失败：${error.message}`, 'error'); stageOverride = 'read'; render(); }
             return;
         }
         if (target.id === 'battle-orb-recognize') { void recognize(); return; }
