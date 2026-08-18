@@ -1,4 +1,4 @@
-const VERSION = '0.11.0';
+const VERSION = '0.12.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -46,7 +46,8 @@ const COMBAT_STRATEGY_PRESETS = Object.freeze({
     guard: { label: '护卫防守', description: '围绕主角或指定队友，优先阻断近身威胁。', text: '护卫防守：优先保护主角和濒危队友，攻击进入近战范围的敌人；不要为了追击远处目标离开护卫位置。' },
 });
 let deployState = { strategyText: '', activePreset: null, assignments: {} };
-let autoState = { running: false, step: '', startedAt: 0 };
+let autoState = { running: false, step: '', startedAt: 0, attempt: 0, failed: false };
+let autoCancelRequested = false;
 let mapZoom = 1;
 let mapPan = { x: 0, y: 0 };
 let mapIntent = null;
@@ -86,6 +87,7 @@ const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.strin
 
 let stageOverride = null;
 let lastStage = null;
+let lastAutoKey = '';
 let view = 'stage';
 let promptHistory = [];
 let debugTrace = [];
@@ -425,13 +427,13 @@ function normalizeDeclaration(input) {
     output.battlefield.shapeHint = ['rectangle', 'circle', 'unknown'].includes(output.battlefield.shapeHint) ? output.battlefield.shapeHint : 'unknown';
     output.participants = output.participants.map((item, index) => ({
         id: String(item.id || `participant-${index + 1}`), name: String(item.name || `参战者 ${index + 1}`), count: Math.max(1, Number(item.count) || 1),
-        side: item.side === 'player' ? 'player' : item.side === 'neutral' ? 'neutral' : 'enemy', source: item.source === 'existing' ? 'existing' : 'create',
+        side: item.side === 'player' ? 'player' : item.side === 'neutral' || item.side === 'ally' ? 'neutral' : 'enemy', source: item.source === 'existing' ? 'existing' : 'create',
         state: typeof item.state === 'string' ? item.state : '已进入交战状态', relativePosition: String(item.relativePosition || '战场中'), ...(item.reference ? { reference: String(item.reference).replace(/^\/+/, '').replace(/^关系列表[\\/]/, '') } : {}),
     }));
     return output;
 }
 
-const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。contactPairs 必须写成"每个子数组恰好两个参战实体 id"的数组，例如 [["alice","zombie_group_01"]]；绝不能写成对象（如 {"attackerId":..,"targetId":..}），也不能用别的字段名。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition；已有 MVU 实体 source=existing 并填写 reference，新敌人 source=create。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
+const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。contactPairs 必须写成"每个子数组恰好两个参战实体 id"的数组，例如 [["alice","zombie_group_01"]]；绝不能写成对象（如 {"attackerId":..,"targetId":..}），也不能用别的字段名。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition。side 只能是 player、enemy、neutral 三者之一：玩家或玩家可控角色用 player；敌对单位用 enemy；其它角色（友方 NPC、同伴、旁观者、中立者）一律用 neutral。禁止使用 ally、friendly、friend、npc、ally_npc 等其它取值。source 只能填 existing 或 create：只有当你确实能从当前 MVU 或关系列表对应到具体已有实体时，才用 existing，且必须同时填写 reference（该已有实体的相对路径或唯一 id）；无法对应任何已有实体时一律用 create。绝不允许写 source=existing 却缺少 reference。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
 const BATTLE_PROTOCOL_V326 = `<战斗协议>
   system_base: 基于D&D规则改编的d100战斗系统，强调战术行动和资源管理，采取回合制战斗模式
   core_mechanics:
@@ -1263,9 +1265,14 @@ async function superviseCombatModel(candidate, declaration, snapshot, maxRounds 
     return { model: current, phase2Failed: false };
 }
 
-function declarationValidation(value) {
+function declarationValidationReport(value) {
     const report = validateBattleDeclaration(value, { strict: false });
-    if (!report?.ok) throw new Error((report?.errors || []).slice(0, 5).map(error => `${error.path}：${error.message}`).join('\n') || '战场声明校验失败');
+    return report?.ok ? [] : (report?.errors || []).slice(0, 6).map(error => `${error.path}：${error.message}`);
+}
+
+function declarationValidation(value) {
+    const errors = declarationValidationReport(value);
+    if (errors.length) throw new Error(errors.join('\n') || '战场声明校验失败');
 }
 
 function retryLimit() {
@@ -1289,14 +1296,34 @@ async function withRetry(fn, label) {
 async function recognizeCore() {
     tavernSnapshot = readTavern();
     const tagged = battleDeclarationFromFloor();
-    const content = tagged || extractJsonObject(await generateRaw([
-        { role: 'system', content: DECLARATION_SYSTEM },
-        { role: 'user', content: JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2) },
-    ], 2600, '识别战场声明', 'declaration'));
-    declaration = normalizeDeclaration(content);
-    declarationValidation(declaration);
-    const declarationBox = $('#battle-orb-declaration'); if (declarationBox) declarationBox.value = JSON.stringify(declaration, null, 2);
-    return tagged;
+    const declarationBox = $('#battle-orb-declaration');
+    if (tagged) {
+        declaration = normalizeDeclaration(tagged);
+        declarationValidation(declaration);
+        if (declarationBox) declarationBox.value = JSON.stringify(declaration, null, 2);
+        return tagged;
+    }
+    const declarationPrompt = () => JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2);
+    let candidate = normalizeDeclaration(extractJsonObject(await generateRaw([{ role: 'system', content: DECLARATION_SYSTEM }, { role: 'user', content: declarationPrompt() }], 2600, '识别战场声明', 'declaration')));
+    // 二步式：识别出的声明校验失败时，把错误回传要求主 AI 修正一次，而不是直接致命报错。
+    let errors = declarationValidationReport(candidate);
+    if (errors.length) {
+        recordDebug('declaration_phase1_errors', { errors });
+        setStatus(`战场声明校验需修正（${errors.length} 项）：${errors[0]}`, 'warn'); render();
+        const repairedRaw = await generateRaw([
+            { role: 'system', content: DECLARATION_SYSTEM },
+            { role: 'user', content: JSON.stringify({ currentDeclaration: candidate, validationErrors: errors, instruction: '根据上面的校验错误修正并重新输出完整的战场声明 JSON 对象（保持 schema、participants 等结构完整）。' }, null, 2) },
+        ], 2600, '识别战场声明（修正请求）', 'declaration');
+        candidate = normalizeDeclaration(extractJsonObject(repairedRaw));
+        errors = declarationValidationReport(candidate);
+    }
+    if (declarationBox) declarationBox.value = JSON.stringify(candidate, null, 2);
+    if (errors.length) {
+        recordDebug('declaration_unrepaired', { errors });
+        throw new Error(errors.slice(0, 3).join('；') || '战场声明校验失败');
+    }
+    declaration = candidate;
+    return null;
 }
 
 async function recognize() {
@@ -1408,34 +1435,76 @@ async function createBattle() {
     finally { busy = false; render(); }
 }
 
-// 一键全自动：读取 → 识别（限次重试）→ 创建（限次重试）→ 停在“确认队伍战术”（④ 编制部署）。
+// 一键全自动：读取 → 识别（可一步修正）→ 创建（可修复重试）→ 停在“确认队伍战术”（④ 编制部署）。
+// 任一步骤失败都会在“最大尝试次数”内整体重试；运行中可随时取消。
+function isAutoCancelledError(error) {
+    return Boolean(error) && String(error?.message || '').includes('已取消');
+}
+
+function cancelFullAuto() {
+    if (!autoState.running) return;
+    autoCancelRequested = true;
+    llmCancel();
+    setStatus('正在取消一键全自动…', 'warn');
+    render();
+}
+
 async function runFullAuto() {
     if (busy || autoState.running) return;
     autoState.running = true;
     autoState.startedAt = Date.now();
+    autoState.failed = false;
+    autoCancelRequested = false;
     busy = true; flowError = null;
+    const limit = retryLimit();
+    let lastError = null;
     try {
-        autoState.step = '读取楼层与 MVU';
-        setStatus('一键全自动：正在读取楼层与 MVU…', 'working'); render();
-        tavernSnapshot = readTavern();
-        void refreshTavernFromGlobals();
-        const found = battleDeclarationFromFloor();
-        if (found) declaration = normalizeDeclaration(found);
-        stageOverride = null;
-        if (!declaration) {
-            autoState.step = '识别战场声明';
-            setStatus('一键全自动：正在识别战场声明…', 'working'); render();
-            await withRetry(() => recognizeCore(), '识别战场声明');
+        for (let attempt = 0; attempt < limit; attempt += 1) {
+            if (autoCancelRequested) throw new Error('全自动任务已取消');
+            autoState.attempt = attempt + 1;
+            try {
+                autoState.step = '读取楼层与 MVU';
+                setStatus('一键全自动：正在读取楼层与 MVU…', 'working'); render();
+                tavernSnapshot = readTavern();
+                void refreshTavernFromGlobals();
+                const found = battleDeclarationFromFloor();
+                if (found) declaration = normalizeDeclaration(found);
+                stageOverride = null;
+                if (!declaration) {
+                    autoState.step = '识别战场声明';
+                    setStatus('一键全自动：正在识别战场声明…', 'working'); render();
+                    await recognizeCore();
+                }
+                autoState.step = '创建战场';
+                setStatus('一键全自动：正在建立 CombatModel 并创建二维战场…', 'working'); render();
+                await createBattleCore();
+                autoState.step = '确认队伍战术';
+                setStatus('战场已创建；请在“编制部署”确认参战、操作方式与战斗策略', 'ok');
+                render();
+                return;
+            } catch (error) {
+                if (isAutoCancelledError(error)) throw error;
+                lastError = error;
+                recordDebug('full_auto_attempt_error', { attempt, step: autoState.step, error: String(error.message || error) });
+                if (attempt < limit - 1) {
+                    declaration = null;
+                    setStatus(`一键全自动第 ${attempt + 1} 次失败（${autoState.step}）：${error.message}，正在整体重试（${attempt + 2}/${limit}）…`, 'warn');
+                    render();
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+            }
         }
-        autoState.step = '创建战场';
-        setStatus('一键全自动：正在建立 CombatModel 并创建二维战场…', 'working'); render();
-        await createBattleCore();
-        autoState.step = '确认队伍战术';
-        setStatus('战场已创建；请在“编制部署”确认参战、操作方式与战斗策略', 'ok');
+        throw lastError || new Error('全自动流程失败');
     } catch (error) {
-        flowError = { step: autoState.step || '读取', message: error.message || '全自动流程失败' };
-        notify(`一键全自动失败（${autoState.step}）：${error.message}`, 'error');
-        setStatus(`一键全自动失败（${autoState.step}）：${error.message}`, 'error');
+        if (isAutoCancelledError(error)) {
+            flowError = null;
+            setStatus('一键全自动已取消', 'info');
+        } else {
+            autoState.failed = true;
+            flowError = { step: autoState.step || '读取', message: error.message || '全自动流程失败' };
+            notify(`一键全自动失败（${autoState.step}）：${error.message}`, 'error');
+            setStatus(`一键全自动失败（${autoState.step}）：${error.message}`, 'error');
+        }
     } finally {
         busy = false; autoState.running = false; render();
     }
@@ -2061,16 +2130,20 @@ function declarationSummaryMarkup(value) {
 
 function autoCardMarkup() {
     const running = autoState.running;
-    const failed = Boolean(flowError);
+    const failed = autoState.failed && Boolean(flowError);
     const step = autoState.step || '读取楼层与 MVU';
+    const attemptNote = running && autoState.attempt > 1 ? `（第 ${autoState.attempt}/${retryLimit()} 次尝试）` : '';
     const action = running
-        ? `<span class="bo-auto-running">正在${escapeHtml(step)}…</span>`
+        ? `<span class="bo-auto-running">正在${escapeHtml(step)}…${attemptNote}</span>`
         : failed
             ? `<span class="bo-auto-error">上次全自动流程失败（${escapeHtml(flowError.step || '')}）：${escapeHtml(flowError.message || '')}</span>`
             : '';
     return `<section class="bo-auto-card">
       <header><b>一键全自动战斗</b><small>自动 读取楼层 → 识别声明 → 创建战场（失败按“最大尝试次数”自动重试），完成后停在“确认队伍战术”。</small></header>
-      <button id="battle-orb-auto" class="bo-primary bo-auto-run" type="button" ${running ? 'disabled' : ''}>${running ? '全自动进行中…' : '⚡ 一键全自动战斗'}</button>
+      <div class="bo-auto-actions">
+        <button id="battle-orb-auto" class="bo-primary bo-auto-run" type="button" ${running ? 'disabled' : ''}>${running ? '全自动进行中…' : '⚡ 一键全自动战斗'}</button>
+        ${running ? `<button id="battle-orb-auto-cancel" class="bo-secondary bo-auto-cancel" type="button">取消任务</button>` : ''}
+      </div>
       ${action}
       <p class="bo-muted">默认隐藏详细的分步页面；如需手动分步控制，请在设置中开启 DEBUG 模式。</p>
     </section>`;
@@ -2078,10 +2151,10 @@ function autoCardMarkup() {
 
 function stageMarkup(stage) {
     if (stage === 'read') {
-        if (!settings.debugMode) return autoCardMarkup();
+        if (!settings.debugMode || autoState.running || autoState.failed) return autoCardMarkup();
         return `<p class="bo-muted">从当前酒馆楼层读取剧情与 MVU 状态，作为后续识别战场的依据。</p><button id="battle-orb-auto" class="bo-primary bo-auto-run" type="button">⚡ 一键全自动战斗</button><button id="battle-orb-sync" class="bo-primary" type="button">① 读取楼层与 MVU</button>`;
     }
-    if (!settings.debugMode && (stage === 'recognize' || stage === 'create')) {
+    if ((!settings.debugMode || autoState.running || autoState.failed) && (stage === 'recognize' || stage === 'create')) {
         return autoCardMarkup();
     }
     if (stage === 'recognize') {
@@ -2113,8 +2186,11 @@ function renderStage() {
     const meta = STAGE_META[stage];
     const label = $('#battle-orb-stage-label'); if (label) label.textContent = meta.label;
     const hint = $('#battle-orb-stage-hint'); if (hint) hint.textContent = meta.hint;
-    if (stage !== lastStage) {
+    // 一键全自动的运行/失败/步骤/尝试次数变化时也要重绘（阶段未变但卡片内容变了）。
+    const autoKey = `${autoState.running}|${autoState.failed}|${autoState.attempt}|${autoState.step}`;
+    if (stage !== lastStage || autoKey !== lastAutoKey) {
         lastStage = stage;
+        lastAutoKey = autoKey;
         root.innerHTML = stageMarkup(stage);
     }
     const state = publicBattle();
@@ -2555,7 +2631,7 @@ function renderSettingsView() {
     const content = $('#battle-orb-settings-content');
     if (!content) return;
     const floorInfo = tavernSnapshot ? `<div id="battle-orb-floor" class="bo-floor">已读取 ${tavernSnapshot.messages.length} 楼 · MVU ${tavernSnapshot.mvu.applied} 条 Patch · ${tavernSnapshot.mvu.source}</div>` : '<div class="bo-floor">尚未读取楼层</div>';
-    content.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>全自动与调试</summary><label class="bo-setting"><input id="battle-orb-debug-mode" type="checkbox" ${settings.debugMode ? 'checked' : ''}><span>DEBUG 模式（默认关闭）</span><small>关闭时界面只显示“一键全自动战斗”与最后确认队伍战术的界面；开启后恢复详细的分步页面（读取/识别/创建）与提示词、基准、DEBUG 导出等工具。</small></label><label class="bo-setting"><input id="battle-orb-max-retries" type="number" min="1" max="1000" step="1" value="${settings.maxRetries}"><span>LLM 最大尝试次数（1-1000）</span><small>识别 / 建模 / 数据审查 / 战后剧情等每次 LLM 请求的最大尝试次数；全自动模式在限制内自动重试全部请求。</small></label></details><details class="bo-fold" open><summary>战场建模</summary><label class="bo-setting"><input id="battle-orb-fast-modeling" type="checkbox" ${settings.fastModeling ? 'checked' : ''}><span>急速模式（无二阶段检查）</span><small>建模阶段仅做一次生成，跳过战斗数据检查 AI 的审查；适合追求速度与低消耗。</small></label><label class="bo-setting"><input id="battle-orb-rollback-modeling" type="checkbox" ${settings.rollbackModeling ? 'checked' : ''}><span>回滚模式</span><small>第一阶段成功即归档；第二阶段全部失败时立刻用第一阶段结果创建战场，不再报错或等待。</small></label></details><details class="bo-fold" open><summary>工作 API 预设</summary><small class="bo-muted">为“战场识别”与“战场建模”两种调用场景各自配置调用来源：酒馆 API（generateRaw）为默认选项，也可改用自定义 API 预设（Base URL / 路径 / 模型 / Key / 额外头与体），并可按实例保存复用。</small>${renderWorkApiSection('declaration')}${renderWorkApiSection('modeling')}</details><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示、判断依据、建模模式、重试次数、DEBUG 模式与工作 API 预设设置已持久化到浏览器本地。</p>`;
+    content.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>全自动与调试</summary><label class="bo-setting"><input id="battle-orb-debug-mode" type="checkbox" ${settings.debugMode ? 'checked' : ''}><span>DEBUG 模式（默认关闭）</span><small>关闭时界面只显示“一键全自动战斗”与最后确认队伍战术的界面；开启后恢复详细的分步页面（读取/识别/创建）与提示词、基准等工具。导出 DEBUG 记录按钮无论何时都可用。</small></label><label class="bo-setting"><input id="battle-orb-max-retries" type="number" min="1" max="1000" step="1" value="${settings.maxRetries}"><span>LLM 最大尝试次数（1-1000）</span><small>识别 / 建模 / 数据审查 / 战后剧情等每次 LLM 请求的最大尝试次数；全自动模式在限制内整体自动重试；识别声明校验失败会先让主 AI 修正一步而非直接报错。</small></label></details><details class="bo-fold" open><summary>战场建模</summary><label class="bo-setting"><input id="battle-orb-fast-modeling" type="checkbox" ${settings.fastModeling ? 'checked' : ''}><span>急速模式（无二阶段检查）</span><small>建模阶段仅做一次生成，跳过战斗数据检查 AI 的审查；适合追求速度与低消耗。</small></label><label class="bo-setting"><input id="battle-orb-rollback-modeling" type="checkbox" ${settings.rollbackModeling ? 'checked' : ''}><span>回滚模式</span><small>第一阶段成功即归档；第二阶段全部失败时立刻用第一阶段结果创建战场，不再报错或等待。</small></label></details><details class="bo-fold" open><summary>工作 API 预设</summary><small class="bo-muted">为“战场识别”与“战场建模”两种调用场景各自配置调用来源：酒馆 API（generateRaw）为默认选项，也可改用自定义 API 预设（Base URL / 路径 / 模型 / Key / 额外头与体），并可按实例保存复用。</small>${renderWorkApiSection('declaration')}${renderWorkApiSection('modeling')}</details><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示、判断依据、建模模式、重试次数、DEBUG 模式与工作 API 预设设置已持久化到浏览器本地。</p>`;
     const mvu = content.querySelector('#battle-orb-mvu');
     if (mvu) mvu.textContent = tavernSnapshot ? JSON.stringify(tavernSnapshot.mvu.state, null, 2) : '同步后显示';
 }
@@ -2581,10 +2657,10 @@ function renderBenchmarkView() {
 }
 
 function renderView() {
-    // DEBUG 模式关闭时，隐藏提示词/基准/DEBUG 导出等详细工具与入口。
-    const debugTools = ['#battle-orb-tool-prompts', '#battle-orb-tool-debug', '#battle-orb-tool-bench'];
+    // DEBUG 模式关闭时，隐藏提示词与基准等详细工具；导出 DEBUG 记录按钮始终可见。
+    const debugTools = ['#battle-orb-tool-prompts', '#battle-orb-tool-bench'];
     for (const selector of debugTools) { const node = $(selector); if (node) node.hidden = settings.debugMode ? false : true; }
-    const debugInline = $('#battle-orb-tool-debug-inline'); if (debugInline) debugInline.hidden = settings.debugMode ? false : true;
+    const debugInline = $('#battle-orb-tool-debug-inline'); if (debugInline) debugInline.hidden = false;
     const views = { stage: '#battle-orb-stage', settings: '#battle-orb-settings-view', prompts: '#battle-orb-prompts-view', benchmark: '#battle-orb-benchmark-view' };
     for (const [key, selector] of Object.entries(views)) {
         const node = $(selector);
@@ -2600,7 +2676,7 @@ function renderView() {
 
 function setView(next) {
     view = next;
-    if (next !== 'stage') lastStage = null;
+    if (next !== 'stage') { lastStage = null; lastAutoKey = ''; }
     render();
 }
 
@@ -2615,7 +2691,7 @@ function startNewBattle() {
     battle = null; engine = null; repository = null; model = null; declaration = null; tavernSnapshot = null;
     deployState = { strategyText: '', activePreset: null, assignments: {} };
     mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; actionNotice = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
-    flowError = null; stageOverride = 'read'; lastStage = null;
+    flowError = null; stageOverride = 'read'; lastStage = null; lastAutoKey = ''; autoState.failed = false; autoCancelRequested = false;
     setStatus('已重置；从读取阶段开始新战斗', 'ok');
     render();
 }
@@ -2629,7 +2705,7 @@ function resetToStageOne() {
 
 function bindPanel() {
     document.addEventListener('click', event => {
-        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-enter-battle, #battle-orb-back-create, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts, #battle-orb-preview-confirm, #battle-orb-preview-cancel, #battle-orb-auto, [data-deploy-preset]');
+        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-enter-battle, #battle-orb-back-create, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts, #battle-orb-preview-confirm, #battle-orb-preview-cancel, #battle-orb-auto, #battle-orb-auto-cancel, [data-deploy-preset]');
         if (!target) return;
         const presetButton = event.target.closest('[data-deploy-preset]');
         if (presetButton) {
@@ -2658,19 +2734,20 @@ function bindPanel() {
             return;
         }
         if (target.id === 'battle-orb-auto') { void runFullAuto(); return; }
+        if (target.id === 'battle-orb-auto-cancel') { cancelFullAuto(); return; }
         if (target.id === 'battle-orb-recognize') { void recognize(); return; }
         if (target.id === 'battle-orb-create') { void createBattle(); return; }
         if (target.id === 'battle-orb-narrate') { void narrate(); return; }
         if (target.id === 'battle-orb-to-create') { stageOverride = 'create'; render(); return; }
         if (target.id === 'battle-orb-back-recognize') { stageOverride = 'recognize'; render(); return; }
         if (target.id === 'battle-orb-enter-battle') { void enterBattle(); return; }
-        if (target.id === 'battle-orb-back-create') { resetBattleState(); stageOverride = 'recognize'; lastStage = null; setStatus('已放弃当前战场，返回修改声明', 'ok'); render(); return; }
+        if (target.id === 'battle-orb-back-create') { resetBattleState(); stageOverride = 'recognize'; lastStage = null; lastAutoKey = ''; setStatus('已放弃当前战场，返回修改声明', 'ok'); render(); return; }
         if (target.id === 'battle-orb-new-battle') { startNewBattle(); return; }
         if (target.id === 'battle-orb-approve-abandon') {
             battle = null; engine = null; repository = null; model = null;
             deployState = { strategyText: '', activePreset: null, assignments: {} };
             mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; actionNotice = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
-            stageOverride = 'create'; lastStage = null;
+            stageOverride = 'create'; lastStage = null; lastAutoKey = '';
             setStatus('已放弃当前战斗，可返回修改声明或重新创建', 'ok');
             render(); return;
         }
@@ -3067,6 +3144,8 @@ globalThis.__battleOrbDebug = {
     settings: () => ({ ...settings }),
     flowError: () => flowError ? { ...flowError } : null,
     state: () => publicBattle(),
+    autoState: () => ({ ...autoState }),
+    declaration: () => declaration ? clone(declaration) : null,
     applyModelSuggestions: (model, declaration, suggestions) => applyModelSuggestions(model, declaration, suggestions),
     mergeModel: (candidate, input) => mergeModel(candidate, input),
 };
