@@ -1,4 +1,4 @@
-const VERSION = '0.19.0';
+const VERSION = '0.20.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -431,7 +431,7 @@ function normalizeDeclaration(input) {
     output.participants = output.participants.map((item, index) => ({
         id: String(item.id || `participant-${index + 1}`), name: String(item.name || `参战者 ${index + 1}`), count: Math.max(1, Number(item.count) || 1),
         side: item.side === 'player' ? 'player' : item.side === 'neutral' || item.side === 'ally' ? 'neutral' : 'enemy', source: item.source === 'existing' ? 'existing' : 'create',
-        state: typeof item.state === 'string' ? item.state : '已进入交战状态', relativePosition: String(item.relativePosition || '战场中'), ...(item.reference ? { reference: String(item.reference).replace(/^\/+/, '').replace(/^关系列表[\\/]/, '') } : {}),
+        state: typeof item.state === 'string' ? item.state : '已进入交战状态', relativePosition: String(item.relativePosition || '战场中'), ...(item.reference ? { reference: String(item.reference).replace(/^\/+/, '').replace(/[\\/.]/g, '/') } : {}),
     }));
     return output;
 }

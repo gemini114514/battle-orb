@@ -8,6 +8,32 @@ const sideIndexCache = new WeakMap();
 const AWARENESS_RANK = Object.freeze({ unaware: 0, suspicious: 1, tracking: 2, engaged: 3 });
 const clockMs = () => globalThis.process?.hrtime?.bigint ? Number(globalThis.process.hrtime.bigint()) / 1e6 : globalThis.performance?.now?.() || Date.now();
 
+// 根据战场最终状态，程序化生成敌方单位的 MVU 回写 patch（不依赖正文 AI）。
+// 每个有 reference 的敌方声明参与者按组聚合：存活成员数、存活成员剩余 HP 之和、
+// 组血池清零；全灭则 数量=0 / 在场=false，杜绝“被干掉的敌人战后仍满血存在”。
+function buildEnemyStatePatches(state) {
+    const patches = [];
+    const references = new Map();
+    for (const participant of (state.preparation?.declaration?.participants || [])) {
+        if (!participant || participant.side !== 'enemy' || participant.id == null || !participant.reference) continue;
+        let reference = String(participant.reference).replace(/^\/+/, '').replace(/[\\/.]/g, '/');
+        if (!reference.includes('/')) reference = `关系列表/${reference}`;
+        references.set(String(participant.id), reference);
+    }
+    for (const [declarationId, reference] of references) {
+        const members = state.combatants.filter(unit => unit.side === 'enemy' && (String(unit.declarationId) === declarationId || String(unit.id) === declarationId));
+        if (!members.length) continue;
+        const alive = members.filter(unit => unit.state === 'active');
+        const remainingHp = alive.reduce((sum, unit) => sum + Math.max(0, Number(unit.hp) || 0), 0);
+        const base = `/stat_data/${reference}`;
+        patches.push({ op: 'replace', path: `${base}/HP`, value: remainingHp });
+        patches.push({ op: 'replace', path: `${base}/THP`, value: 0 });
+        patches.push({ op: 'replace', path: `${base}/数量`, value: alive.length });
+        patches.push({ op: 'replace', path: `${base}/在场`, value: alive.length > 0 });
+    }
+    return patches;
+}
+
 export class CombatEngine {
     constructor(repository) { this.repository = repository; }
 
@@ -1942,18 +1968,21 @@ export class CombatEngine {
         const events = [...this.repository.events(state.id), ...state.pendingEvents];
         const finalSnapshot = { battlefield: deepClone(state.battlefield), combatants: deepClone(state.combatants), zones: deepClone(state.zones), intel: deepClone(state.intel), meleeSlots: deepClone(state.meleeSlots), round: state.round };
         const protagonist = state.combatants.find(unit => unit.side === 'player' && unit.controller === 'player') || state.combatants.find(unit => unit.side === 'player');
+        // 程序化回写参战敌方单位的最终状态（HP/THP/数量/在场），不再依赖正文 AI 自觉
+        // 补 patch——AI 经常遗漏，导致被干掉的敌人仍在 MVU 里满血存活。
+        const protagonistPatch = protagonist ? [
+            { op: 'replace', path: '/stat_data/系统状态/是否战斗中', value: false },
+            { op: 'replace', path: '/stat_data/系统状态/当前轮次', value: state.round },
+            { op: 'replace', path: '/stat_data/主角/HP', value: protagonist.hp },
+            { op: 'replace', path: '/stat_data/主角/EP', value: protagonist.ep },
+        ] : [];
         state.finalResult = {
             battleId: state.id, winner, rulesetVersion: state.rulesetVersion, seed: state.seed, initialHash: state.initialHash,
             eventHash: events.at(-1)?.hash || null, rounds: state.round, initialState: state.initialSnapshot, finalState: finalSnapshot,
             casualties: state.combatants.filter(unit => unit.state !== 'active').map(unit => ({ id: unit.id, name: unit.name, side: unit.side, state: unit.state })),
             keyEvents: events.filter(event => ['initiative_roll', 'initiative_order_locked', 'round_started', 'attack_check', 'counterattack_triggered', 'unit_state_changed', 'boss_phase_changed', 'player_dying', 'intel_detected', 'intel_shared', 'noise_emitted', 'melee_slots_allocated', 'awareness_changed', 'tracking_lost', 'maneuver_check', 'maneuver_resolved', 'lure_created', 'withdrawal_resolved', 'activation_summary'].includes(event.type)).slice(-200),
             checkResults: events.filter(event => event.type === 'attack_check').map(event => event.payload),
-            mvuPatch: protagonist ? [
-                { op: 'replace', path: '/stat_data/系统状态/是否战斗中', value: false },
-                { op: 'replace', path: '/stat_data/系统状态/当前轮次', value: state.round },
-                { op: 'replace', path: '/stat_data/主角/HP', value: protagonist.hp },
-                { op: 'replace', path: '/stat_data/主角/EP', value: protagonist.ep },
-            ] : [],
+            mvuPatch: [...protagonistPatch, ...buildEnemyStatePatches(state)],
             narrativeAnchors: this.buildNarrativeAnchors(events),
         };
         this.event(state, 'combat_completed', { winner, rounds: state.round, resultHash: sha256({ winner, rounds: state.round, seed: state.seed, initialHash: state.initialHash, finalState: finalSnapshot, casualties: state.finalResult.casualties, checkResults: state.finalResult.checkResults }) });
