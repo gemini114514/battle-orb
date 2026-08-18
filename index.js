@@ -1,4 +1,4 @@
-const VERSION = '0.7.7';
+const VERSION = '0.7.8';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -411,7 +411,12 @@ const roll = api.d100();
 api.damage(t.id, 20 + (roll > 75 ? 10 : 0));   // 暴击
 if (roll > 50) api.status(t.id, "bleed", 2);    // 出血 DoT
 api.push(t.id, 1.5, 0);                          // 击退
-可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（地面 AoE 范围查询）、api.d100()/api.d(n)（确定性骰）、api.damage(targetId,amount,type?)、api.heal、api.status、api.dispel、api.move、api.push(targetId,dx,dy)、api.resource、api.summon(templateId,zoneId,count)、api.log。信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责护甲/死亡/碰撞结算。
+可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（地面 AoE 范围查询）、api.d100()/api.d(n)（确定性骰）、api.damage(targetId,amount,type?)、api.heal、api.status、api.dispel、api.move、api.push(targetId,dx,y)、api.resource、api.summon(templateId,zoneId,count)、api.log。信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责护甲/死亡/碰撞结算。
+
+【被动技能（事件阶段脚本）】被动写在 combatant 的 passives 数组，每项含 id/name/trigger/script。当前支持的触发器：
+- trigger:"on_kill"：当该单位击杀任意敌人后立即触发。脚本里 api.state().actor 是击杀者（本被动拥有者），api.event() 返回 { type:"on_kill", target:<被击杀的敌人> }，可用 api.heal/api.status/api.damage 等发射效果。示例（击杀回复 10HP）：
+passives:[{ "id":"bio-siphon","name":"生体噬元","trigger":"on_kill","script":"const a = api.state().actor; api.heal(a.id, 10); api.log('击杀回复 10 点生命值');" }]
+被动脚本与能力脚本一样会进入本地沙箱审批，禁止 fetch/eval/DOM。
 
 【基础攻击·硬性要求（违反即被退回修复）】
 - 每个单位必须至少有 1 个基础攻击（普通攻击）：声明式（禁止 script，无需审批即可使用）、actionType=main、power=0、modifier=0（直接使用单位攻击力）、cooldownRounds=0、targetCount=1、aoe=false。
@@ -936,8 +941,7 @@ async function validateScriptsLocally(model) {
     if (!model || !Array.isArray(model.combatants)) return model;
     let changed = false;
     const combatants = model.combatants.map(unit => {
-        if (!Array.isArray(unit.abilities)) return unit;
-        const abilities = unit.abilities.map(ability => {
+        const abilities = Array.isArray(unit.abilities) ? unit.abilities.map(ability => {
             if (!ability.script) return ability;
             try {
                 const inspection = inspectScript(ability.script, ability);
@@ -948,8 +952,20 @@ async function validateScriptsLocally(model) {
                 const { script, scriptHash, scriptInspection, ...rest } = ability;
                 return rest;
             }
-        });
-        return { ...unit, abilities };
+        }) : unit.abilities;
+        const passives = Array.isArray(unit.passives) ? unit.passives.map(passive => {
+            if (!passive.script) return passive;
+            try {
+                const inspection = inspectScript(passive.script, passive);
+                return { ...passive, scriptHash: inspection.hash, scriptInspection: inspection };
+            } catch (error) {
+                changed = true;
+                recordDebug('passive_script_downgraded', { unitId: unit.id, passiveId: passive.id, error: String(error.message || error) });
+                const { script, scriptHash, scriptInspection, ...rest } = passive;
+                return rest;
+            }
+        }) : unit.passives;
+        return { ...unit, abilities, passives };
     });
     return changed ? { ...model, combatants } : model;
 }
@@ -1663,18 +1679,23 @@ function renderScriptApproval(state) {
     const pause = state?.pauseReason;
     if (pause?.type !== 'script_approval') { root.innerHTML = ''; return; }
     const unit = state.combatants.find(item => item.id === pause.unitId);
-    const ability = unit?.abilities?.find(item => item.id === pause.abilityId);
+    const isPassive = Boolean(pause.passiveId);
+    const ability = isPassive
+        ? unit?.passives?.find(item => item.id === pause.abilityId)
+        : unit?.abilities?.find(item => item.id === pause.abilityId);
     const inspection = pause.inspection || ability?.scriptInspection || {};
     const caps = Array.isArray(inspection.capabilities) ? inspection.capabilities : [];
     const limits = inspection.limits || {};
     const source = String(inspection.source || ability?.script || '');
+    const kindLabel = isPassive ? `被动脚本 · ${escapeHtml(pause.trigger || ability?.trigger || '事件')}` : '脚本能力';
+    const rejectLabel = isPassive ? '拒绝（移除该被动）' : '拒绝（移除该能力）';
     root.innerHTML = `<div class="bo-script-approval">
-      <header><b>脚本能力审批</b><small>${escapeHtml(pause.abilityId || '')} · ${escapeHtml(ability?.name || '')}</small></header>
+      <header><b>${isPassive ? '被动脚本审批' : '脚本能力审批'}</b><small>${escapeHtml(pause.abilityId || '')} · ${escapeHtml(ability?.name || '')} · ${kindLabel}</small></header>
       <div class="bo-script-meta"><span>哈希 ${escapeHtml(String(inspection.hash || '').slice(0, 16))}…</span><span>${escapeHtml(unit?.name || '')} · ${escapeHtml(ability?.name || '')}</span><span>${escapeHtml(limits.executionMs ?? 25)}ms / ${escapeHtml(limits.memoryMb ?? 16)}MB / ${escapeHtml(limits.maxEffects ?? 64)} 效果</span></div>
       <div class="bo-script-caps">${caps.map(cap => `<span class="bo-script-cap">${escapeHtml(cap)}</span>`).join('') || '<span class="bo-muted">未调用任何接口</span>'}</div>
       <pre class="bo-script-source">${escapeHtml(source)}</pre>
       <div id="battle-orb-script-test" class="bo-script-test">沙箱测试：<button id="battle-orb-script-run-test" class="bo-secondary" type="button">运行 100 轮种子测试</button></div>
-      <div class="bo-script-actions"><button id="battle-orb-script-approve" class="bo-primary" type="button" data-script-hash="${escapeHtml(String(inspection.hash || ''))}" data-script-unit="${escapeHtml(pause.unitId || '')}" data-script-ability="${escapeHtml(pause.abilityId || '')}">批准</button><button id="battle-orb-script-reject" class="bo-secondary" type="button" data-script-unit="${escapeHtml(pause.unitId || '')}" data-script-ability="${escapeHtml(pause.abilityId || '')}">拒绝（移除该能力）</button></div>
+      <div class="bo-script-actions"><button id="battle-orb-script-approve" class="bo-primary" type="button" data-script-hash="${escapeHtml(String(inspection.hash || ''))}" data-script-unit="${escapeHtml(pause.unitId || '')}" data-script-ability="${escapeHtml(pause.abilityId || '')}">批准</button><button id="battle-orb-script-reject" class="bo-secondary" type="button" data-script-unit="${escapeHtml(pause.unitId || '')}" data-script-ability="${escapeHtml(pause.abilityId || '')}">${rejectLabel}</button></div>
     </div>`;
 }
 
@@ -1999,7 +2020,9 @@ function bindPanel() {
             const state = publicBattle();
             const pause = state?.pauseReason;
             const unit = state?.combatants?.find(item => item.id === pause?.unitId);
-            const ability = unit?.abilities?.find(item => item.id === pause?.abilityId);
+            const ability = pause?.passiveId
+                ? unit?.passives?.find(item => item.id === pause?.abilityId)
+                : unit?.abilities?.find(item => item.id === pause?.abilityId);
             if (!ability?.script) return;
             setStatus('正在运行沙箱测试（100 轮种子用例）…', 'working');
             void testScript(ability.script, ability).then(result => {

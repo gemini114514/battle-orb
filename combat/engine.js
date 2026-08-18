@@ -656,7 +656,17 @@ export class CombatEngine {
             const hash = scriptHash(ability.script);
             ability.scriptHash = hash;
             if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
-                state.status = 'awaiting_script_approval'; state.pauseReason = { type: 'script_approval', unitId: unit.id, abilityId: ability.id, inspection: inspectScript(ability.script, ability) };
+                state.status = 'awaiting_script_approval'; state.pauseReason = { type: 'script_approval', unitId: unit.id, abilityId: ability.id, scriptHash: hash, inspection: inspectScript(ability.script, ability) };
+                this.event(state, 'script_approval_required', state.pauseReason); return;
+            }
+            if (!state.approvedScripts.includes(hash)) state.approvedScripts.push(hash);
+        }
+        for (const unit of state.combatants) for (const passive of unit.passives || []) {
+            if (!passive.script) continue;
+            const hash = scriptHash(passive.script);
+            passive.scriptHash = hash;
+            if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
+                state.status = 'awaiting_script_approval'; state.pauseReason = { type: 'script_approval', unitId: unit.id, abilityId: passive.id, passiveId: passive.id, scriptHash: hash, inspection: inspectScript(passive.script, passive) };
                 this.event(state, 'script_approval_required', state.pauseReason); return;
             }
             if (!state.approvedScripts.includes(hash)) state.approvedScripts.push(hash);
@@ -894,7 +904,7 @@ export class CombatEngine {
         const targets = (ability.aoe || ability.targetCount > 1) ? this.knownTargets(state, actor).filter(item => rangeLegal(state, actor, item, ability) && this.canEngage(state, actor, item, ability)).slice(0, ability.targetCount) : [target];
         while (!ability.aoe && targets.length > 1 && actor.ep < Math.ceil(ability.epCost * targetCostMultiplier(targets.length))) targets.pop();
         if (ability.script) { if (!await this.executeScriptAbility(state, actor, targets, ability)) return; }
-        else this.resolveAttack(state, actor, targets, ability);
+        else await this.resolveAttack(state, actor, targets, ability);
         // A confirmed “拉扯/风筝/边打边退” strategy spends the remaining
         // movement budget immediately after a successful attack. This keeps
         // the player from standing in the same contact cluster while still
@@ -1119,7 +1129,7 @@ export class CombatEngine {
             if (budget.main <= 0) throw httpError(400, '本回合主要行动已用尽');
             if (actor.cooldowns?.[ability.id]) throw httpError(400, `能力冷却中：剩余 ${actor.cooldowns[ability.id]} 回合`);
             const moved = this.moveAttack(state, actor, target, ability);
-            this.resolveAttack(state, actor, [target], ability);
+            await this.resolveAttack(state, actor, [target], ability);
             budget.main -= 1;
             this.event(state, 'move_attack_resolved', { actorId: actor.id, targetId: target.id, abilityId: ability.id, distanceMeters: Math.round(moved * 1000) / 1000 });
             endTurn = this.movementRemaining(state, actor) <= 1e-6;
@@ -1182,7 +1192,7 @@ export class CombatEngine {
             const targets = (command.targetIds || []).map(id => state.combatants.find(item => item.id === id)).filter(Boolean);
             if (!targets.length) throw httpError(400, '请选择目标');
             if (targets.length > ability.targetCount) throw httpError(400, '目标数量超过能力上限');
-            this.resolveAttack(state, actor, targets, ability);
+            await this.resolveAttack(state, actor, targets, ability);
             budget[actionType] -= 1;
             const hasAnotherAttack = actor.abilities.some(item => budget[item.actionType || 'main'] > 0 && !actor.cooldowns?.[item.id] && actor.ep >= item.epCost && this.knownTargets(state, actor).some(target => rangeLegal(state, actor, target, item) && this.canEngage(state, actor, target, item)));
             // Movement is a meter pool, not a separate once-per-turn action.
@@ -1202,11 +1212,11 @@ export class CombatEngine {
         if (!this.afterAction(state)) await this.advanceUntilPause(state, state.mode === 'manual' ? 1000 : 10000);
     }
 
-    resolveAttack(state, actor, targets, ability, options = {}) {
-        return this.benchmarkMeasure(state, 'engine.resolve-attack', () => this.resolveAttackMeasured(state, actor, targets, ability, options));
+    async resolveAttack(state, actor, targets, ability, options = {}) {
+        return this.benchmarkMeasureAsync(state, 'engine.resolve-attack', () => this.resolveAttackMeasured(state, actor, targets, ability, options));
     }
 
-    resolveAttackMeasured(state, actor, targets, ability, { allowCounterattack = true, counterattack = false, ignoreEngagement = false, triggerSequence = null, rng: sharedRng = null } = {}) {
+    async resolveAttackMeasured(state, actor, targets, ability, { allowCounterattack = true, counterattack = false, ignoreEngagement = false, triggerSequence = null, rng: sharedRng = null } = {}) {
         const totalEpCost = Math.ceil(ability.epCost * (ability.aoe ? 1 : targetCostMultiplier(targets.length)));
         if (actor.ep < totalEpCost) throw httpError(400, 'EP 不足');
         for (const target of targets) {
@@ -1246,7 +1256,10 @@ export class CombatEngine {
                 const multiplier = !ability.aoe && index > 0 ? .7 : 1;
                 applied = applyDamage(target, Math.round(damage.final * multiplier));
                 if (target.state !== applied.before.state) this.event(state, 'unit_state_changed', { unitId: target.id, from: applied.before.state, to: target.state });
-                if (target.state === 'dying' && applied.before.state === 'active') actor.kills += 1;
+                if (target.state === 'dying' && applied.before.state === 'active') {
+                    actor.kills += 1;
+                    if (!state.__passiveExecuting) await this.runOnKillPassives(state, actor, target, rng);
+                }
                 this.checkBossPhase(state, target);
             }
             const result = { targetId: target.id, rawRolls: roll.rolls, selected: roll.selected, rngIndex: roll.rngIndex, modifier: actor.attackModifier + actor.tierCorrection + ability.modifier, total, defenseDC: effectiveDefenseDC, ambush, outcome: roll.selected <= 5 ? 'disaster' : roll.selected >= 96 ? 'miracle' : hit ? 'hit' : 'miss', damage, applied };
@@ -1270,7 +1283,7 @@ export class CombatEngine {
             // the defender remains active. Counterattacks opt out of this
             // hook so two melee units cannot recurse forever.
             if (allowCounterattack && isMeleeAbility(ability) && living(target) && living(actor)) {
-                this.resolveMeleeCounterattack(state, target, actor, attackEvent, rng);
+                await this.resolveMeleeCounterattack(state, target, actor, attackEvent, rng);
             }
             if (!living(actor)) break;
         }
@@ -1285,7 +1298,7 @@ export class CombatEngine {
         return preferred || unit.abilities?.find(item => item.id === 'basic-attack' || isMeleeAbility(item)) || null;
     }
 
-    resolveMeleeCounterattack(state, defender, attacker, triggerEvent, sharedRng = null) {
+    async resolveMeleeCounterattack(state, defender, attacker, triggerEvent, sharedRng = null) {
         const ability = this.counterattackAbility(defender);
         if (!ability || !living(defender) || !living(attacker) || !rangeLegal(state, defender, attacker, ability)) return;
         const passive = (defender.passives || []).find(item => item.id === 'melee-counterattack');
@@ -1294,7 +1307,7 @@ export class CombatEngine {
             passiveId: passive?.id || 'melee-counterattack', triggerSequence: triggerEvent?.sequence || null,
             incomingOutcome: triggerEvent?.payload?.outcome || null,
         });
-        this.resolveAttack(state, defender, [attacker], ability, { allowCounterattack: false, counterattack: true, ignoreEngagement: true, triggerSequence: triggerEvent?.sequence || null, rng: sharedRng });
+        await this.resolveAttack(state, defender, [attacker], ability, { allowCounterattack: false, counterattack: true, ignoreEngagement: true, triggerSequence: triggerEvent?.sequence || null, rng: sharedRng });
     }
 
     canEngage(state, actor, target, ability) {
@@ -1541,9 +1554,8 @@ export class CombatEngine {
                 zones: state.zones,
                 rng: scriptRng,
             });
-            this.applyEffects(state, actor, output.effects);
-            this.event(state, 'script_action_resolved', { actorId: actor.id, abilityId: ability.id, scriptHash: hash, epCost: ability.epCost, rng: scriptRng, effects: output.effects });
-            return true;
+            await this.applyEffects(state, actor, output.effects);
+            this.event(state, 'script_action_resolved', { actorId: actor.id, abilityId: ability.id, scriptHash: hash, epCost: ability.epCost, rng: scriptRng, effects: output.effects });            return true;
         } catch (error) {
             actor.ep += ability.epCost;
             this.pause(state, { type: 'script_error', actorId: actor.id, abilityId: ability.id, scriptHash: hash, error: error.message });
@@ -1578,12 +1590,52 @@ export class CombatEngine {
         return created;
     }
 
-    applyEffects(state, actor, effects) {
+    async runOnKillPassives(state, actor, target, sharedRng = null) {
+        if (!living(actor) || !target) return;
+        const passives = (actor.passives || []).filter(passive => passive.trigger === 'on_kill' && passive.script && passive.enabled !== false);
+        if (!passives.length) return;
+        state.__passiveExecuting = true;
+        try {
+            for (const passive of passives) {
+                const hash = passive.scriptHash || scriptHash(passive.script);
+                if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
+                    state.status = 'awaiting_script_approval';
+                    state.pauseReason = { type: 'script_approval', unitId: actor.id, abilityId: passive.id, passiveId: passive.id, scriptHash: hash, inspection: inspectScript(passive.script, passive) };
+                    this.event(state, 'script_approval_required', state.pauseReason);
+                    return;
+                }
+                const scriptRng = this.nextScriptRng(state);
+                try {
+                    const output = await runScript(passive.script, {
+                        ability: { id: passive.id, name: passive.name || passive.id },
+                        actor: deepClone(actor),
+                        targets: [deepClone(target)],
+                        units: state.combatants.filter(unit => unit.state !== 'dying').map(unit => ({ id: unit.id, name: unit.name, side: unit.side, hp: unit.hp, maxHp: unit.maxHp, ep: unit.ep, position: unit.position, statuses: unit.statuses })),
+                        battlefield: state.battlefield,
+                        round: state.round,
+                        zones: state.zones,
+                        rng: scriptRng,
+                        event: { type: 'on_kill', actorId: actor.id, targetId: target.id, target: deepClone(target) },
+                    });
+                    await this.applyEffects(state, actor, output.effects);
+                    this.event(state, 'passive_script_resolved', { actorId: actor.id, passiveId: passive.id, trigger: 'on_kill', targetId: target.id, scriptHash: hash, rng: scriptRng, effects: output.effects });
+                } catch (error) {
+                    this.event(state, 'passive_script_error', { actorId: actor.id, passiveId: passive.id, trigger: 'on_kill', scriptHash: hash, error: error.message });
+                }
+            }
+        } finally { state.__passiveExecuting = false; }
+    }
+
+    async applyEffects(state, actor, effects) {
         for (const effect of effects) {
             const target = state.combatants.find(item => item.id === effect.targetId);
             if (effect.type === 'damage' && target) {
                 const applied = applyDamage(target, Math.max(0, Math.round(effect.amount)));
                 if (target.state !== applied.before.state) this.event(state, 'unit_state_changed', { unitId: target.id, from: applied.before.state, to: target.state });
+                if (target.state === 'dying' && applied.before.state === 'active') {
+                    actor.kills += 1;
+                    if (!state.__passiveExecuting) await this.runOnKillPassives(state, actor, target);
+                }
                 this.checkBossPhase(state, target);
             }
             else if (effect.type === 'heal' && target) { const beforeState = target.state; target.hp = Math.min(target.maxHp, target.hp + Math.max(0, Math.round(effect.amount))); if (target.hp > 0 && target.state === 'dying') target.state = 'active'; if (beforeState !== target.state) this.event(state, 'unit_state_changed', { unitId: target.id, from: beforeState, to: target.state }); }
@@ -1702,10 +1754,15 @@ export class CombatEngine {
             if (!state.approvedScripts.includes(String(input.scriptHash))) state.approvedScripts.push(String(input.scriptHash));
             this.event(state, 'script_approved', { unitId: input.unitId, abilityId: input.abilityId, scriptHash: String(input.scriptHash) });
         } else if (input.mode === 'reject') {
-            const index = unit?.abilities?.findIndex(ability => ability.id === input.abilityId) ?? -1;
-            if (!unit || index < 0) throw httpError(400, '未找到该脚本能力');
-            unit.abilities.splice(index, 1);
-            this.event(state, 'script_rejected', { unitId: input.unitId, abilityId: input.abilityId });
+            if (unit?.passives?.some(passive => passive.id === input.abilityId && passive.script)) {
+                unit.passives = unit.passives.filter(passive => passive.id !== input.abilityId);
+                this.event(state, 'script_rejected', { unitId: input.unitId, abilityId: input.abilityId, passiveId: input.abilityId });
+            } else {
+                const index = unit?.abilities?.findIndex(ability => ability.id === input.abilityId) ?? -1;
+                if (!unit || index < 0) throw httpError(400, '未找到该脚本能力');
+                unit.abilities.splice(index, 1);
+                this.event(state, 'script_rejected', { unitId: input.unitId, abilityId: input.abilityId });
+            }
         }
         for (const candidate of state.combatants) for (const ability of candidate.abilities) {
             if (!ability.script) continue;
@@ -1713,7 +1770,18 @@ export class CombatEngine {
             ability.scriptHash = hash;
             if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
                 state.status = 'awaiting_script_approval';
-                state.pauseReason = { type: 'script_approval', unitId: candidate.id, abilityId: ability.id, inspection: inspectScript(ability.script, ability) };
+                state.pauseReason = { type: 'script_approval', unitId: candidate.id, abilityId: ability.id, scriptHash: hash, inspection: inspectScript(ability.script, ability) };
+                this.event(state, 'script_approval_required', state.pauseReason);
+                return false;
+            }
+        }
+        for (const candidate of state.combatants) for (const passive of candidate.passives || []) {
+            if (!passive.script) continue;
+            const hash = passive.scriptHash || scriptHash(passive.script);
+            passive.scriptHash = hash;
+            if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
+                state.status = 'awaiting_script_approval';
+                state.pauseReason = { type: 'script_approval', unitId: candidate.id, abilityId: passive.id, passiveId: passive.id, scriptHash: hash, inspection: inspectScript(passive.script, passive) };
                 this.event(state, 'script_approval_required', state.pauseReason);
                 return false;
             }

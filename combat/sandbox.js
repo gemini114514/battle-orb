@@ -41,7 +41,7 @@ export function inspectScript(source, ability = {}) {
     if (textSize > MAX_SOURCE) throw new Error('脚本超过 64KB');
     const forbidden = /\b(?:fetch|XMLHttpRequest|WebSocket|require|process|Deno|Bun|importScripts|eval|Function|document|window|location)\b|\bimport\s*\(/;
     if (forbidden.test(text)) throw new Error('脚本请求了沙箱禁止能力');
-    const apiNames = ['state', 'distance', 'unitsInArea', 'd100', 'd', 'damage', 'heal', 'status', 'dispel', 'move', 'push', 'resource', 'summon', 'log'];
+    const apiNames = ['state', 'distance', 'unitsInArea', 'd100', 'd', 'damage', 'heal', 'status', 'dispel', 'move', 'push', 'resource', 'summon', 'log', 'event'];
     const capabilities = [...new Set([...text.matchAll(/api\.([a-zA-Z]+)\s*\(/g)].map(match => match[1]).filter(name => apiNames.includes(name)))];
     return { hash: scriptHash(text), rulesetVersion: RULESET_VERSION, ability: { id: ability.id, name: ability.name }, source: text, size: textSize, capabilities, limits: { executionMs: 25, memoryMb: 16, maxEffects: MAX_EFFECTS, triggerDepth: 8 } };
 }
@@ -94,7 +94,8 @@ export async function runScript(source, input) {
               push: (targetId, dx, dy) => emit("push", { targetId: String(targetId), dx: Number(dx), dy: Number(dy) }),
               resource: (targetId, resource, delta) => emit("resource", { targetId: String(targetId), resource: String(resource), delta: Number(delta) }),
               summon: (templateId, zoneId, count = 1, x = null, y = null) => emit("summon", { templateId: String(templateId), zoneId: String(zoneId), count: Number(count), x: x === null ? null : Number(x), y: y === null ? null : Number(y) }),
-              log: (message) => emit("log", { message: String(message) })
+              log: (message) => emit("log", { message: String(message) }),
+              event: () => ({ type: input.event?.type || null, actor: input.actor || null, target: input.event?.target || null })
             });
             Math.random = undefined;
             (() => { ${source}\n })();

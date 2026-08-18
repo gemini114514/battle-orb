@@ -356,6 +356,8 @@ export function normalizePassives(passives, abilities = []) {
         enabled: passive.enabled !== false,
         trigger: passive.trigger || null,
         abilityId: passive.abilityId ? String(passive.abilityId) : null,
+        script: typeof passive.script === 'string' ? passive.script : null,
+        scriptHash: passive.scriptHash || null,
     })) : [];
     if (!output.some(passive => passive.id === 'melee-counterattack') && abilities.some(ability => ability?.id === 'basic-attack' || isMeleeAbility(ability))) {
         output.unshift({ id: 'melee-counterattack', name: '近战自动反击', type: 'passive', enabled: true, trigger: 'melee_attacked', abilityId: 'basic-attack' });
