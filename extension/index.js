@@ -1,4 +1,4 @@
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -48,6 +48,12 @@ const forcedUnitIds = new Set();
 let mapState = null;
 let busy = false;
 let mounted = false;
+
+const SETTINGS_KEY = 'battle-orb.settings';
+let settings = { writeVerdictBasis: true };
+let flowError = null;
+try { settings = { writeVerdictBasis: true, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { /* keep defaults */ }
+const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} };
 
 const $ = selector => document.querySelector(selector);
 const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
@@ -425,6 +431,7 @@ function declarationValidation(value) {
 
 async function recognize() {
     if (busy) return;
+    flowError = null;
     busy = true; setStatus('正在读取酒馆楼层与 MVU…', 'working');
     try {
         tavernSnapshot = readTavern();
@@ -438,13 +445,14 @@ async function recognize() {
         $('#battle-orb-declaration').value = JSON.stringify(declaration, null, 2);
         render();
         setStatus(tagged ? '已从当前楼层读取 BattleDeclaration' : '已由酒馆当前 AI 草拟战场声明', 'ok');
-    } catch (error) { notify(`识别战场失败：${error.message}`, 'error'); }
+    } catch (error) { flowError = { step: 'recognize', message: error.message || '识别失败' }; notify(`识别战场失败：${error.message}`, 'error'); }
     finally { busy = false; render(); }
 }
 
 async function createBattle() {
     if (busy) return;
     try {
+        flowError = null;
         if (!declaration) await recognize();
         if (!declaration) return;
         declaration = normalizeDeclaration(extractJsonObject($('#battle-orb-declaration').value));
@@ -468,7 +476,7 @@ async function createBattle() {
         mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
         setStatus('战场已创建；骰点、伤害、状态、位置和胜负由本地引擎裁定', 'ok');
         render();
-    } catch (error) { notify(`创建战场失败：${error.message}`, 'error'); }
+    } catch (error) { flowError = { step: 'create', message: error.message || '创建失败' }; notify(`创建战场失败：${error.message}`, 'error'); }
     finally { busy = false; render(); }
 }
 
@@ -481,7 +489,9 @@ async function execute(command) {
         await engine.command(battle, command);
         repository.commit(battle);
         mapIntent = null; mapMenu = null;
-        showActionNotice(actionNoticeFromEvents(repository.events(battle.id).slice(-24), publicBattle(), command.actorId, command.type));
+        const notice = actionNoticeFromEvents(repository.events(battle.id).slice(-24), publicBattle(), command.actorId, command.type);
+        showActionNotice(notice);
+        if (notice) setStatus(notice.text, notice.kind);
         return true;
     }
     catch (error) { notify(`行动失败：${error.message}`, 'error'); return false; }
@@ -873,6 +883,24 @@ function renderLedger(state) {
     node.innerHTML = events.length ? events.map(event => `<div><span>#${event.sequence}</span> ${escapeHtml(event.type)} <small>${escapeHtml(JSON.stringify(event.payload || {}).slice(0, 180))}</small></div>`).join('') : '<div class="bo-muted">暂无裁定事件</div>';
 }
 
+function renderSteps() {
+    const steps = [
+        ['read', 'battle-orb-sync', '①', '读取', '楼层 + MVU', Boolean(tavernSnapshot)],
+        ['recognize', 'battle-orb-recognize', '②', '识别', '战场声明', Boolean(declaration)],
+        ['create', 'battle-orb-create', '③', '创建战场', 'CombatModel', Boolean(publicBattle())],
+    ];
+    for (const [key, id, badge, label, hint, done] of steps) {
+        const button = $(`#${id}`);
+        if (!button) continue;
+        const failed = flowError?.step === key;
+        button.classList.toggle('done', done);
+        button.classList.toggle('failed', failed);
+        button.classList.toggle('active', !done && !failed && !busy && (key === 'read' || (key === 'recognize' && Boolean(tavernSnapshot)) || (key === 'create' && Boolean(declaration))));
+        button.disabled = busy || (key === 'create' && !declaration);
+        button.innerHTML = `<i>${failed ? '↻' : badge}</i><b>${failed ? '重试' : label}</b><small>${failed ? (flowError?.message || '') : hint}</small>`;
+    }
+}
+
 function render() {
     const floor = $('#battle-orb-floor');
     if (floor) floor.textContent = tavernSnapshot ? `已读取 ${tavernSnapshot.messages.length} 楼 · MVU ${tavernSnapshot.mvu.applied} 条 Patch · ${tavernSnapshot.mvu.source}` : '尚未读取当前酒馆聊天';
@@ -883,11 +911,47 @@ function render() {
     const state = publicBattle();
     mapState = state;
     const field = $('#battle-orb-field'); if (field) field.hidden = !state;
-    const create = $('#battle-orb-create'); if (create) create.disabled = busy || !declaration;
     const narrateButton = $('#battle-orb-narrate'); if (narrateButton) narrateButton.disabled = busy || !state || state.status !== 'completed';
     const meta = $('#battle-orb-battle-meta');
     if (meta && state) meta.textContent = `${state.title || '遭遇'} · ${state.status} · seed ${String(state.seed || '').slice(0, 12)}`;
     renderTurn(state); renderLedger(state); renderBattlefield(state);
+    renderSteps();
+}
+
+function assistantName() {
+    const ctx = activeContext();
+    const name = String(ctx.name2 || '').trim();
+    if (name && name !== 'SillyTavern System') return name;
+    const all = Array.isArray(ctx.chat) ? ctx.chat : [];
+    for (let index = all.length - 1; index >= 0; index -= 1) {
+        const message = all[index];
+        if (message && !message.is_user && !message.is_system) {
+            const candidate = String(message.name || '').trim();
+            if (candidate && candidate !== 'SillyTavern System') return candidate;
+        }
+    }
+    return name || 'assistant';
+}
+
+function insertFloor(ctx, content, extra = {}) {
+    const mes = String(content || '');
+    const message = {
+        name: assistantName(),
+        is_user: false,
+        is_system: false,
+        send_date: new Date().toISOString(),
+        mes,
+        swipe_id: 0,
+        swipes: [mes],
+        extra,
+    };
+    ctx.chat.push(message);
+    ctx.chatMetadata.tainted = true;
+    const messageId = ctx.chat.length - 1;
+    ctx.addOneMessage(message, { scroll: true });
+    void ctx.eventSource.emit(ctx.eventTypes.MESSAGE_RECEIVED, messageId, 'battle-orb');
+    void ctx.eventSource.emit(ctx.eventTypes.CHARACTER_MESSAGE_RENDERED, messageId, 'battle-orb');
+    return messageId;
 }
 
 async function narrate() {
@@ -895,12 +959,25 @@ async function narrate() {
     if (!state || state.status !== 'completed' || busy) return;
     const ctx = activeContext(); const battleId = state.id;
     if (ctx.chat?.some(message => message.extra?.battleOrb?.battleId === battleId)) return notify('这场战斗已经回写过当前聊天', 'info');
-    busy = true; setStatus('正在让酒馆当前 AI 融合本地战报…', 'working'); render();
+    busy = true; setStatus('正在回写战报…', 'working'); render();
     try {
         const events = repository.events(battleId);
         const final = state.finalResult;
         const dsl = buildBattleResultDsl({ state, events, final });
         const recent = (tavernSnapshot || readTavern()).recent;
+        const checks = (final.checkResults || []).slice(-20).map(check => `- ${check.actorId || ''} → ${check.targetId || ''}：D100 ${check.selected} + ${check.modifier} = ${check.total} / DC ${check.defenseDC}，${check.outcome || 'resolved'}`).join('\n');
+        const patch = Array.isArray(final.mvuPatch) ? final.mvuPatch : [];
+        const recordExtra = { battleOrb: { battleId, replayHash: final.eventHash || null, result: final, importedAt: new Date().toISOString() } };
+        const checksBlock = checks ? `<CheckResult>\n${checks}\n</CheckResult>\n\n` : '';
+        const patchBlock = `<UpdateVariable><JSONPatch>\n${JSON.stringify(patch, null, 2)}\n</JSONPatch></UpdateVariable>`;
+
+        const recordContent = `${dsl}\n\n${checksBlock}${patchBlock}`;
+
+        if (settings.writeVerdictBasis) {
+            insertFloor(ctx, `【Battle Orb 战斗记录】\n${recordContent}`, recordExtra);
+            setStatus('判断依据已正式插入楼层，正在创作剧情…', 'working'); render();
+        }
+
         let prose = '';
         try {
             prose = String(await generateRaw([
@@ -911,16 +988,14 @@ async function narrate() {
             prose = `本地战斗在第 ${final.rounds || state.round || 0} 回合完成。胜者：${final.winner === 'player' ? '玩家方' : final.winner === 'enemy' ? '敌方' : '未决'}。正文 AI 暂不可用，本楼保留本地权威战报与 MVU 更新。`;
             setStatus(`正文 AI 暂不可用，使用本地战报模板回写：${error.message}`, 'warn');
         }
-        const checks = (final.checkResults || []).slice(-20).map(check => `- ${check.actorId || ''} → ${check.targetId || ''}：D100 ${check.selected} + ${check.modifier} = ${check.total} / DC ${check.defenseDC}，${check.outcome || 'resolved'}`).join('\n');
-        const patch = Array.isArray(final.mvuPatch) ? final.mvuPatch : [];
-        const content = `${prose || '本地战斗已完成。'}\n\n${checks ? `<CheckResult>\n${checks}\n</CheckResult>\n\n` : ''}<UpdateVariable><JSONPatch>\n${JSON.stringify(patch, null, 2)}\n</JSONPatch></UpdateVariable>`;
-        const message = { name: ctx.name2 || 'assistant', is_user: false, is_system: false, send_date: Math.floor(Date.now() / 1000), mes: content, extra: { battleOrb: { battleId, replayHash: final.eventHash || null, result: final, importedAt: new Date().toISOString() } } };
-        ctx.chat.push(message); ctx.chatMetadata.tainted = true; const messageId = ctx.chat.length - 1;
-        ctx.addOneMessage(message, { scroll: true });
-        await ctx.eventSource.emit(ctx.eventTypes.MESSAGE_RECEIVED, messageId, 'battle-orb');
-        await ctx.eventSource.emit(ctx.eventTypes.CHARACTER_MESSAGE_RENDERED, messageId, 'battle-orb');
+
+        if (settings.writeVerdictBasis) {
+            insertFloor(ctx, prose || '本地战斗已完成。', {});
+        } else {
+            insertFloor(ctx, `${prose || '本地战斗已完成。'}\n\n${checksBlock}${patchBlock}`, recordExtra);
+        }
         await ctx.saveChat();
-        setStatus('战报已写回当前主 AI 聊天，并保留 MVU JSONPatch', 'ok');
+        setStatus(settings.writeVerdictBasis ? '战斗记录与剧情已写回当前酒馆楼层' : '剧情已写回当前酒馆楼层（仅剧情）', 'ok');
         notify('Battle Orb 战报已回写当前酒馆聊天', 'success');
     } catch (error) { notify(`战后回写失败：${error.message}`, 'error'); }
     finally { busy = false; render(); }
@@ -991,10 +1066,21 @@ async function handleMapClick(event) {
 }
 
 function bindPanel() {
-    $('#battle-orb-sync')?.addEventListener('click', () => { tavernSnapshot = readTavern(); void refreshTavernFromGlobals(); const found = battleDeclarationFromFloor(); if (found) declaration = normalizeDeclaration(found); render(); setStatus(`已读取 ${tavernSnapshot.messages.length} 楼与 ${tavernSnapshot.mvu.applied} 条 MVU Patch（${tavernSnapshot.mvu.source}）`, 'ok'); });
+    $('#battle-orb-sync')?.addEventListener('click', async () => {
+        flowError = null;
+        try {
+            tavernSnapshot = readTavern();
+            await refreshTavernFromGlobals();
+            const found = battleDeclarationFromFloor();
+            if (found) declaration = normalizeDeclaration(found);
+            render();
+            setStatus(`已读取 ${tavernSnapshot.messages.length} 楼与 ${tavernSnapshot.mvu.applied} 条 MVU Patch（${tavernSnapshot.mvu.source}）`, 'ok');
+        } catch (error) { flowError = { step: 'read', message: error.message || '读取失败' }; notify(`读取失败：${error.message}`, 'error'); render(); }
+    });
     $('#battle-orb-recognize')?.addEventListener('click', () => void recognize());
     $('#battle-orb-create')?.addEventListener('click', () => void createBattle());
     $('#battle-orb-narrate')?.addEventListener('click', () => void narrate());
+    $('#battle-orb-write-verdict')?.addEventListener('change', event => { settings.writeVerdictBasis = Boolean(event.target.checked); saveSettings(); setStatus(settings.writeVerdictBasis ? '判断依据回写正文：战斗记录正式插入楼层后再创作剧情' : '只写回剧情：仅把剧情写回楼层', 'ok'); });
     $('#battle-orb-declaration')?.addEventListener('input', event => { try { declaration = normalizeDeclaration(JSON.parse(event.target.value)); } catch { declaration = null; } render(); });
     document.addEventListener('click', async event => {
         const action = event.target.closest('[data-action]')?.dataset.action;
@@ -1067,8 +1153,13 @@ function mount() {
       <section id="${PANEL_ID}">
         <header id="battle-orb-head" class="bo-header"><div><small>BATTLE ORB · TAVERN NATIVE</small><h2>战斗球</h2><p>直接读取当前酒馆楼层与 MVU；本地裁定战斗；战报回写主 AI。</p></div><button id="battle-orb-close" class="bo-close">×</button></header>
         <div id="battle-orb-body" class="bo-body">
-          <div id="battle-orb-status" class="bo-status">准备就绪：点击“读取酒馆”</div>
-          <div class="bo-toolbar"><button id="battle-orb-sync">读取酒馆楼层 / MVU</button><button id="battle-orb-recognize">识别 / 生成战场声明</button><button id="battle-orb-create" disabled>创建二维战场</button></div>
+          <div class="bo-steps">
+            <button id="battle-orb-sync" class="bo-step" type="button"><i>①</i><b>读取</b><small>楼层 + MVU</small></button>
+            <button id="battle-orb-recognize" class="bo-step" type="button"><i>②</i><b>识别</b><small>战场声明</small></button>
+            <button id="battle-orb-create" class="bo-step" type="button"><i>③</i><b>创建战场</b><small>CombatModel</small></button>
+          </div>
+          <label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label>
+          <div id="battle-orb-status" class="bo-status">准备就绪：点击“读取”</div>
           <div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div>
           <details class="bo-fold"><summary>当前 MVU 快照</summary><pre id="battle-orb-mvu">同步后显示</pre></details>
           <section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="从当前楼层读取，或点击识别让主 AI 草拟"></textarea></section>
