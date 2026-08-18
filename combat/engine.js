@@ -656,8 +656,13 @@ export class CombatEngine {
             const hash = scriptHash(ability.script);
             ability.scriptHash = hash;
             if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
-                state.status = 'awaiting_script_approval'; state.pauseReason = { type: 'script_approval', unitId: unit.id, abilityId: ability.id, scriptHash: hash, inspection: inspectScript(ability.script, ability) };
-                this.event(state, 'script_approval_required', state.pauseReason); return;
+                if (this.repository.autoApprove) {
+                    // 全自动模式：自动批准并写入持久化缓存，无需手动确认。
+                    this.repository.approveScript(hash, state.rulesetVersion);
+                } else {
+                    state.status = 'awaiting_script_approval'; state.pauseReason = { type: 'script_approval', unitId: unit.id, abilityId: ability.id, scriptHash: hash, inspection: inspectScript(ability.script, ability) };
+                    this.event(state, 'script_approval_required', state.pauseReason); return;
+                }
             }
             if (!state.approvedScripts.includes(hash)) state.approvedScripts.push(hash);
         }
@@ -666,8 +671,12 @@ export class CombatEngine {
             const hash = scriptHash(passive.script);
             passive.scriptHash = hash;
             if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
-                state.status = 'awaiting_script_approval'; state.pauseReason = { type: 'script_approval', unitId: unit.id, abilityId: passive.id, passiveId: passive.id, scriptHash: hash, inspection: inspectScript(passive.script, passive) };
-                this.event(state, 'script_approval_required', state.pauseReason); return;
+                if (this.repository.autoApprove) {
+                    this.repository.approveScript(hash, state.rulesetVersion);
+                } else {
+                    state.status = 'awaiting_script_approval'; state.pauseReason = { type: 'script_approval', unitId: unit.id, abilityId: passive.id, passiveId: passive.id, scriptHash: hash, inspection: inspectScript(passive.script, passive) };
+                    this.event(state, 'script_approval_required', state.pauseReason); return;
+                }
             }
             if (!state.approvedScripts.includes(hash)) state.approvedScripts.push(hash);
         }
@@ -1907,10 +1916,14 @@ export class CombatEngine {
             const hash = ability.scriptHash || scriptHash(ability.script);
             ability.scriptHash = hash;
             if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
-                state.status = 'awaiting_script_approval';
-                state.pauseReason = { type: 'script_approval', unitId: candidate.id, abilityId: ability.id, scriptHash: hash, inspection: inspectScript(ability.script, ability) };
-                this.event(state, 'script_approval_required', state.pauseReason);
-                return false;
+                if (this.repository.autoApprove) {
+                    this.repository.approveScript(hash, state.rulesetVersion);
+                } else {
+                    state.status = 'awaiting_script_approval';
+                    state.pauseReason = { type: 'script_approval', unitId: candidate.id, abilityId: ability.id, scriptHash: hash, inspection: inspectScript(ability.script, ability) };
+                    this.event(state, 'script_approval_required', state.pauseReason);
+                    return false;
+                }
             }
         }
         for (const candidate of state.combatants) for (const passive of candidate.passives || []) {
@@ -1918,10 +1931,14 @@ export class CombatEngine {
             const hash = passive.scriptHash || scriptHash(passive.script);
             passive.scriptHash = hash;
             if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
-                state.status = 'awaiting_script_approval';
-                state.pauseReason = { type: 'script_approval', unitId: candidate.id, abilityId: passive.id, passiveId: passive.id, scriptHash: hash, inspection: inspectScript(passive.script, passive) };
-                this.event(state, 'script_approval_required', state.pauseReason);
-                return false;
+                if (this.repository.autoApprove) {
+                    this.repository.approveScript(hash, state.rulesetVersion);
+                } else {
+                    state.status = 'awaiting_script_approval';
+                    state.pauseReason = { type: 'script_approval', unitId: candidate.id, abilityId: passive.id, passiveId: passive.id, scriptHash: hash, inspection: inspectScript(passive.script, passive) };
+                    this.event(state, 'script_approval_required', state.pauseReason);
+                    return false;
+                }
             }
         }
         state.status = 'paused'; state.pauseReason = null;

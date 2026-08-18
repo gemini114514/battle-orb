@@ -1,4 +1,4 @@
-const VERSION = '0.10.0';
+const VERSION = '0.11.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -23,6 +23,7 @@ try {
         import('./combat/rules.js'),
     ]);
     const { compileStrategy } = await import('./combat/strategy.js');
+    const { materializeScriptLibrary, scriptLibraryPromptText } = await import('./combat/script-library.js');
     const { inspectScript, testScript, runScript } = sandbox;
     bootTrace('dependencies-loaded');
 
@@ -45,6 +46,7 @@ const COMBAT_STRATEGY_PRESETS = Object.freeze({
     guard: { label: '护卫防守', description: '围绕主角或指定队友，优先阻断近身威胁。', text: '护卫防守：优先保护主角和濒危队友，攻击进入近战范围的敌人；不要为了追击远处目标离开护卫位置。' },
 });
 let deployState = { strategyText: '', activePreset: null, assignments: {} };
+let autoState = { running: false, step: '', startedAt: 0 };
 let mapZoom = 1;
 let mapPan = { x: 0, y: 0 };
 let mapIntent = null;
@@ -66,11 +68,15 @@ let mounted = false;
 const SETTINGS_KEY = 'battle-orb.settings';
 const WORK_API_DEFAULT = { provider: 'tavern', baseUrl: '', path: '/v1/chat/completions', apiKey: '', model: '', temperature: 0.4, extraHeaders: '{}', extraBody: '{}', profiles: [], activeProfile: '' };
 const defaultWorkApi = () => ({ ...WORK_API_DEFAULT });
-let settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() } };
+let settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, maxRetries: 3, debugMode: false, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() } };
 let flowError = null;
 try {
     const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-    settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, previewCombat: true, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() }, ...stored };
+    // ?battleOrbDebug=1 强制 DEBUG 界面（自动化冒烟测试用）；真实用户用设置中的 bool 控制。
+    if (new URLSearchParams(location.search).get('battleOrbDebug') === '1') stored.debugMode = true;
+    settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, maxRetries: 3, debugMode: false, previewCombat: true, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() }, ...stored };
+    settings.maxRetries = Math.max(1, Math.min(1000, Number(settings.maxRetries) || 3));
+    settings.debugMode = Boolean(settings.debugMode);
     for (const kind of ['declaration', 'modeling']) {
         settings.api[kind] = { ...WORK_API_DEFAULT, ...(settings.api?.[kind] || {}) };
         if (!Array.isArray(settings.api[kind].profiles)) settings.api[kind].profiles = [];
@@ -601,6 +607,17 @@ const BATTLE_PROTOCOL_V326 = `<战斗协议>
 </战斗协议>
 `;
 
+// 本地脚本库说明：给战斗建模 AI 的“已有本地实现”清单，避免每次战斗重复发明脚本。
+const SCRIPT_LIBRARY_PROMPT_TEXT = `【本地脚本库（这些技能效果已有本地沙箱实现，不要重复发明）】
+以下技能效果已由本地沙箱实现。若某个具名特殊技能/战术技能的预期效果**匹配其中一项**，**不要自写 script**，改为在该能力（或被动）上加两个字段：
+"scriptLibrary": "<id>"      // 必填：效果对应的本地实现 id
+"libraryParams": { ... }     // 可选：覆盖该实现的默认参数（见各条目“默认参数”）
+本地会在进入沙箱前按参数实例化脚本；相同参数跨战斗源码一致，一经批准即可直接复用，无需再次审批。
+只有效果**不匹配任何已有实现**时才自写 script。以下为清单：
+
+${scriptLibraryPromptText()}
+`;
+
 const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)。每个 combatant 必须含 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/position/visionMeters/intelProfile/tacticalProfile/abilities。必须保持 declaration 中的 participant 都出现：玩家 combatant 用原 declarationId，controller=player。
 
 【世界书战斗协议背景（V3.2.6 · 仅作世界观背景理解，勿直接照抄机制）】
@@ -634,6 +651,8 @@ passives:[{ "id":"bio-siphon","name":"生体噬元","trigger":"on_kill","script"
 passives:[{ "id":"iron-stance","name":"铁御","trigger":"on_kill","script":"const a = api.state().actor; api.status(a.id, { id:'stance', name:'铁御', defenseBonus:8, vsMelee:true }, 99); api.modify(a.id, 'defenseDC', 5, { rounds: 99 }); api.log('铁御展开，近战攻击防御提升');" }]
 被动脚本与能力脚本一样会进入本地沙箱审批，禁止 fetch/eval/DOM。
 
+${SCRIPT_LIBRARY_PROMPT_TEXT}
+
 【基础攻击·硬性要求（违反即被退回修复）】
 - 每个单位必须至少有 1 个基础攻击（普通攻击）：声明式（禁止 script，无需审批即可使用）、actionType=main、power=0、modifier=0（直接使用单位攻击力）、cooldownRounds=0、targetCount=1、aoe=false。
 - 请结合单位实际武器装备与战场声明自行作答攻击模式与资源消耗：单位有几个攻击模式/武器就给几个基础攻击（如持弩又架盾 → 弩基础攻击 + 盾基础攻击各一个）。基础攻击默认免费（epCost=0），但若该攻击模式本身有明确的资源消耗设定（如每次射击消耗 EP/弹药），请保留合理的 EP 消耗。判断标准是"实际设定需要消耗多少"：凭空给普通攻击加 EP、或明显不消耗资源的攻击被加了 EP，都是错误；有明确消耗设定的则必须保留。攻击类型（type）与射程也由你根据实际武器装备判断：远程武器（弓/弩/枪械/法杖/投掷/射击）maxRangeMeters ≥ 6m，近战武器（剑/盾/徒手/棍）≤ 2.5m。不要套用模板。
@@ -646,7 +665,7 @@ const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据审查 AI（�
 
 【输入】你会收到：完整 CombatModel（每个 combatant 含 abilities 的信封字段与可选 script）、战场声明 declaration。
 
-【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。带 script 的脚本能力：脚本内容由本地沙箱校验（100 轮种子测试），除第 8 条标注的"固定多发保真修复"外，你**绝不允许**修改、重写或删除 script 字段，也禁止输出脚本内容。
+【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。带 script 的脚本能力：脚本内容由本地沙箱校验（100 轮种子测试），除第 8 条标注的"固定多发保真修复"外，你**绝不允许**修改、重写或删除 script 字段，也禁止输出脚本内容。**脚本能力可能来自本地脚本库**（模型用 scriptLibrary 字段引用，本地已实例化为稳定源码，效果视为已实现）：这类能力你只需要补齐缺失的信封字段（epCost/maxRangeMeters/actionType 等），**绝不改动其 script**，更不要建议重新发明脚本。
 
 【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能开销合理性（对抗性判断，绝不机械地把所有基础攻击改成 0）：结合该攻击模式的实际设定判断 EP 消耗是否合理——凭空给普通攻击/基础攻击加了 EP、或明显不消耗资源的攻击被加了 EP → 输出 set_ability 建议把 epCost 改为 0；若设定明确需要资源（如每次射击消耗 EP/弹药），应保留合理的 epCost，基础攻击同样允许合理 EP 消耗。若某单位完全没有普通攻击（没有任何声明式主行动攻击）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（名称与射程按武器类型调整，epCost 按实际设定）。7) THP/群体（对抗性检查）：战术战场**不使用 THP**——thp 是正文叙事简化概念（护盾、临时防护、群体血池都不属于战术战场）。任何 combatant 的 thp>0，无论是否有护盾/临时防护描述，一律输出 {"op":"set_combatant","declarationId":"..","field":"thp","value":0}；玩家单位同样适用，绝不默认给任何单位加护盾。群体（count>1）：declaration 中 count>1 的 participant，其对应 combatant 必须带 count 字段且等于声明值（引擎自动把该 combatant 展开成 count 个独立成员，每个成员独立 HP/行动）。若 combatant 缺失 count、count 与声明不符、或把群体压成单个单位（如用 thp 当群体血池、用 groupCount 假装数量、把整个群体的总血量塞进一个 hp）→ 输出 {"op":"set_combatant","declarationId":"..","field":"count","value":<声明 count>}；若该 combatant 的 thp>0 一并输出 thp→0。8) 固定多发脚本保真（对抗性检查，唯一允许改写 script 的情形）：能力名或效果承诺"连射/连击/双发/二连/多段/连续 N 发"等固定次数攻击时，检查脚本是否在每次激活中无条件发射恰好 N 发 api.attack。若脚本把攻击次数绑定到 api.state().targets 的长度上（例如 if (targets.length > 1) api.attack(targets[1].id)、或仅对已选目标逐个发射），导致选少目标就少打几发——不符合"固定 N 发"效果 → 输出 {"op":"set_ability_script","declarationId":"..","abilityId":"..","script":"<修复后的固定 N 发脚本>"}，遵循最有利写法：第 1 发打 api.state().targets[0]，后续每一发优先改打另一存活敌人（api.state().enemies 里 hp>0 且 id 不同），无其它存活敌人则连击同一目标。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动（第 7 条的 thp/count 修复除外）。
 
@@ -995,6 +1014,8 @@ function normalizeAbility(source) {
     };
     if (ability.script) output.script = ability.script;
     if (ability.scriptHash) output.scriptHash = ability.scriptHash;
+    if (ability.scriptLibrary) output.scriptLibrary = String(ability.scriptLibrary);
+    if (ability.libraryParams && typeof ability.libraryParams === 'object') output.libraryParams = ability.libraryParams;
     return output;
 }
 
@@ -1180,26 +1201,35 @@ async function validateScriptsLocally(model) {
     let changed = false;
     const combatants = model.combatants.map(unit => {
         const abilities = Array.isArray(unit.abilities) ? unit.abilities.map(ability => {
+            if (!ability.script) {
+                // 本地脚本库引用：先按参数实例化 script（稳定源码 → 跨战斗哈希一致 → 可命中审批缓存）。
+                const materialized = materializeScriptLibrary(ability);
+                if (materialized !== ability) { changed = true; ability = materialized; }
+            }
             if (!ability.script) return ability;
             try {
                 const inspection = inspectScript(ability.script, ability);
                 return { ...ability, scriptHash: inspection.hash, scriptInspection: inspection };
             } catch (error) {
                 changed = true;
-                recordDebug('script_downgraded', { unitId: unit.id, abilityId: ability.id, error: String(error.message || error) });
-                const { script, scriptHash, scriptInspection, ...rest } = ability;
+                recordDebug('script_downgraded', { unitId: unit.id, abilityId: ability.id, scriptLibrary: ability.scriptLibrary || null, error: String(error.message || error) });
+                const { script, scriptHash, scriptInspection, scriptLibrary, libraryParams, ...rest } = ability;
                 return rest;
             }
         }) : unit.abilities;
         const passives = Array.isArray(unit.passives) ? unit.passives.map(passive => {
+            if (!passive.script) {
+                const materialized = materializeScriptLibrary(passive);
+                if (materialized !== passive) { changed = true; passive = materialized; }
+            }
             if (!passive.script) return passive;
             try {
                 const inspection = inspectScript(passive.script, passive);
                 return { ...passive, scriptHash: inspection.hash, scriptInspection: inspection };
             } catch (error) {
                 changed = true;
-                recordDebug('passive_script_downgraded', { unitId: unit.id, passiveId: passive.id, error: String(error.message || error) });
-                const { script, scriptHash, scriptInspection, ...rest } = passive;
+                recordDebug('passive_script_downgraded', { unitId: unit.id, passiveId: passive.id, scriptLibrary: passive.scriptLibrary || null, error: String(error.message || error) });
+                const { script, scriptHash, scriptInspection, scriptLibrary, libraryParams, ...rest } = passive;
                 return rest;
             }
         }) : unit.passives;
@@ -1214,10 +1244,10 @@ async function superviseCombatModel(candidate, declaration, snapshot, maxRounds 
     for (let round = 0; round < maxRounds; round += 1) {
         let suggestions = [];
         try {
-            const raw = await generateRaw([
+            const raw = await withRetry(async () => generateRaw([
                 { role: 'system', content: MODEL_SUPERVISOR_SYSTEM },
                 { role: 'user', content: JSON.stringify({ declaration, combatModel: current, ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2) },
-            ], 5000, `战斗数据审查（第二段 · 第 ${round + 1} 轮）`, 'modeling');
+            ], 5000, `战斗数据审查（第二段 · 第 ${round + 1} 轮）`, 'modeling'), `战斗数据审查（第二段 · 第 ${round + 1} 轮）`);
             const parsed = extractJsonObject(raw);
             suggestions = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
         } catch (error) {
@@ -1238,20 +1268,43 @@ function declarationValidation(value) {
     if (!report?.ok) throw new Error((report?.errors || []).slice(0, 5).map(error => `${error.path}：${error.message}`).join('\n') || '战场声明校验失败');
 }
 
+function retryLimit() {
+    return Math.max(1, Math.min(1000, Number(settings.maxRetries) || 3));
+}
+
+async function withRetry(fn, label) {
+    const limit = retryLimit();
+    let lastError = null;
+    for (let attempt = 0; attempt < limit; attempt += 1) {
+        try { return await fn(attempt); }
+        catch (error) {
+            if (String(error?.message || '').includes('已取消')) throw error;
+            lastError = error;
+            if (attempt < limit - 1) { setStatus(`${label}第 ${attempt + 1} 次失败（${error.message}），正在重试（${attempt + 2}/${limit}）…`, 'warn'); render(); }
+        }
+    }
+    throw lastError || new Error(`${label}失败`);
+}
+
+async function recognizeCore() {
+    tavernSnapshot = readTavern();
+    const tagged = battleDeclarationFromFloor();
+    const content = tagged || extractJsonObject(await generateRaw([
+        { role: 'system', content: DECLARATION_SYSTEM },
+        { role: 'user', content: JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2) },
+    ], 2600, '识别战场声明', 'declaration'));
+    declaration = normalizeDeclaration(content);
+    declarationValidation(declaration);
+    const declarationBox = $('#battle-orb-declaration'); if (declarationBox) declarationBox.value = JSON.stringify(declaration, null, 2);
+    return tagged;
+}
+
 async function recognize() {
     if (busy) return;
     flowError = null;
     busy = true; setStatus('正在读取酒馆楼层与 MVU…', 'working');
     try {
-        tavernSnapshot = readTavern();
-        const tagged = battleDeclarationFromFloor();
-        const content = tagged ? tagged : extractJsonObject(await generateRaw([
-            { role: 'system', content: DECLARATION_SYSTEM },
-            { role: 'user', content: JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2) },
-        ], 2600, '识别战场声明', 'declaration'));
-        declaration = normalizeDeclaration(content);
-        declarationValidation(declaration);
-        const declarationBox = $('#battle-orb-declaration'); if (declarationBox) declarationBox.value = JSON.stringify(declaration, null, 2);
+        const tagged = await withRetry(() => recognizeCore(), '识别战场声明');
         stageOverride = 'recognize';
         render();
         setStatus(tagged ? '已从当前楼层读取 BattleDeclaration' : '已由酒馆当前 AI 草拟战场声明', 'ok');
@@ -1259,23 +1312,23 @@ async function recognize() {
     finally { busy = false; render(); }
 }
 
-async function createBattle() {
-    if (busy) return;
-    try {
-        flowError = null;
-        if (!declaration) await recognize();
-        if (!declaration) return;
-        const declarationBox = $('#battle-orb-declaration');
-        if (declarationBox) declaration = normalizeDeclaration(extractJsonObject(declarationBox.value));
-        declarationValidation(declaration);
-        busy = true; setStatus('正在用酒馆当前 AI 建立 CombatModel…', 'working'); render();
-        tavernSnapshot ||= readTavern();
-        // 第一段生成 + 致命错误保底检测：本地不静默改模型，检测到致命错误就把问题
-        // 回传给战斗 AI 要求其自行修复（最多 2 次修复请求）；仍失败则回退安全默认模型。
-        let candidate = null;
-        let fatalErrors = [];
-        let phaseOneNote = '';
-        for (let attempt = 0; attempt <= 2; attempt += 1) {
+async function createBattleCore() {
+    if (!declaration) {
+        const tagged = await recognizeCore();
+        if (!declaration) throw new Error(tagged ? 'BattleDeclaration 校验失败' : '识别战场声明失败');
+    }
+    const declarationBox = $('#battle-orb-declaration');
+    if (declarationBox) declaration = normalizeDeclaration(extractJsonObject(declarationBox.value));
+    declarationValidation(declaration);
+    setStatus('正在用酒馆当前 AI 建立 CombatModel…', 'working'); render();
+    tavernSnapshot ||= readTavern();
+    // 第一段生成 + 致命错误保底检测：本地不静默改模型，检测到致命错误就把问题
+    // 回传给战斗 AI 要求其自行修复（最多 maxRetries-1 次修复请求）；生成异常也按限次重试。
+    const attempts = retryLimit();
+    let candidate = null;
+    let fatalErrors = [];
+    let phaseOneNote = '';
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
             try {
                 const userPayload = { declaration, mvu: tavernSnapshot.mvu.state };
                 if (attempt > 0 && fatalErrors.length) userPayload.repairErrors = fatalErrors;
@@ -1290,8 +1343,11 @@ async function createBattle() {
                 setStatus(`第一段建模存在致命错误（第 ${attempt + 1} 次修复请求）：${fatalErrors.join('；')}`, 'warn'); render();
             } catch (error) {
                 if (String(error?.message || '').includes('已取消')) throw error;
-                setStatus(`CombatModel 生成失败，改用本地安全默认模型：${error.message}`, 'warn');
+                recordDebug('modeling_phase1_generation_error', { attempt, error: String(error.message || error) });
+                setStatus(`CombatModel 第 ${attempt + 1}/${attempts} 次生成失败：${error.message}`, 'warn'); render();
+                if (attempt < attempts - 1) continue;
                 candidate = null;
+                phaseOneNote = '（已回退安全默认模型：生成失败）';
                 break;
             }
         }
@@ -1328,17 +1384,61 @@ async function createBattle() {
         recordDebug('modeling_final', { mode: modeNote || '两段式', combatants: model.combatants?.length || 0, basicAttacks: model.combatants?.reduce((sum, unit) => sum + (unit.abilities || []).filter(ability => /^basic-attack/.test(ability.id)).length, 0) || 0 });
         repository = new BrowserCombatRepository();
         engine = new CombatEngine(repository);
+        // 全自动模式：进入战场时自动批准脚本（并写入持久化缓存），无需手动逐条确认。
+        repository.autoApprove = Boolean(autoState.running);
         const created = engine.create({ seed: id('tavern'), mode: 'manual', storySessionId: tavernSnapshot.chatId, encounter: model, assetProfiles: model.assetProfiles || [], preparation: { declaration, source: 'tavern-injected' } });
         battle = repository.get(created.id);
         battle.__combatBenchmark = { spans: {} };
         deployState = { strategyText: '', activePreset: null, assignments: {} };
         mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
         stageOverride = null;
-        recordDebug('battle_created', { battleId: battle.id, combatants: model.combatants?.length || 0, title: model.title, ruleset: battle.rulesetVersion, mode: modeNote || phaseOneNote });
-        setStatus(`战场已建模${modeNote}${phaseOneNote}；请在“编制部署”选择参战、操作方式与战斗策略`, 'ok');
+        recordDebug('battle_created', { battleId: battle.id, combatants: model.combatants?.length || 0, title: model.title, ruleset: battle.rulesetVersion, mode: modeNote || phaseOneNote, auto: Boolean(autoState.running) });
+        return { note: `${modeNote}${phaseOneNote}` };
+}
+
+async function createBattle() {
+    if (busy) return;
+    flowError = null;
+    busy = true;
+    try {
+        const result = await withRetry(() => createBattleCore(), '创建战场');
+        setStatus(`战场已建模${result.note}；请在“编制部署”选择参战、操作方式与战斗策略`, 'ok');
         render();
     } catch (error) { flowError = { step: 'create', message: error.message || '创建失败' }; notify(`创建战场失败：${error.message}`, 'error'); stageOverride = 'create'; }
     finally { busy = false; render(); }
+}
+
+// 一键全自动：读取 → 识别（限次重试）→ 创建（限次重试）→ 停在“确认队伍战术”（④ 编制部署）。
+async function runFullAuto() {
+    if (busy || autoState.running) return;
+    autoState.running = true;
+    autoState.startedAt = Date.now();
+    busy = true; flowError = null;
+    try {
+        autoState.step = '读取楼层与 MVU';
+        setStatus('一键全自动：正在读取楼层与 MVU…', 'working'); render();
+        tavernSnapshot = readTavern();
+        void refreshTavernFromGlobals();
+        const found = battleDeclarationFromFloor();
+        if (found) declaration = normalizeDeclaration(found);
+        stageOverride = null;
+        if (!declaration) {
+            autoState.step = '识别战场声明';
+            setStatus('一键全自动：正在识别战场声明…', 'working'); render();
+            await withRetry(() => recognizeCore(), '识别战场声明');
+        }
+        autoState.step = '创建战场';
+        setStatus('一键全自动：正在建立 CombatModel 并创建二维战场…', 'working'); render();
+        await createBattleCore();
+        autoState.step = '确认队伍战术';
+        setStatus('战场已创建；请在“编制部署”确认参战、操作方式与战斗策略', 'ok');
+    } catch (error) {
+        flowError = { step: autoState.step || '读取', message: error.message || '全自动流程失败' };
+        notify(`一键全自动失败（${autoState.step}）：${error.message}`, 'error');
+        setStatus(`一键全自动失败（${autoState.step}）：${error.message}`, 'error');
+    } finally {
+        busy = false; autoState.running = false; render();
+    }
 }
 
 function publicBattle() { return battle && engine ? engine.publicState(battle) : null; }
@@ -1959,9 +2059,30 @@ function declarationSummaryMarkup(value) {
     return `<section class="bo-decl-summary"><header><b>BattleDeclaration</b><small>${escapeHtml(declaration.reason || '待创建战场')}</small></header>${rows.map(([key, value]) => `<div><span>${key}</span><b>${escapeHtml(value)}</b></div>`).join('')}<small class="bo-decl-note">可在上一阶段继续修改声明。</small></section>`;
 }
 
+function autoCardMarkup() {
+    const running = autoState.running;
+    const failed = Boolean(flowError);
+    const step = autoState.step || '读取楼层与 MVU';
+    const action = running
+        ? `<span class="bo-auto-running">正在${escapeHtml(step)}…</span>`
+        : failed
+            ? `<span class="bo-auto-error">上次全自动流程失败（${escapeHtml(flowError.step || '')}）：${escapeHtml(flowError.message || '')}</span>`
+            : '';
+    return `<section class="bo-auto-card">
+      <header><b>一键全自动战斗</b><small>自动 读取楼层 → 识别声明 → 创建战场（失败按“最大尝试次数”自动重试），完成后停在“确认队伍战术”。</small></header>
+      <button id="battle-orb-auto" class="bo-primary bo-auto-run" type="button" ${running ? 'disabled' : ''}>${running ? '全自动进行中…' : '⚡ 一键全自动战斗'}</button>
+      ${action}
+      <p class="bo-muted">默认隐藏详细的分步页面；如需手动分步控制，请在设置中开启 DEBUG 模式。</p>
+    </section>`;
+}
+
 function stageMarkup(stage) {
     if (stage === 'read') {
-        return `<p class="bo-muted">从当前酒馆楼层读取剧情与 MVU 状态，作为后续识别战场的依据。</p><button id="battle-orb-sync" class="bo-primary" type="button">① 读取楼层与 MVU</button>`;
+        if (!settings.debugMode) return autoCardMarkup();
+        return `<p class="bo-muted">从当前酒馆楼层读取剧情与 MVU 状态，作为后续识别战场的依据。</p><button id="battle-orb-auto" class="bo-primary bo-auto-run" type="button">⚡ 一键全自动战斗</button><button id="battle-orb-sync" class="bo-primary" type="button">① 读取楼层与 MVU</button>`;
+    }
+    if (!settings.debugMode && (stage === 'recognize' || stage === 'create')) {
+        return autoCardMarkup();
     }
     if (stage === 'recognize') {
         return `<div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div><button id="battle-orb-recognize" class="bo-primary" type="button" ${declaration ? 'disabled' : ''}>② 识别 / 生成战场声明</button><small id="battle-orb-recognize-note" class="bo-recognize-note" ${declaration ? '' : 'hidden'}>BattleDeclaration 已就绪：重新生成需先清空下方声明文本，避免误触覆盖。</small><label class="bo-hint-field"><span>识别提示（可选）</span><input id="battle-orb-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="可选：额外的识别提醒"></label><section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="点击识别让主 AI 草拟，或直接粘贴已有声明"></textarea></section><button id="battle-orb-to-create" class="bo-secondary ${declaration ? 'bo-next' : ''}" type="button" ${declaration ? '' : 'disabled'}>下一步：创建战场 →</button>`;
@@ -2315,10 +2436,10 @@ async function narrate() {
 
         let prose = '';
         try {
-            prose = String(await generateRaw([
+            prose = String(await withRetry(async () => generateRaw([
                 { role: 'system', content: '你是酒馆主 AI 的战后叙事融合器。只能依据本地 BATTLE_RESULT_DSL 写中文剧情，不能改写命中、伤害、位置、伤亡、胜负或 MVU Patch；只输出正文，不要 JSON、不要分析。' },
                 { role: 'user', content: `战前最近剧情：\n${JSON.stringify(recent)}\n\n本地权威战报：\n${dsl}` },
-            ], 6000, '战后剧情创作')).replace(/<UpdateVariable>[\s\S]*?<\/UpdateVariable>/gi, '').trim();
+            ], 6000, '战后剧情创作'), '战后剧情创作')).replace(/<UpdateVariable>[\s\S]*?<\/UpdateVariable>/gi, '').trim();
         } catch (error) {
             prose = `本地战斗在第 ${final.rounds || state.round || 0} 回合完成。胜者：${final.winner === 'player' ? '玩家方' : final.winner === 'enemy' ? '敌方' : '未决'}。正文 AI 暂不可用，本楼保留本地权威战报与 MVU 更新。`;
             setStatus(`正文 AI 暂不可用，使用本地战报模板回写：${error.message}`, 'warn');
@@ -2434,7 +2555,7 @@ function renderSettingsView() {
     const content = $('#battle-orb-settings-content');
     if (!content) return;
     const floorInfo = tavernSnapshot ? `<div id="battle-orb-floor" class="bo-floor">已读取 ${tavernSnapshot.messages.length} 楼 · MVU ${tavernSnapshot.mvu.applied} 条 Patch · ${tavernSnapshot.mvu.source}</div>` : '<div class="bo-floor">尚未读取楼层</div>';
-    content.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>战场建模</summary><label class="bo-setting"><input id="battle-orb-fast-modeling" type="checkbox" ${settings.fastModeling ? 'checked' : ''}><span>急速模式（无二阶段检查）</span><small>建模阶段仅做一次生成，跳过战斗数据检查 AI 的审查；适合追求速度与低消耗。</small></label><label class="bo-setting"><input id="battle-orb-rollback-modeling" type="checkbox" ${settings.rollbackModeling ? 'checked' : ''}><span>回滚模式</span><small>第一阶段成功即归档；第二阶段全部失败时立刻用第一阶段结果创建战场，不再报错或等待。</small></label></details><details class="bo-fold" open><summary>工作 API 预设</summary><small class="bo-muted">为“战场识别”与“战场建模”两种调用场景各自配置调用来源：酒馆 API（generateRaw）为默认选项，也可改用自定义 API 预设（Base URL / 路径 / 模型 / Key / 额外头与体），并可按实例保存复用。</small>${renderWorkApiSection('declaration')}${renderWorkApiSection('modeling')}</details><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示、判断依据、建模模式与工作 API 预设设置已持久化到浏览器本地。</p>`;
+    content.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>全自动与调试</summary><label class="bo-setting"><input id="battle-orb-debug-mode" type="checkbox" ${settings.debugMode ? 'checked' : ''}><span>DEBUG 模式（默认关闭）</span><small>关闭时界面只显示“一键全自动战斗”与最后确认队伍战术的界面；开启后恢复详细的分步页面（读取/识别/创建）与提示词、基准、DEBUG 导出等工具。</small></label><label class="bo-setting"><input id="battle-orb-max-retries" type="number" min="1" max="1000" step="1" value="${settings.maxRetries}"><span>LLM 最大尝试次数（1-1000）</span><small>识别 / 建模 / 数据审查 / 战后剧情等每次 LLM 请求的最大尝试次数；全自动模式在限制内自动重试全部请求。</small></label></details><details class="bo-fold" open><summary>战场建模</summary><label class="bo-setting"><input id="battle-orb-fast-modeling" type="checkbox" ${settings.fastModeling ? 'checked' : ''}><span>急速模式（无二阶段检查）</span><small>建模阶段仅做一次生成，跳过战斗数据检查 AI 的审查；适合追求速度与低消耗。</small></label><label class="bo-setting"><input id="battle-orb-rollback-modeling" type="checkbox" ${settings.rollbackModeling ? 'checked' : ''}><span>回滚模式</span><small>第一阶段成功即归档；第二阶段全部失败时立刻用第一阶段结果创建战场，不再报错或等待。</small></label></details><details class="bo-fold" open><summary>工作 API 预设</summary><small class="bo-muted">为“战场识别”与“战场建模”两种调用场景各自配置调用来源：酒馆 API（generateRaw）为默认选项，也可改用自定义 API 预设（Base URL / 路径 / 模型 / Key / 额外头与体），并可按实例保存复用。</small>${renderWorkApiSection('declaration')}${renderWorkApiSection('modeling')}</details><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示、判断依据、建模模式、重试次数、DEBUG 模式与工作 API 预设设置已持久化到浏览器本地。</p>`;
     const mvu = content.querySelector('#battle-orb-mvu');
     if (mvu) mvu.textContent = tavernSnapshot ? JSON.stringify(tavernSnapshot.mvu.state, null, 2) : '同步后显示';
 }
@@ -2460,6 +2581,10 @@ function renderBenchmarkView() {
 }
 
 function renderView() {
+    // DEBUG 模式关闭时，隐藏提示词/基准/DEBUG 导出等详细工具与入口。
+    const debugTools = ['#battle-orb-tool-prompts', '#battle-orb-tool-debug', '#battle-orb-tool-bench'];
+    for (const selector of debugTools) { const node = $(selector); if (node) node.hidden = settings.debugMode ? false : true; }
+    const debugInline = $('#battle-orb-tool-debug-inline'); if (debugInline) debugInline.hidden = settings.debugMode ? false : true;
     const views = { stage: '#battle-orb-stage', settings: '#battle-orb-settings-view', prompts: '#battle-orb-prompts-view', benchmark: '#battle-orb-benchmark-view' };
     for (const [key, selector] of Object.entries(views)) {
         const node = $(selector);
@@ -2504,7 +2629,7 @@ function resetToStageOne() {
 
 function bindPanel() {
     document.addEventListener('click', event => {
-        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-enter-battle, #battle-orb-back-create, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts, #battle-orb-preview-confirm, #battle-orb-preview-cancel, [data-deploy-preset]');
+        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-enter-battle, #battle-orb-back-create, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts, #battle-orb-preview-confirm, #battle-orb-preview-cancel, #battle-orb-auto, [data-deploy-preset]');
         if (!target) return;
         const presetButton = event.target.closest('[data-deploy-preset]');
         if (presetButton) {
@@ -2532,6 +2657,7 @@ function bindPanel() {
             } catch (error) { flowError = { step: 'read', message: error.message || '读取失败' }; notify(`读取失败：${error.message}`, 'error'); stageOverride = 'read'; render(); }
             return;
         }
+        if (target.id === 'battle-orb-auto') { void runFullAuto(); return; }
         if (target.id === 'battle-orb-recognize') { void recognize(); return; }
         if (target.id === 'battle-orb-create') { void createBattle(); return; }
         if (target.id === 'battle-orb-narrate') { void narrate(); return; }
@@ -2631,6 +2757,8 @@ function bindPanel() {
         if (event.target.id === 'battle-orb-preview-toggle') { settings.previewCombat = Boolean(event.target.checked); saveSettings(); if (!settings.previewCombat) cancelActionPreview(); setStatus(settings.previewCombat ? '释放前预览检定与伤害已启用' : '已关闭释放预览，恢复直接结算', 'ok'); return; }
         if (event.target.id === 'battle-orb-fast-modeling') { settings.fastModeling = Boolean(event.target.checked); saveSettings(); setStatus(settings.fastModeling ? '急速模式：创建战场时将跳过二阶段检查' : '已关闭急速模式，恢复两段式审查', 'ok'); return; }
         if (event.target.id === 'battle-orb-rollback-modeling') { settings.rollbackModeling = Boolean(event.target.checked); saveSettings(); setStatus(settings.rollbackModeling ? '回滚模式：二阶段失败将立即用第一阶段结果创建战场' : '已关闭回滚模式', 'ok'); return; }
+        if (event.target.id === 'battle-orb-max-retries') { settings.maxRetries = Math.max(1, Math.min(1000, Number(event.target.value) || 3)); saveSettings(); setStatus(`LLM 最大尝试次数：${settings.maxRetries}`, 'ok'); return; }
+        if (event.target.id === 'battle-orb-debug-mode') { settings.debugMode = Boolean(event.target.checked); saveSettings(); setStatus(settings.debugMode ? 'DEBUG 模式已开启：显示详细分步页面与工具' : '已关闭 DEBUG 模式：界面恢复为一键全自动', 'ok'); render(); return; }
         const apiFieldMatch = String(event.target.id).match(/^battle-orb-api-(decl|model)-(.+)$/);
         if (apiFieldMatch && Object.hasOwn(WORK_API_FIELDS, apiFieldMatch[2])) {
             const kind = apiFieldMatch[1] === 'decl' ? 'declaration' : 'modeling';
