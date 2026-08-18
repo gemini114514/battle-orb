@@ -1,4 +1,4 @@
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -59,6 +59,7 @@ const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.strin
 
 let stageOverride = null;
 let lastStage = null;
+let view = 'stage';
 let promptHistory = [];
 let debugTrace = [];
 let llmTask = null;
@@ -410,7 +411,12 @@ function recordDebug(kind, data = {}) {
 function renderLlmBar() {
     const bar = $('#battle-orb-llm-bar');
     if (!bar) return;
-    if (!llmTask) { bar.hidden = true; return; }
+    if (!llmTask) {
+        bar.hidden = true;
+        const label = $('#battle-orb-llm-label'); if (label) label.textContent = '';
+        const time = $('#battle-orb-llm-time'); if (time) time.textContent = '00:00';
+        return;
+    }
     bar.hidden = false;
     const label = $('#battle-orb-llm-label'); if (label) label.textContent = llmTask.label || 'LLM 调用中…';
     const time = $('#battle-orb-llm-time'); if (time) { const elapsed = Math.max(0, Math.floor((Date.now() - llmTask.startedAt) / 1000)); time.textContent = `${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`; }
@@ -430,6 +436,8 @@ function llmCancel() {
     if (!llmTask) return;
     llmTask.cancelled = true;
     if (llmTask.resolveCancel) llmTask.resolveCancel();
+    llmTask = null;
+    if (llmInterval) { clearInterval(llmInterval); llmInterval = 0; }
     renderLlmBar();
 }
 
@@ -551,16 +559,6 @@ async function runBenchmark() {
     } finally { busy = false; render(); }
 }
 
-function renderBenchmark() {
-    const fold = $('#battle-orb-benchmark-fold');
-    if (!fold) return;
-    if (!benchmarkResult) { fold.hidden = true; fold.innerHTML = ''; return; }
-    fold.hidden = false;
-    const spans = Array.isArray(benchmarkResult.spans) ? benchmarkResult.spans : [];
-    const topSpans = spans.slice(0, 8).map(span => `<tr><td>${escapeHtml(span.name)}</td><td>${span.count}</td><td>${span.totalMs.toFixed(1)}</td><td>${span.maxMs.toFixed(1)}</td></tr>`).join('');
-    fold.innerHTML = `<details class="bo-fold" open><summary>基准测试：${benchmarkResult.durationMs}ms · ${benchmarkResult.rounds} 回合 · 101 单位</summary><div class="bo-bench-summary"><span>胜者 ${escapeHtml(benchmarkResult.winner)}</span><span>事件 ${benchmarkResult.eventCount}</span><span>引擎 ${escapeHtml(benchmarkResult.engineVersion)}</span><span>seed ${escapeHtml(benchmarkResult.seed)}</span></div><table class="bo-bench-table"><thead><tr><th>阶段</th><th>次数</th><th>总计 ms</th><th>峰值 ms</th></tr></thead><tbody>${topSpans || '<tr><td colspan="4">无阶段统计</td></tr>'}</tbody></table></details>`;
-}
-
 async function exportDebug() {
     const state = publicBattle();
     const payload = {
@@ -636,7 +634,11 @@ async function superviseCombatModel(candidate, declaration, snapshot, maxRounds 
                 { role: 'system', content: MODEL_SUPERVISOR_SYSTEM },
                 { role: 'user', content: JSON.stringify({ declaration, mvu: snapshot?.mvu?.state, combatModel: current }, null, 2) },
             ], 7000, `战斗数据检查（第二段 · 第 ${round + 1} 轮）`));
-        } catch (error) { setStatus(`战斗数据检查 AI 第 ${round + 1} 轮修正失败：${error.message}`, 'warn'); break; }
+        } catch (error) {
+            if (String(error?.message || '').includes('已取消')) throw error;
+            setStatus(`战斗数据检查 AI 第 ${round + 1} 轮修正失败：${error.message}`, 'warn');
+            break;
+        }
         if (!revised || typeof revised !== 'object') break;
         const normalized = mergeModel(revised, declaration);
         if (JSON.stringify(normalized) === JSON.stringify(current)) return current;
@@ -689,7 +691,10 @@ async function createBattle() {
                 { role: 'user', content: JSON.stringify({ declaration, mvu: tavernSnapshot.mvu.state }, null, 2) },
             ], 7000, '战斗建模（第一段生成）'));
             setStatus('CombatModel 已生成，正在由战斗数据检查 AI 审查修正…', 'working'); render();
-        } catch (error) { setStatus(`CombatModel 生成失败，改用本地安全默认模型：${error.message}`, 'warn'); }
+        } catch (error) {
+            if (String(error?.message || '').includes('已取消')) throw error;
+            setStatus(`CombatModel 生成失败，改用本地安全默认模型：${error.message}`, 'warn');
+        }
         candidate = await superviseCombatModel(candidate, declaration, tavernSnapshot);
         model = mergeModel(candidate, declaration);
         repository = new BrowserCombatRepository();
@@ -1266,7 +1271,7 @@ function renderStage() {
         if (metaBox && state) metaBox.textContent = `${state.title || '遭遇'} · ${state.status} · seed ${String(state.seed || '').slice(0, 12)}`;
         renderTurn(state); renderLedger(state); renderBattlefield(state);
     }
-    renderBenchmark();
+    renderView();
 }
 
 function render() {
@@ -1429,24 +1434,53 @@ async function handleMapClick(event) {
     return true;
 }
 
-function renderSettingsFold() {
-    const fold = $('#battle-orb-settings-fold');
-    if (!fold) return;
+function renderSettingsView() {
+    const content = $('#battle-orb-settings-content');
+    if (!content) return;
     const floorInfo = tavernSnapshot ? `<div id="battle-orb-floor" class="bo-floor">已读取 ${tavernSnapshot.messages.length} 楼 · MVU ${tavernSnapshot.mvu.applied} 条 Patch · ${tavernSnapshot.mvu.source}</div>` : '<div class="bo-floor">尚未读取楼层</div>';
-    fold.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示与判断依据设置已持久化到浏览器本地。</p>`;
-    const mvu = fold.querySelector('#battle-orb-mvu');
+    content.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示与判断依据设置已持久化到浏览器本地。</p>`;
+    const mvu = content.querySelector('#battle-orb-mvu');
     if (mvu) mvu.textContent = tavernSnapshot ? JSON.stringify(tavernSnapshot.mvu.state, null, 2) : '同步后显示';
 }
 
-function renderPromptsFold() {
-    const fold = $('#battle-orb-prompts-fold');
-    if (!fold) return;
+function renderPromptsView() {
+    const content = $('#battle-orb-prompts-content');
+    if (!content) return;
     const entries = promptHistory.length ? [...promptHistory].reverse().map(entry => {
         const messages = Array.isArray(entry.messages) ? entry.messages.map(message => `<div class="bo-prompt-msg"><b>${escapeHtml(message.role || '')}</b><pre>${escapeHtml(String(message.content || '').slice(0, 3000))}</pre></div>`).join('') : '';
         const response = entry.ok ? `<details class="bo-fold"><summary>模型返回（${entry.durationMs ?? '—'}ms）</summary><pre>${escapeHtml(String(entry.response?.preview ?? JSON.stringify(entry.response) ?? '')).slice(0, 4000)}</pre></details>` : `<span class="bo-prompt-error">${escapeHtml(entry.error || '失败')}</span>`;
         return `<article class="bo-prompt-entry"><header><b>${escapeHtml(entry.stage || 'LLM 调用')}</b><small>${escapeHtml(entry.at)} · ${entry.durationMs ?? '—'}ms · ${entry.ok ? '成功' : '失败'}</small></header>${messages}${response}</article>`;
     }).join('') : '<p class="bo-muted">暂无 LLM 调用记录。识别 / 创建战场 / 回写都会记录完整提示词。</p>';
-    fold.innerHTML = `<div class="bo-prompts-head"><b>工作阶段提示词</b><small>识别、建模（两段式）、战后剧情都会记录可查</small></div><div class="bo-prompts-list">${entries}</div><button id="battle-orb-export-prompts" class="bo-secondary" type="button">导出 Prompt 追踪 JSON</button>`;
+    content.innerHTML = `<div class="bo-prompts-head"><b>识别、建模（两段式）、战后剧情等阶段提示词均可查</b><small>共 ${promptHistory.length} 次调用</small></div><div class="bo-prompts-list">${entries}</div><button id="battle-orb-export-prompts" class="bo-secondary" type="button">导出 Prompt 追踪 JSON</button>`;
+}
+
+function renderBenchmarkView() {
+    const content = $('#battle-orb-benchmark-content');
+    if (!content) return;
+    if (!benchmarkResult) { content.innerHTML = '<p class="bo-muted">尚未运行基准测试。点击右上角 ⚡ 或下方按钮运行 1 对 100 本地战斗基准。</p><button id="battle-orb-tool-bench-inline" class="bo-primary" type="button">运行基准测试</button>'; return; }
+    const spans = Array.isArray(benchmarkResult.spans) ? benchmarkResult.spans : [];
+    const topSpans = spans.slice(0, 8).map(span => `<tr><td>${escapeHtml(span.name)}</td><td>${span.count}</td><td>${span.totalMs.toFixed(1)}</td><td>${span.maxMs.toFixed(1)}</td></tr>`).join('');
+    content.innerHTML = `<details class="bo-fold" open><summary>基准测试：${benchmarkResult.durationMs}ms · ${benchmarkResult.rounds} 回合 · 101 单位</summary><div class="bo-bench-summary"><span>胜者 ${escapeHtml(benchmarkResult.winner)}</span><span>事件 ${benchmarkResult.eventCount}</span><span>引擎 ${escapeHtml(benchmarkResult.engineVersion)}</span><span>seed ${escapeHtml(benchmarkResult.seed)}</span></div><table class="bo-bench-table"><thead><tr><th>阶段</th><th>次数</th><th>总计 ms</th><th>峰值 ms</th></tr></thead><tbody>${topSpans || '<tr><td colspan="4">无阶段统计</td></tr>'}</tbody></table></details><button id="battle-orb-tool-bench-inline" class="bo-secondary" type="button">重新运行基准测试</button>`;
+}
+
+function renderView() {
+    const views = { stage: '#battle-orb-stage', settings: '#battle-orb-settings-view', prompts: '#battle-orb-prompts-view', benchmark: '#battle-orb-benchmark-view' };
+    for (const [key, selector] of Object.entries(views)) {
+        const node = $(selector);
+        if (!node) continue;
+        const active = key === view;
+        node.hidden = !active;
+        node.classList.toggle('active', active);
+    }
+    if (view === 'settings') renderSettingsView();
+    else if (view === 'prompts') renderPromptsView();
+    else if (view === 'benchmark') renderBenchmarkView();
+}
+
+function setView(next) {
+    view = next;
+    if (next !== 'stage') lastStage = null;
+    render();
 }
 
 function exportPromptTrace() {
@@ -1501,26 +1535,18 @@ function bindPanel() {
         }
     });
     document.addEventListener('click', event => {
-        const toggle = event.target.closest('#battle-orb-tool-settings, #battle-orb-tool-prompts');
-        if (!toggle) return;
-        const settingsFold = $('#battle-orb-settings-fold');
-        const promptsFold = $('#battle-orb-prompts-fold');
-        if (toggle.id === 'battle-orb-tool-settings') {
-            const next = settingsFold.hidden;
-            settingsFold.hidden = !next;
-            if (next) renderSettingsFold();
-            if (!next) promptsFold.hidden = true;
-        } else {
-            const next = promptsFold.hidden;
-            promptsFold.hidden = !next;
-            if (next) renderPromptsFold();
-            if (!next) settingsFold.hidden = true;
+        const toggle = event.target.closest('#battle-orb-tool-settings, #battle-orb-tool-prompts, #battle-orb-tool-bench');
+        if (toggle) {
+        if (toggle.id === 'battle-orb-tool-settings') setView('settings');
+        else if (toggle.id === 'battle-orb-tool-prompts') setView('prompts');
+        else { setView('benchmark'); void runBenchmark(); }
+        return;
         }
-    });
-    document.addEventListener('click', event => {
-        if (event.target.closest('#battle-orb-tool-debug')) void exportDebug();
-        else if (event.target.closest('#battle-orb-tool-bench')) void runBenchmark();
-        else if (event.target.closest('#battle-orb-llm-cancel')) llmCancel();
+        const back = event.target.closest('#battle-orb-view-back-settings, #battle-orb-view-back-prompts, #battle-orb-view-back-bench');
+        if (back) { setView('stage'); return; }
+        if (event.target.closest('#battle-orb-tool-debug')) { void exportDebug(); return; }
+        if (event.target.closest('#battle-orb-llm-cancel')) { llmCancel(); return; }
+        if (event.target.closest('#battle-orb-tool-bench-inline')) { void runBenchmark(); return; }
     });
     document.addEventListener('input', event => {
         if (event.target.id === 'battle-orb-recognize-hint') { settings.recognizeHint = String(event.target.value || '').trim(); saveSettings(); return; }
@@ -1614,10 +1640,10 @@ function mount() {
         </div>
         <div id="battle-orb-body" class="bo-body">
           <div id="battle-orb-status" class="bo-status">准备就绪：点击“① 读取楼层与 MVU”</div>
-          <section id="battle-orb-stage" class="bo-stage"></section>
-          <section id="battle-orb-settings-fold" class="bo-fold-panel" hidden></section>
-          <section id="battle-orb-prompts-fold" class="bo-fold-panel" hidden></section>
-          <section id="battle-orb-benchmark-fold" class="bo-fold-panel" hidden></section>
+          <section id="battle-orb-stage" class="bo-stage bo-view active"></section>
+          <section id="battle-orb-settings-view" class="bo-view" hidden><header class="bo-view-head"><b>设置</b><button id="battle-orb-view-back-settings" class="bo-link" type="button">← 返回</button></header><div id="battle-orb-settings-content"></div></section>
+          <section id="battle-orb-prompts-view" class="bo-view" hidden><header class="bo-view-head"><b>工作阶段提示词</b><button id="battle-orb-view-back-prompts" class="bo-link" type="button">← 返回</button></header><div id="battle-orb-prompts-content"></div></section>
+          <section id="battle-orb-benchmark-view" class="bo-view" hidden><header class="bo-view-head"><b>基准测试</b><button id="battle-orb-view-back-bench" class="bo-link" type="button">← 返回</button></header><div id="battle-orb-benchmark-content"></div></section>
         </div>
       </section>`;
     document.body.append(root);
