@@ -1,4 +1,4 @@
-const VERSION = '0.8.6';
+const VERSION = '0.8.7';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -425,7 +425,9 @@ const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完�
 2) 脚本式（推荐用于具名特殊技能/装备技能/战术技能）：在声明式信封字段基础上加 script 字段。脚本运行于沙箱（禁网络/禁 eval/禁 DOM），可读取战场并发射效果，示例：
 const t = api.state().targets[0];
 api.attack(t.id);                                // 第一击：权威战斗检定
-api.attack(t.id);                                // 第二击：再次独立检定（连击=多次调用）
+const other = api.state().enemies.find(u => u.id !== t.id && u.hp > 0);
+api.attack((other || t).id);                     // 第二击：优先另一存活敌人，否则连击同一目标
+【连击/连射（固定多发）铁律】装备词条或技能效果承诺"每回合/每次使用连射 N 发/连击 N 次"时，脚本必须在每次激活中**无条件发射恰好 N 发**（N 次独立的 api.attack，各自走完整权威检定）。**严禁把攻击次数绑定到 api.state().targets 的长度上**——"有几个目标就打几发"（如 if (targets.length > 1) 才射第二发）会把固定 N 发退化成 1 发，属于弱化实现。目标选择遵循最有利写法：第 1 发打所选主目标 targets[0]；后续每一发优先改打**另一存活敌人**（用 api.state().enemies 里 hp>0 且 id 不同的单位），场上没有其它存活敌人时才连击同一目标。每一发都是独立检定，引擎按顺序结算命中/护甲/死亡，前一发已击杀的目标不会吃下后一发。
 【攻击检定铁律】对敌人造成伤害的攻击必须用 api.attack（与普通攻击完全一致的权威检定：D100+攻击修正+位阶修正+能力修正 vs 目标防御DC，原始 96-100 奇迹、1-5 灾难，命中后经护甲/抗性减伤由引擎结算伤害）。严禁用 api.d100 手搓"命中率/暴击"再 api.damage 补伤害——那是绕过防御 DC 的非法攻击检定；api.damage 只用于不经过战斗检定的直接效果（持续伤害 DoT、环境伤害、自伤、固定扣血等）。
 可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies，单位对象含 id/name/side/hp/maxHp/ep/maxEp/thp/attack/magicAttack/attackModifier/defenseDC/initiativeDC/armor/resistance/tierCorrection/speedMeters/visionMeters/exertion/position/statuses/attributes，可直接读取判定属性做条件）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（返回半径 r 内单位对象数组，字段同上）、api.d100()/api.d(n)（确定性骰，仅用于非检定的脚本判定）、api.attack(targetId, options?)、api.damage(targetId,amount,type?)、api.heal(targetId,amount)、api.status(targetId,status,时长)、api.dispel(targetId,status)、api.move、api.push(targetId,dx,y)、api.resource(targetId,hp|ep|thp,delta)、api.modify(targetId,字段,delta,{rounds?})、api.summon(templateId,zoneId,count)、api.log。
 【属性修改】api.modify 可对任意数值属性即时增减（可带 rounds 回合到期自动还原），字段支持攻击/防御/检定全量：attack、magicAttack、attackModifier、defenseDC、initiativeDC、armor、resistance、tierCorrection、maxHp、maxEp、hp、ep、thp、speedMeters、visionMeters、exertion、attributes.strengthModifier/dexterityModifier/constitutionModifier/spiritModifier/charismaModifier。例如防御架势：api.modify(t.id, "defenseDC", 5, { rounds: 2 })。
@@ -451,9 +453,9 @@ const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据审查 AI（�
 
 【输入】你会收到：完整 CombatModel（每个 combatant 含 abilities 的信封字段与可选 script）、战场声明 declaration。
 
-【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。带 script 的脚本能力：脚本内容由本地沙箱校验（100 轮种子测试），你**绝不允许**修改、重写或删除 script 字段，也禁止输出脚本内容。
+【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。带 script 的脚本能力：脚本内容由本地沙箱校验（100 轮种子测试），除第 8 条标注的"固定多发保真修复"外，你**绝不允许**修改、重写或删除 script 字段，也禁止输出脚本内容。
 
-【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能开销合理性（对抗性判断，绝不机械地把所有基础攻击改成 0）：结合该攻击模式的实际设定判断 EP 消耗是否合理——凭空给普通攻击/基础攻击加了 EP、或明显不消耗资源的攻击被加了 EP → 输出 set_ability 建议把 epCost 改为 0；若设定明确需要资源（如每次射击消耗 EP/弹药），应保留合理的 epCost，基础攻击同样允许合理 EP 消耗。若某单位完全没有普通攻击（没有任何声明式主行动攻击）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（名称与射程按武器类型调整，epCost 按实际设定）。7) 数值来源（thp 临时生命/护盾）对抗性检查：thp 只能来自声明或剧情明确描述的护盾/临时防护（如 participant.state 里写"裹着冰霜护盾/厚甲壳/石化外壳"），且数值应与描述强度相称。模型凭空给单位加 thp（声明与剧情均无护盾依据）→ 输出 {"op":"set_combatant","declarationId":"..","field":"thp","value":0}；玩家单位同样适用，绝不默认给任何单位加护盾。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
+【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能开销合理性（对抗性判断，绝不机械地把所有基础攻击改成 0）：结合该攻击模式的实际设定判断 EP 消耗是否合理——凭空给普通攻击/基础攻击加了 EP、或明显不消耗资源的攻击被加了 EP → 输出 set_ability 建议把 epCost 改为 0；若设定明确需要资源（如每次射击消耗 EP/弹药），应保留合理的 epCost，基础攻击同样允许合理 EP 消耗。若某单位完全没有普通攻击（没有任何声明式主行动攻击）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（名称与射程按武器类型调整，epCost 按实际设定）。7) 数值来源（thp 临时生命/护盾）对抗性检查：thp 只能来自声明或剧情明确描述的护盾/临时防护（如 participant.state 里写"裹着冰霜护盾/厚甲壳/石化外壳"），且数值应与描述强度相称。模型凭空给单位加 thp（声明与剧情均无护盾依据）→ 输出 {"op":"set_combatant","declarationId":"..","field":"thp","value":0}；玩家单位同样适用，绝不默认给任何单位加护盾。8) 固定多发脚本保真（对抗性检查，唯一允许改写 script 的情形）：能力名或效果承诺"连射/连击/双发/二连/多段/连续 N 发"等固定次数攻击时，检查脚本是否在每次激活中无条件发射恰好 N 发 api.attack。若脚本把攻击次数绑定到 api.state().targets 的长度上（例如 if (targets.length > 1) api.attack(targets[1].id)、或仅对已选目标逐个发射），导致选少目标就少打几发——不符合"固定 N 发"效果 → 输出 {"op":"set_ability_script","declarationId":"..","abilityId":"..","script":"<修复后的固定 N 发脚本>"}，遵循最有利写法：第 1 发打 api.state().targets[0]，后续每一发优先改打另一存活敌人（api.state().enemies 里 hp>0 且 id 不同），无其它存活敌人则连击同一目标。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
 
 【输出格式】只输出一个 JSON 数组 suggestions，不要 Markdown。每项形如：
 {"op":"set_ability","declarationId":"..","abilityId":"..","field":"maxRangeMeters","value":15}
@@ -931,6 +933,15 @@ function applyModelSuggestions(model, declaration, suggestions) {
                     if (isNumeric) ability[s.field] = Math.max(0, Number(s.value));
                     else ability[s.field] = s.value;
                     unitChanged = true; changed = true;
+                }
+            } else if (s.op === 'set_ability_script') {
+                const ability = (nextUnit.abilities || []).find(a => String(a.id) === String(s.abilityId));
+                if (ability && typeof s.script === 'string' && s.script.trim() && ability.script !== s.script) {
+                    try {
+                        inspectScript(s.script, ability);
+                        ability.script = s.script;
+                        unitChanged = true; changed = true;
+                    } catch { /* 非法脚本：忽略修复建议 */ }
                 }
             } else if (s.op === 'set_combatant') {
                 if (s.field === 'controller' && (s.value === 'player' || s.value === 'ai') && nextUnit.controller !== s.value) { nextUnit.controller = s.value; unitChanged = true; changed = true; }
@@ -2580,6 +2591,7 @@ globalThis.__battleOrbDebug = {
     settings: () => ({ ...settings }),
     flowError: () => flowError ? { ...flowError } : null,
     state: () => publicBattle(),
+    applyModelSuggestions: (model, declaration, suggestions) => applyModelSuggestions(model, declaration, suggestions),
 };
 } catch (error) {
     bootTrace('bootstrap-fatal', { message: error?.message || String(error), stack: error?.stack || '' });
