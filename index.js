@@ -1,4 +1,4 @@
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -173,10 +173,22 @@ function installFloatingClampListeners(entries) {
 function openFloatingPanel(panel) {
     panel.classList.add('open');
     panel.style.right = 'auto'; panel.style.bottom = 'auto';
-    const width = panel.offsetWidth || Math.min(760, innerWidth);
-    const height = panel.offsetHeight || Math.min(640, innerHeight);
-    const x = Math.max(0, Math.min(12, innerWidth - Math.min(width, innerWidth)));
-    const y = Math.max(0, Math.min(12, innerHeight - Math.min(height, innerHeight)));
+    const width = Math.max(1, Math.min(Number(panel.offsetWidth) || 760, innerWidth - 8));
+    const height = Math.max(1, Math.min(Number(panel.offsetHeight) || 720, innerHeight - 8));
+    const gap = 10;
+    const fab = document.getElementById(FAB_ID);
+    let anchorX = innerWidth / 2, anchorY = innerHeight / 2;
+    if (fab) {
+        const rect = fab.getBoundingClientRect();
+        anchorX = rect.left + rect.width / 2;
+        anchorY = rect.top + rect.height / 2;
+    }
+    const expandLeft = anchorX > innerWidth / 2;
+    const expandUp = anchorY > innerHeight / 2;
+    let x = expandLeft ? anchorX - gap - width : anchorX + (fab?.offsetWidth || 48) / 2 + gap;
+    let y = expandUp ? anchorY - gap - height : anchorY + (fab?.offsetHeight || 48) / 2 + gap;
+    x = Math.max(4, Math.min(innerWidth - width - 4, x));
+    y = Math.max(4, Math.min(innerHeight - height - 4, y));
     panel.style.left = `${x}px`; panel.style.top = `${y}px`;
     writeFloatingPosition('panel', { x, y });
     requestAnimationFrame(() => restoreFloatingPosition('panel', panel));
