@@ -1,4 +1,4 @@
-const VERSION = '0.8.9';
+const VERSION = '0.9.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -1882,7 +1882,7 @@ function stageMarkup(stage) {
         return `<p class="bo-muted">从当前酒馆楼层读取剧情与 MVU 状态，作为后续识别战场的依据。</p><button id="battle-orb-sync" class="bo-primary" type="button">① 读取楼层与 MVU</button>`;
     }
     if (stage === 'recognize') {
-        return `<div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div><button id="battle-orb-recognize" class="bo-primary" type="button">${declaration ? '重新识别 / 修正声明' : '② 识别 / 生成战场声明'}</button><label class="bo-hint-field"><span>识别提示（可选）</span><input id="battle-orb-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="可选：额外的识别提醒"></label><section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="点击识别让主 AI 草拟，或直接粘贴已有声明"></textarea></section><button id="battle-orb-to-create" class="bo-secondary" type="button" ${declaration ? '' : 'disabled'}>下一步：创建战场 →</button>`;
+        return `<div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div><button id="battle-orb-recognize" class="bo-primary" type="button" ${declaration ? 'disabled' : ''}>② 识别 / 生成战场声明</button><small id="battle-orb-recognize-note" class="bo-recognize-note" ${declaration ? '' : 'hidden'}>BattleDeclaration 已就绪：重新生成需先清空下方声明文本，避免误触覆盖。</small><label class="bo-hint-field"><span>识别提示（可选）</span><input id="battle-orb-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="可选：额外的识别提醒"></label><section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="点击识别让主 AI 草拟，或直接粘贴已有声明"></textarea></section><button id="battle-orb-to-create" class="bo-secondary ${declaration ? 'bo-next' : ''}" type="button" ${declaration ? '' : 'disabled'}>下一步：创建战场 →</button>`;
     }
     if (stage === 'create') {
         return `<div id="battle-orb-declaration-summary"></div><label class="bo-unit-hint"><span>单位修正提示（可选）</span><textarea id="battle-orb-unit-hint" spellcheck="false" placeholder="可选：针对单位的修正提示，随战斗建模传给 AI">${escapeHtml(settings.unitHint || '')}</textarea></label><button id="battle-orb-create" class="bo-primary" type="button">③ 创建二维战场</button><button id="battle-orb-back-recognize" class="bo-link" type="button">← 返回修改声明</button>`;
@@ -1914,7 +1914,9 @@ function renderStage() {
         const declarationBox = $('#battle-orb-declaration');
         if (declarationBox && declaration && declarationBox !== document.activeElement) declarationBox.value = JSON.stringify(declaration, null, 2);
         const nextButton = $('#battle-orb-to-create'); if (nextButton) nextButton.disabled = busy || !declaration;
-        const recognizeButton = $('#battle-orb-recognize'); if (recognizeButton) recognizeButton.disabled = busy;
+        const recognizeButton = $('#battle-orb-recognize'); if (recognizeButton) recognizeButton.disabled = busy || Boolean(declaration);
+        const recognizeNote = $('#battle-orb-recognize-note'); if (recognizeNote) recognizeNote.hidden = !declaration;
+        if (nextButton) nextButton.classList.toggle('bo-next', !busy && Boolean(declaration));
     } else if (stage === 'create') {
         const summary = $('#battle-orb-declaration-summary');
         if (summary) summary.innerHTML = declarationSummaryMarkup(declaration);
