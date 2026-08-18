@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.test/
+data/
+coverage/
+*.log
+*.tmp
+*.bak
+.env
+.env.*
+!.env.example
+temp.txt
+apinomaTestingKey.txt
+*TestingKey*.txt
+

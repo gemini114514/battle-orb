@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#111310" />
+  <title>Battle Orb · 战斗球战术终端</title>
+</head>
+<body>
+  <div id="app" class="game-app">
+    <aside class="game-sidebar" id="rail">
+      <button class="game-logo" data-panel="hub">
+        <span class="logo-sigil">轮</span>
+        <span><b>Battle Orb</b><small>战斗球 · 战术终端 3.2.6</small></span>
+      </button>
+
+      <nav class="game-nav" aria-label="游戏功能">
+        <section class="nav-category" data-nav-category="world">
+          <button class="nav-category-toggle" type="button" data-action="toggle-nav-category" aria-expanded="true"><span>◉</span><em>世界</em><i>⌄</i></button>
+          <div class="nav-category-items">
+            <button class="nav-item active" data-panel="hub"><span>⌂</span><em>世界总览</em></button>
+            <button class="nav-item" data-panel="chat"><span>◈</span><em>剧情楼层</em></button>
+            <button class="nav-item" data-panel="combat"><span>⚔</span><em>战术演算</em><i id="combatNavState">—</i></button>
+            <button class="nav-item" data-panel="missions"><span>◆</span><em>任务</em><i id="missionCount">0</i></button>
+            <button class="nav-item" data-panel="world"><span>◎</span><em>世界档案</em></button>
+            <button class="nav-item" data-panel="worldbook"><span>❋</span><em>世界书管理</em></button>
+            <button class="nav-item" data-panel="intel"><span>≋</span><em>情报与传闻</em></button>
+          </div>
+        </section>
+        <section class="nav-category" data-nav-category="entities">
+          <button class="nav-category-toggle" type="button" data-action="toggle-nav-category" aria-expanded="true"><span>♙</span><em>实体</em><i>⌄</i></button>
+          <div class="nav-category-items">
+            <button class="nav-item" data-panel="status"><span>◎</span><em>主角档案</em></button>
+            <button class="nav-item" data-panel="relations"><span>♙</span><em>实体关系</em></button>
+            <button class="nav-item" data-panel="shop"><span>¤</span><em>个人商店终端</em></button>
+            <button class="nav-item" data-panel="inventory"><span>▣</span><em>装备与道具</em></button>
+            <button class="nav-item" data-panel="abilities"><span>✦</span><em>技能与血统</em></button>
+          </div>
+        </section>
+      </nav>
+
+      <div class="sidebar-foot">
+        <button class="nav-item" data-panel="user-settings"><span>☻</span><em>用户设定</em></button>
+        <button class="nav-item" data-panel="archive"><span>▤</span><em>存档管理</em></button>
+        <button class="nav-item" data-panel="settings"><span>⚙</span><em>系统设置</em></button>
+      </div>
+    </aside>
+
+    <main class="game-main">
+      <div id="updateBanner" class="update-banner hidden" role="status"></div>
+      <header class="game-header">
+        <button class="mobile-menu" data-action="toggle-rail">☰</button>
+        <div class="header-location">
+          <small id="routeLabel">指挥中心</small>
+          <strong id="sessionTitle">新的轮回</strong>
+        </div>
+        <div class="resource-strip">
+          <div class="resource hp"><span>HP</span><b id="hudHp">20/20</b><i><u id="hudHpBar"></u></i></div>
+          <div class="resource ep"><span>EP</span><b id="hudEp">0/0</b><i><u id="hudEpBar"></u></i></div>
+          <div class="resource coin"><span>空间币</span><b id="hudCoin">0</b></div>
+          <div class="resource stability"><span>世界稳定</span><b id="hudStability">100%</b></div>
+        </div>
+        <button type="button" class="version-badge" id="versionBadge" data-action="check-update" title="当前版本 · 点击检查更新">v0.1.0</button>
+        <button class="runtime-state" id="runtimeBadge" data-panel="settings"><i></i><span>载入中</span></button>
+      </header>
+      <div id="aiProcessBar" class="ai-process-bar hidden" aria-live="polite" aria-hidden="true"></div>
+
+      <section class="view active dashboard-view" id="view-hub">
+        <div class="hub-hero">
+          <div class="hero-copy">
+            <small>BATTLE ORB COMMAND</small>
+            <h1 id="hubGreeting">欢迎回来，战斗者</h1>
+            <p id="hubSummary">主神终端已接入。选择一项行动，继续你的轮回。</p>
+            <div class="hero-actions">
+              <button class="primary-action" data-panel="chat">继续冒险 <span>→</span></button>
+              <button data-prompt="【选择世界】">选择任务世界</button>
+              <button data-action="new-chat">建立新轮回</button>
+            </div>
+          </div>
+          <div class="hero-orb"><div><span>WORLD</span><b id="hubWorld">主神空间</b><small id="hubLocation">等待投放</small></div></div>
+        </div>
+        <div class="hub-grid">
+          <article class="hub-card current-objective"><header><span>当前任务</span><button data-panel="missions">全部任务</button></header><div id="hubMission"></div></article>
+          <article class="hub-card character-glance"><header><span>战斗者概览</span><button data-panel="status">完整状态</button></header><div id="hubCharacter"></div></article>
+          <article class="hub-card recent-log"><header><span>最近记录</span><button data-panel="chat">打开记录</button></header><div id="hubRecent"></div></article>
+          <article class="hub-card quick-command"><header><span>快捷指令</span></header><div class="command-grid">
+            <button data-prompt="观察周围环境并列出值得注意的细节。"><span>👁</span>观察环境</button>
+            <button data-prompt="查看当前状态与可用资源。"><span>◫</span>检查状态</button>
+            <button data-prompt="搜索附近可能存在的线索与资源。"><span>⌕</span>搜索区域</button>
+            <button data-action="roll"><span>◇</span>掷 D100</button>
+          </div></article>
+        </div>
+      </section>
+
+      <section class="view adventure-view" id="view-chat">
+        <header class="adventure-toolbar">
+          <div><small id="chapterName">序章</small><h2 id="adventureLocation">主神空间</h2></div>
+          <div class="floor-toolbar-actions">
+            <button type="button" class="story-tools-toggle" data-action="toggle-story-tools" aria-expanded="false" title="展开剧情工具">⋯</button>
+            <button data-action="floor-prev" title="上一楼">‹</button>
+            <button data-action="floor-next" title="下一楼">›</button>
+            <button data-action="view-floor-prompt" id="floorPromptButton">查看 Prompt</button>
+            <button data-action="view-floor-full-prompt" id="floorFullPromptButton" title="查看本楼实际发送给大模型的完整 Prompt（全部消息与内容，只读）">完整 Prompt</button>
+            <button data-action="view-floor-tokens" id="floorTokenUsage">Token —</button>
+            <button data-action="floor-branch-prev" title="上一个分支" aria-label="上一个分支">‹</button>
+            <button data-action="switch-floor-branch" id="floorBranchButton" disabled title="切换当前剧情楼层的并行分支">分支 1/1</button>
+            <button data-action="floor-branch-next" title="下一个分支" aria-label="下一个分支">›</button>
+            <button data-action="edit-floor">编辑本楼</button>
+            <button data-action="regen-floor">重新演算</button>
+            <button data-action="delete-floor" class="danger">从本楼删除</button>
+            <button data-action="roll">掷骰</button>
+            <button data-action="toggle-actions">快捷行动</button>
+            <span id="tokenBadge">0 条记录</span>
+          </div>
+        </header>
+        <div class="story-floor-shell">
+          <div class="messages story-floor" id="messages"></div>
+        </div>
+        <div class="typing hidden" id="typing"><i></i><i></i><i></i><span>世界正在回应 · <b id="generationElapsed">0:00</b> · <em id="generationChars">等待首包</em></span><button type="button" data-action="cancel-generation">中止</button></div>
+        <div class="composer-wrap">
+          <div class="quick-actions hidden" id="quickActions">
+            <div class="quick-action-loading">正在读取 MVU 任务状态…</div>
+          </div>
+          <form class="composer" id="composer">
+            <textarea id="messageInput" rows="1" placeholder="你准备做什么？"></textarea>
+            <!-- SillyTavern card HTML targets this legacy input id. Keep it
+                 off-screen and mirror its value into the independent composer
+                 so card buttons/scripts remain directly compatible. -->
+            <textarea id="send_textarea" aria-hidden="true" tabindex="-1" spellcheck="false"></textarea>
+            <button type="button" class="quick-command-toggle" data-action="toggle-actions" aria-controls="quickActions" aria-expanded="false" title="展开原卡快捷指令">⌘</button>
+            <button type="submit" class="send-button" id="sendButton">执行行动</button>
+          </form>
+          <small>Enter 执行 · Shift + Enter 换行</small>
+        </div>
+      </section>
+
+      <section class="view data-view" id="view-status">
+        <header class="page-heading"><div><small>REINCARNATOR</small><h1>角色状态</h1><p>生命、属性、形态与当前状态的统一面板。</p></div><button data-action="open-setup">编辑建档</button></header>
+        <div id="statusContent" class="dashboard-grid"></div>
+      </section>
+
+      <section class="view data-view" id="view-inventory">
+        <header class="page-heading"><div><small>ARSENAL</small><h1>装备与道具</h1><p>按 V3.2.6 悬浮状态栏协议管理战术栏、背包与仓库。</p></div></header>
+        <div id="inventoryContent"></div>
+      </section>
+
+      <section class="view data-view" id="view-abilities">
+        <header class="page-heading"><div><small>ABILITIES</small><h1>技能与血统</h1><p>能力体系、职业、血统与可切换形态。</p></div></header>
+        <div id="abilityContent" class="entity-sections"></div>
+      </section>
+
+      <section class="view data-view" id="view-missions">
+        <header class="page-heading"><div><small>MISSION CONTROL</small><h1>任务</h1><p>追踪主线、支线、试炼与结算进度。</p></div><button class="accent-button" data-prompt="【选择世界】">请求世界候选</button></header>
+        <div id="missionContent" class="mission-board"></div>
+      </section>
+
+      <section class="view data-view" id="view-world">
+        <header class="page-heading"><div><small>WORLD DOSSIER</small><h1>世界档案</h1><p>当前世界的法则、势力、探索度与因果变化。</p></div></header>
+        <div id="worldContent" class="world-layout"></div>
+      </section>
+
+      <section class="view data-view" id="view-relations">
+        <header class="page-heading"><div><small>ENTITY NETWORK</small><h1>实体关系</h1><p>查看主角与 NPC，以及 NPC 彼此之间的有向好感度。</p></div></header>
+        <div id="relationContent" class="relation-network"></div>
+      </section>
+
+      <section class="view data-view shop-terminal-view" id="view-shop">
+        <header class="page-heading"><div><small>PERSONAL EXCHANGE TERMINAL</small><h1>个人商店终端</h1><p>购物车和自定义兑换库仅属于当前人物存档，不进入共享剧情状态。</p></div><button data-action="open-setup-shop" class="accent-button">进入建档结算</button></header>
+        <div id="personalShopContent" class="personal-shop-content"></div>
+      </section>
+
+      <section class="view data-view" id="view-intel">
+        <header class="page-heading"><div><small>INTELLIGENCE</small><h1>情报与传闻</h1><p>街头巷议、交易情报、布告与势力动态。</p></div></header>
+        <div id="intelContent" class="intel-columns"></div>
+      </section>
+
+      <section class="view data-view" id="view-archive">
+        <header class="page-heading"><div><small>SAVE ARCHIVE</small><h1>轮回存档</h1><p>切换、导出或建立一条新的轮回时间线。</p></div><div><button data-action="export-save">导出全部</button><button class="accent-button" data-action="new-chat">新轮回</button></div></header>
+        <div id="archiveContent" class="archive-list"></div>
+      </section>
+
+      <section class="view data-view combat-view" id="view-combat">
+        <header class="page-heading combat-heading"><div><small>VIBE COMBAT · LOCAL AUTHORITY</small><h1>战术演算终端</h1><p>AI 负责意图与叙事；本地服务器独占骰点、伤害、状态、位置和胜负裁定。</p></div><div class="combat-header-actions"><button class="accent-button" data-action="combat-start">开始 / 继续</button></div></header>
+        <div class="combat-status-strip"><div><small>状态</small><b id="combatStatus">未建立</b></div><div><small>模式</small><select id="combatMode"><option value="manual">纯手操</option><option value="semi">半自动</option><option value="auto">全自动</option></select></div><div><small>回合 / 版本</small><b id="combatRound">—</b></div><div><small>固定种子</small><code id="combatSeed">—</code></div><div><small>事件哈希</small><code id="combatHash">—</code></div></div>
+        <nav class="combat-flow-stepper" aria-label="战术演算流程">
+          <button class="combat-flow-step" data-action="combat-flow-phase" data-combat-flow-step="initiate"><i>1</i><span><b>遭遇发起</b><small>AI 识别 / 手动 / 模拟</small></span></button>
+          <span class="combat-flow-arrow" aria-hidden="true">›</span>
+          <button class="combat-flow-step" data-action="combat-flow-phase" data-combat-flow-step="model"><i>2</i><span><b>数字化建模</b><small>正文 → 战斗 AI → 校验</small></span></button>
+          <span class="combat-flow-arrow" aria-hidden="true">›</span>
+          <button class="combat-flow-step" data-action="combat-flow-phase" data-combat-flow-step="deploy"><i>3</i><span><b>编制部署</b><small>实体 / 策略 / 线路</small></span></button>
+          <span class="combat-flow-arrow" aria-hidden="true">›</span>
+          <button class="combat-flow-step" data-action="combat-flow-phase" data-combat-flow-step="battle"><i>4</i><span><b>战场演算</b><small>二维战场 / 行动 / 账本</small></span></button>
+          <span class="combat-flow-arrow" aria-hidden="true">›</span>
+          <button class="combat-flow-step" data-action="combat-flow-phase" data-combat-flow-step="result"><i>5</i><span><b>结果结算</b><small>战报融合 / 重放 / 追踪</small></span></button>
+        </nav>
+        <div class="combat-flow-body">
+          <section class="combat-flow-panel" data-combat-phase="initiate">
+            <div class="combat-initiate-grid">
+              <article class="combat-action-card combat-initiate-ai">
+                <small>AI RECOGNITION · 从剧情自动建遭遇</small>
+                <h3>AI 识别当前遭遇</h3>
+                <p>战斗 AI 读取当前剧情与 MVU，草拟战场声明，通过本地校验后进入建模阶段。</p>
+                <div class="combat-notes-field">
+                  <label for="combatRecognitionNotes">额外需求（可选 · 一并交给战斗 AI）</label>
+                  <textarea id="combatRecognitionNotes" rows="3" placeholder="例如：更大的战场规模、夜战或雨天、狭窄巷道、需要强调的战场设定或敌人特征。"></textarea>
+                </div>
+                <div class="combat-action-cta">
+                  <button id="combatDraftAiButton" data-action="combat-draft-ai" data-recognition-state="idle">AI 识别当前遭遇</button>
+                  <span id="combatDraftAiStatus" class="combat-ai-recognition-status idle" aria-live="polite">读取当前剧情与 MVU</span>
+                </div>
+              </article>
+              <article class="combat-action-card">
+                <small>MANUAL DRAFT · 直接编辑 JSON</small>
+                <h3>手动新建遭遇</h3>
+                <p>手工编写或粘贴 EncounterDraft，直接创建本地权威遭遇，适合排练与自定义测试。</p>
+                <div class="combat-action-cta"><button data-action="combat-new">手动新建</button></div>
+              </article>
+            </div>
+            <details class="combat-module-fold combat-simulator-fold" id="combatSimulatorFold">
+              <summary><span>模拟器与标准压力场景</span><b id="combatSimulatorFoldState">点击折叠</b></summary>
+              <section class="combat-simulator" id="combatSimulator" aria-labelledby="combatSimulatorTitle">
+                <header><div><small>SIMULATION SANDBOX · LOCAL ONLY</small><h2 id="combatSimulatorTitle">模拟器模式</h2><p>选择样本后会立即启动本地演算，并自动定位到二维战场；默认不写入剧情、MVU 或正式战斗存档。完成后可由你确认，把结果作为“模拟测试剧情”交给正文 AI。</p></div><div class="combat-simulator-state"><small>当前状态</small><b id="combatSimulatorState">未启用</b><div><button data-action="combat-toggle-simulator-picker" hidden>更换样本</button><button data-action="combat-exit-simulator" disabled>退出模拟器</button></div></div></header>
+                <div class="combat-scenario-grid">
+                  <article class="combat-scenario-card danger"><small>STRESS CASE · 01</small><h3>本能丧尸群 · 1 对 100</h3><p>以主角当前面板为同级基准，生成一百名各自行动的丧尸。近战接触位每个目标最多 8 个，用于检验围攻、搜寻和群组账本。</p><footer><span>敌方：同级 ×100</span><button data-action="combat-simulator-scenario" data-simulator-scenario="same-tier-horde">载入并启动</button></footer></article>
+                  <article class="combat-scenario-card boss"><small>STRESS CASE · 02</small><h3>高二生命层级 BOSS</h3><p>按主角当前生命层级向上推演两级的 BOSS 压力样本，包含阶段阈值、先攻与生存压力。</p><footer><span>敌方：BOSS +2 层</span><button data-action="combat-simulator-scenario" data-simulator-scenario="two-tier-boss">载入并启动</button></footer></article>
+                  <article class="combat-scenario-card mixed"><small>STRESS CASE · 03</small><h3>BOSS ＋ 同级随从</h3><p>高二生命层级 BOSS 同时携带同级随从，检验集火策略、群组显示和 BOSS 阶段事件。</p><footer><span>敌方：BOSS + 同级 ×12</span><button data-action="combat-simulator-scenario" data-simulator-scenario="boss-with-minions">载入并启动</button></footer></article>
+                  <article class="combat-scenario-card"><small>TACTICS CASE · 04</small><h3>哥布林小队</h3><p>共享目击情报、近距离协同，并优先压制受伤目标的简单战术样本。</p><footer><span>敌方：小队 ×12</span><button data-action="combat-simulator-scenario" data-simulator-scenario="goblin-squad">载入并启动</button></footer></article>
+                  <article class="combat-scenario-card"><small>TACTICS CASE · 05</small><h3>格式塔机械体</h3><p>任一节点获取信息即可全群共享；用于检查远距情报能力与集体决策。</p><footer><span>敌方：机械体 ×12</span><button data-action="combat-simulator-scenario" data-simulator-scenario="hive-machines">载入并启动</button></footer></article>
+                </div>
+              </section>
+            </details>
+          </section>
+
+          <section class="combat-flow-panel" data-combat-phase="model">
+            <section class="combat-panel combat-model-panel">
+              <header><div><small>COMBAT PIPELINE</small><h2>建模流程状态</h2></div><span>正文声明 → 战斗 AI 建模 → 本地校验 → 固定种子回合制</span></header>
+              <section class="combat-model-status" id="combatModelStatus"><small>COMBAT PIPELINE</small><b>等待剧情 AI 的战场声明</b><span>正文声明 → 战斗 AI 建模 → 本地校验 → 固定种子回合制</span></section>
+            </section>
+          </section>
+
+          <section class="combat-flow-panel" data-combat-phase="deploy">
+            <div class="combat-deploy-grid">
+              <section class="combat-panel roster-panel">
+                <header><div><small>COMBATANTS</small><h2>参战实体</h2></div><button data-action="combat-toggle-cohorts">个体 / 群组</button></header>
+                <div id="combatRoster" class="combat-roster"><div class="empty-state">暂无参战实体</div></div>
+              </section>
+              <section class="combat-panel strategy-panel">
+                <header><div><small>TACTICAL POLICY</small><h2>战斗 AI 与半自动策略</h2></div><button data-action="combat-compile-strategy">AI / 本地编译预览</button></header>
+                <div class="combat-ai-route">
+                  <label><span>独立战斗模型线路</span><select id="combatConnection"></select></label>
+                  <label><span>战斗 AIRP 预设</span><select id="combatPreset"></select></label>
+                </div>
+                <div class="combat-strategy-presets" aria-label="本地战斗策略预设">
+                  <small>本地策略预设（可再编辑）</small>
+                  <div class="combat-strategy-preset-list">
+                    <button type="button" data-combat-strategy-preset="standard">标准推进</button>
+                    <button type="button" data-combat-strategy-preset="focus">集中火力</button>
+                    <button type="button" data-combat-strategy-preset="guerrilla">游击分割</button>
+                    <button type="button" data-combat-strategy-preset="guard">护卫防守</button>
+                  </div>
+                </div>
+                <textarea id="combatStrategy" rows="5" placeholder="例如：优先集火 Boss；HP 低于 50% 或击杀一半敌人时由我接管；保留 20% EP。"></textarea>
+                <p class="combat-strategy-hint">模型只负责声明意图；这里的预设会在本地编译为确定性策略。每名玩家方实体可在左侧单独选择策略和手操 / 自动，未单独选择时跟随上方策略。</p>
+                <div id="combatStrategyPreview" class="strategy-preview empty-state">策略会先编译为确定性规则，确认后才执行。</div>
+              </section>
+            </div>
+          </section>
+
+          <section class="combat-flow-panel" data-combat-phase="battle">
+            <div class="combat-console-grid">
+              <section class="combat-panel battlefield-panel">
+                <header><div><small>2D TURN FIELD · METERS</small><h2>二维战场</h2></div><div class="combat-panel-actions"><button data-action="combat-redo" title="重复上一次玩家行动">重做上次行动</button><button data-action="combat-advance">推进演算</button></div></header>
+                <div id="combatZones" class="combat-zones"><div class="empty-state">创建遭遇后显示二维战场</div></div>
+              </section>
+              <section class="combat-panel turn-panel">
+                <header><div><small>TURN CONTROL</small><h2>当前行动</h2></div><span id="combatActiveUnit">—</span></header>
+                <div id="combatTurn"><div class="empty-state">等待行动时机</div></div>
+              </section>
+              <section class="combat-panel event-panel">
+                <header><div><small>IMMUTABLE LEDGER</small><h2>本地裁定账本</h2></div><button data-action="combat-refresh">刷新</button></header>
+                <div id="combatEvents" class="combat-events"><div class="empty-state">尚无事件</div></div>
+              </section>
+            </div>
+          </section>
+
+          <section class="combat-flow-panel" data-combat-phase="result">
+            <div class="combat-result-grid">
+              <section class="combat-panel result-panel">
+                <header><div><small>NARRATIVE FUSION</small><h2 id="combatResultTitle">剧情融合</h2><span id="combatNarrateStatus" class="combat-narrate-status idle" aria-live="polite">等待可写入结果</span></div><div class="combat-panel-actions"><button data-action="combat-replay">查看重放</button><button data-action="combat-debug-export" title="导出本场请求、操作、报错、事件和重放快照">导出 DEBUG</button><button class="accent-button" id="combatNarrateButton" data-action="combat-narrate">生成并写入剧情</button></div></header>
+                <div class="combat-notes-field combat-disposition-field" id="combatDispositionField">
+                  <label for="combatDispositionNotes">战后处置（可选 · 一并交给正文 AI）</label>
+                  <textarea id="combatDispositionNotes" rows="3" placeholder="例如：搜刮战利品并逐件清点、什么都不要、安葬死者、破坏尸体、审问俘虏、快速撤离……"></textarea>
+                </div>
+                <div id="combatResult"><div class="empty-state">正式暂停或战斗结束后可生成融合剧情。</div></div>
+              </section>
+              <section class="combat-panel combat-trace-panel">
+                <header><div><small>PAIRED PROMPT TRACE · READ ONLY</small><h2>剧情 AI / 战斗 AI 构建记录</h2><p>按同一 turnId 成对查看完整请求与回复，包含预设、World Info、BattleDeclaration、CombatModel、校验和创建结果。</p></div><button data-action="combat-view-prompt-trace">用内建编辑器查看</button></header>
+                <div id="combatPromptTraceSummary" class="combat-trace-summary">尚未读取本场黑盒记录。</div>
+              </section>
+            </div>
+           </section>
+         </div>
+       </section>
+
+      <section class="view data-view" id="view-worldbook">
+        <header class="page-heading"><div><small>CUSTOM WORLD BOOK</small><h1>世界书管理</h1><p>以原卡 3.2.6 世界书格式管理预设之外的自定义条目；与角色卡内置条目并行生效，支持关键词触发、常驻注入、EJS 与聊天深度注入。</p></div></header>
+        <div class="worldbook-layout">
+          <div class="manager-sidebar"><header><h3>自定义条目</h3><button data-action="worldbook-new">＋ 新建</button></header><div id="worldbookList" class="manager-list"></div><div class="user-profile-sidebar-foot"><button type="button" data-action="import-worldbook">导入</button><button type="button" data-action="export-worldbook">导出全部</button><button type="button" data-action="restore-worldbook-seeds" title="恢复本流程预置条目（不会覆盖已有同名条目）">恢复预置</button><input id="worldbookFile" type="file" accept="application/json,.json" hidden /></div></div>
+          <form class="manager-editor worldbook-editor" id="worldbookForm">
+            <input type="hidden" name="id" />
+            <div class="editor-heading"><div><small>WORLDBOOK ENTRY · V3 格式</small><h2 id="worldbookTitle">未选择条目</h2></div><div><button type="button" data-action="delete-worldbook" class="danger">删除</button><button type="submit" class="accent-button">保存条目</button></div></div>
+            <div class="form-grid">
+              <label class="wide"><span>标题 / 备注（comment）</span><input name="comment" placeholder="例如：【战术演算】战斗交接协议" /></label>
+              <label class="wide"><span>主关键词（keys · 逗号分隔，任一命中即激活；勾选常驻则永远注入）</span><input name="keys" placeholder="战斗, 开战, 遭遇战" /></label>
+              <label class="wide"><span>次要关键词（secondary_keys · 逗号分隔，仅作记录）</span><input name="secondaryKeys" placeholder="可选" /></label>
+              <label><span>插入顺序（insertion_order，小者在前）</span><input name="insertionOrder" type="number" value="100" /></label>
+              <label><span>位置（position）</span><select name="position"><option value="before_char">before_char · world_info 槽</option><option value="after_char">after_char · additional_info 槽</option></select></label>
+              <label><span>注入深度（depth · “静态块”以外按深度注入聊天）</span><select name="depth"><option value="">静态块</option><option value="0">0 · 最新楼层之后</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label>
+              <label><span>深度注入角色（role）</span><select name="role"><option value="0">system</option><option value="1">user</option><option value="2">assistant</option></select></label>
+              <label class="checkbox-field"><span>启用（enabled）</span><input name="enabled" type="checkbox" checked /></label>
+              <label class="checkbox-field"><span>常驻（constant）</span><input name="constant" type="checkbox" /></label>
+              <label class="checkbox-field"><span>关键词用正则（use_regex）</span><input name="useRegex" type="checkbox" checked /></label>
+              <label class="wide"><span>内容（支持 EJS 与宏，与卡内条目一致）</span><textarea name="content" rows="14" spellcheck="false" placeholder="条目正文……"></textarea></label>
+            </div>
+            <footer class="worldbook-editor-foot"><span id="worldbookMeta">新条目保存后立即与角色卡内置世界书并行生效。</span></footer>
+          </form>
+        </div>
+      </section>
+
+
+
+      <section class="view data-view" id="view-settings">
+        <header class="page-heading"><div><small>SYSTEM</small><h1>系统设置</h1><p>管理模型连接、用途线路、AIRP 风格预设和助手脚本。</p></div></header>
+        <div class="settings-tabs"><button class="active" data-settings-tab="connections">API 连接</button><button data-settings-tab="model-routing">大模型配置</button><button data-settings-tab="prompt-lab">提示词实验室</button><button data-settings-tab="presets">AIRP 预设</button><button data-settings-tab="regex">正则预设</button><button data-settings-tab="scripts">助手脚本</button><button data-settings-tab="blackbox">诊断黑盒</button><button data-settings-tab="general">常规</button></div>
+
+        <section class="settings-panel active" data-settings-panel="connections">
+          <div class="manager-sidebar"><header><h3>连接配置</h3><button data-action="new-connection">＋</button></header><div id="connectionList" class="manager-list"></div></div>
+          <form class="manager-editor" id="connectionForm">
+            <input type="hidden" name="id" />
+            <div class="editor-heading"><div><small>MODEL CONNECTION</small><h2 id="connectionEditorTitle">新建连接</h2></div><div><button type="button" data-action="import-connections">导入实例集</button><input id="connectionFile" type="file" accept="application/json,.json" hidden><button type="button" data-action="export-connections">导出实例集</button><button type="button" data-action="delete-connection" class="danger">删除</button><button type="submit" class="accent-button">保存连接</button></div></div>
+            <div class="form-grid"><label><span>配置名称</span><input name="name" placeholder="例如：Claude Sonnet 主线路" /></label><label><span>API 协议</span><select name="protocol"><option value="openai-chat">OpenAI Chat Completions</option><option value="openai-responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option><option value="gemini">Google Gemini</option></select></label><label><span>API 基础地址</span><input name="baseUrl" placeholder="https://api.openai.com" /></label><label><span>接口路径</span><input name="path" placeholder="/v1/chat/completions" /></label><label class="wide"><span>模型（输入可过滤，仍可手填）</span><div class="model-row"><div class="model-combo"><input name="model" autocomplete="off" /><div id="connectionModelOptions" class="model-options"></div></div><button type="button" data-action="fetch-models">获取模型</button></div></label><label><span>模型列表路径</span><input name="modelsPath" placeholder="/v1/models" /></label><label><span>API 版本（可选）</span><input name="apiVersion" placeholder="Anthropic 默认 2023-06-01" /></label><label class="wide"><span>API Key（仅存浏览器 localStorage）</span><input name="apiKey" type="password" autocomplete="off" /></label><label class="wide"><span>额外请求头 JSON</span><textarea name="extraHeaders" rows="3">{}</textarea></label><label class="wide"><span>额外请求体 JSON</span><textarea name="extraBody" rows="3">{}</textarea></label><label><span>温度 <output id="temperatureValue">0.9</output></span><input name="temperature" type="range" min="0" max="2" step="0.05" value="0.9" /></label><label><span>最大输出 Token</span><input name="maxTokens" type="number" min="256" max="65536" value="8192" /></label><label class="wide"><span>连接测试提示词</span><textarea name="testPrompt" rows="3">只回复 OK</textarea></label></div>
+            <div class="connection-test"><button type="button" data-action="test-connection">测试连接</button><span id="connectionTestResult">保存后可作为当前主模型线路</span></div>
+          </form>
+        </section>
+
+        <section class="settings-panel general-settings model-routing-panel" data-settings-panel="model-routing">
+          <form class="settings-layout" id="modelRoutingForm">
+            <div class="settings-group model-routing-intro"><small class="settings-kicker">MODEL ROUTING</small><h3>按用途分配模型线路</h3><p>每个用途都可以绑定 API 连接。留空时跟随“API 连接”页当前主线路；连接配置本身仍在 API 连接页统一维护。</p><div id="modelRoutingSummary" class="model-routing-summary"></div></div>
+            <div class="settings-group"><label><span>剧情 AI</span><select name="storyConnectionId"></select><small class="field-help">负责常规剧情楼层、正文续写与世界叙事。</small></label><label><span>战斗 AI</span><select name="combatConnectionId"></select><small class="field-help">负责遭遇识别、策略编译等模型辅助；战斗结果仍由本地引擎裁定。</small></label><label><span>商店 AI</span><select name="shopConnectionId"></select><small class="field-help">负责个人商店目标决策和商品文案填充；模型输出与提示词会原样进入诊断链路。</small></label><button type="submit" class="accent-button">保存大模型配置</button></div>
+            <div class="settings-group runtime-group"><h3>调用优先级</h3><div class="routing-order"><span>1</span><b>用途专属连接</b><small>已绑定时优先使用对应连接</small><span>2</span><b>当前 API 主线路</b><small>用途未绑定连接时自动回退</small></div></div>
+          </form>
+        </section>
+
+        <section class="settings-panel" data-settings-panel="presets">
+          <div class="manager-sidebar"><header><h3>AIRP 预设库</h3><button data-action="import-preset">导入</button></header><div id="presetList" class="manager-list"></div><input id="presetFile" type="file" accept=".json,application/json" hidden /></div>
+          <div class="manager-editor preset-editor"><div class="editor-heading"><div><small>SILLYTAVERN OAI PRESET</small><h2 id="presetTitle">未选择预设</h2></div><div><button data-action="add-prompt-entry">新增条目</button><button data-action="delete-preset" class="danger">删除预设</button><button data-action="activate-preset" class="accent-button">设为当前</button></div></div><div id="presetSummary" class="preset-summary empty-state">导入预设后可逐条编辑。</div><div class="entry-editor-layout"><div id="promptEntries" class="prompt-entry-list"></div><form id="promptEntryEditor" class="entry-detail-editor"><div class="empty-state">在左侧选择一个提示词条目</div></form></div></div>
+        </section>
+
+        <section class="settings-panel" data-settings-panel="scripts">
+          <div class="manager-sidebar"><header><h3>助手脚本库</h3><button data-action="import-script">本地导入</button></header><div class="url-import"><input id="scriptUrl" type="url" placeholder="https://…/script.json"><button data-action="import-script-url">URL 导入</button></div><div id="scriptList" class="manager-list"></div><input id="scriptFile" type="file" accept=".json,.js,.mjs,application/json,text/javascript" hidden /></div>
+          <div class="manager-editor"><div class="editor-heading"><div><small>TAVERN HELPER SCRIPT</small><h2 id="scriptTitle">未选择脚本</h2></div><div><button data-action="delete-script" class="danger">删除</button><button data-action="toggle-script" class="accent-button">启用 / 停用</button></div></div><div id="scriptSummary" class="script-summary empty-state">支持导入酒馆助手脚本 JSON。大型脚本存放于 IndexedDB，不占用 localStorage。</div></div>
+        </section>
+
+        <section class="settings-panel" data-settings-panel="regex">
+          <div class="manager-sidebar"><header><h3>酒馆正则预设</h3><button data-action="import-regex-preset">导入</button></header><div id="regexPresetList" class="manager-list"></div><input id="regexPresetFile" type="file" accept="application/json,.json" hidden></div>
+          <div class="manager-editor"><div class="editor-heading"><div><small>SILLYTAVERN REGEX PIPELINE</small><h2 id="regexPresetTitle">卡内正则</h2></div><div><label class="icon-checkbox" title="启用或停用整个正则预设"><input id="regexPresetEnabled" type="checkbox"></label><button data-action="refresh-regex-display" title="不改动原始楼层，按当前正则重新渲染可见文本">重新应用</button><button data-action="add-regex-entry">新增规则</button><button data-action="delete-regex-preset" class="danger">删除预设</button></div></div><div id="regexPresetSummary" class="preset-summary"></div><div class="entry-editor-layout"><div id="regexEntries" class="prompt-entry-list"></div><form id="regexEntryEditor" class="entry-detail-editor"><div class="empty-state">在左侧选择一条正则规则</div></form></div></div>
+        </section>
+
+        <section class="settings-panel general-settings" data-settings-panel="blackbox">
+          <div class="blackbox-panel"><header><div><small>GAMEPLAY FLIGHT RECORDER</small><h2>游玩诊断黑盒</h2><p>本机记录启动、脚本、提示词、请求响应、变量变化和错误。API Key、令牌、Cookie 会在写入前脱敏。</p></div><span id="blackboxState">初始化中</span></header><div class="blackbox-stats"><div><small>当前运行</small><b id="blackboxRunId">—</b></div><div><small>事件数</small><b id="blackboxEventCount">0</b></div><div><small>会话</small><b id="blackboxSessionId">—</b></div><div><small>最近事件</small><b id="blackboxLastEvent">—</b></div></div><div class="blackbox-actions"><button data-action="export-blackbox" class="accent-button">导出当前诊断包</button><button data-action="clear-blackbox" class="danger">清空历史并新建运行</button></div><div id="blackboxTimeline" class="blackbox-timeline"></div></div>
+        </section>
+
+        <section class="settings-panel general-settings prompt-lab-panel" data-settings-panel="prompt-lab">
+          <div id="promptLabContent"><div class="prompt-lab-loading">选择模式后构造当前真实提示词…</div></div>
+        </section>
+
+        <section class="settings-panel general-settings" data-settings-panel="general">
+          <form class="settings-layout" id="settingsForm"><div class="settings-group"><h3>显示与大屏适配</h3><label><span>界面字号 / 缩放</span><select name="uiScale"><option value="0.85">紧凑 · 85%</option><option value="1">标准 · 100%</option><option value="1.15">大字 · 115%</option><option value="1.3">大屏 · 130%</option><option value="1.5">展台 · 150%</option></select></label><p class="settings-help">调整整个终端的字号、按钮和面板比例；刷新页面后仍会保留。</p><button type="button" data-action="save-settings" class="accent-button">保存常规设置</button></div><div class="settings-group"><h3>当前调用参数</h3><div id="activeCallSummary"></div></div><div class="settings-group runtime-group"><h3>规则运行时</h3><div id="integrityDetails"></div></div></form>
+        </section>
+      </section>
+
+      <section class="view data-view user-settings-view" id="view-user-settings">
+        <header class="page-heading"><div><small>USER PROFILES</small><h1>用户设定</h1><p>保存多个用户 A / B / C / D 设定档案，当前启用档案会作为对话中的用户身份与补充设定。</p></div></header>
+        <div class="user-profile-layout">
+          <div class="manager-sidebar user-profile-sidebar"><header><h3>用户设定档案</h3><button type="button" data-action="new-user-profile">＋ 新建</button></header><div id="userProfileList" class="manager-list"></div><div class="user-profile-sidebar-foot"><button type="button" data-action="import-user-profile">导入</button><button type="button" data-action="export-user-profile">导出当前</button><button type="button" data-action="export-user-profiles">导出全部</button><input id="userProfileFile" type="file" accept="application/json,.json" hidden /></div></div>
+          <form class="manager-editor user-profile-editor" id="userProfileForm">
+            <input type="hidden" name="id" />
+            <div class="editor-heading"><div><small>USER PROFILE</small><h2 id="userProfileEditorTitle">新建用户设定</h2><span id="userProfileEditorState" class="user-profile-state">未启用</span></div><div><button type="button" data-action="delete-user-profile" id="userProfileDelete" class="danger">删除</button><button type="button" data-action="activate-user-profile" id="userProfileActivate" class="accent-button">设为当前</button><button type="submit" class="accent-button">保存设定</button></div></div>
+            <div class="form-grid"><label><span>设定档案名称</span><input name="name" required placeholder="例如：用户A / 写手模式 / 现实身份" /></label><label><span>对话显示名称</span><input name="displayName" placeholder="模型称呼你的名字" /></label><label class="wide"><span>标签（逗号分隔）</span><input name="tags" placeholder="主账号，严肃，中文" /></label><label class="wide"><span>备注</span><input name="description" placeholder="仅用于管理，不会自动发送给模型" /></label><label class="wide"><span>用户补充设定</span><textarea name="persona" rows="18" spellcheck="false" placeholder="例如：姓名、身份、写作偏好、禁忌、长期目标……"></textarea></label></div>
+            <footer class="user-profile-editor-foot"><span>保存到本机 IndexedDB；切换档案不会修改角色卡或当前 MVU 人物档案。</span><span id="userProfileUpdatedAt">—</span></footer>
+          </form>
+        </div>
+      </section>
+    </main>
+
+    <nav class="mobile-bottom-nav" aria-label="主导航">
+      <button type="button" class="active" data-panel="hub"><span>⌂</span><em>主页</em></button>
+      <button type="button" data-panel="chat"><span>◈</span><em>剧情</em></button>
+      <button type="button" data-panel="combat"><span>⚔</span><em>战斗</em></button>
+      <button type="button" data-panel="status"><span>◎</span><em>角色</em></button>
+      <button type="button" data-action="toggle-rail" aria-label="打开完整功能菜单"><span>☰</span><em>更多</em></button>
+    </nav>
+
+    <dialog id="setupDialog" class="setup-dialog">
+      <form id="setupForm">
+        <header><div><small>REINCARNATOR REGISTRATION</small><h2>轮回者建档</h2></div><div><button type="button" data-action="open-profiles" class="setup-profile-shortcut">人物档案库</button><button type="button" data-action="close-setup">×</button></div></header>
+        <div class="setup-progress"><i class="active"></i><i></i><i></i><i></i><i></i><span id="setupStepLabel">1 / 5 · 信息 / 属性</span></div>
+        <section class="setup-step active" data-step="0">
+          <h3>信息 / 属性</h3><p>初始五维共 8 点，F 为零投入；角色血统将按卡片原始结构写入 MVU。</p>
+          <div class="form-grid"><label><span>姓名</span><input name="name" required placeholder="输入姓名或代号" /></label><label><span>年龄</span><input name="age" type="number" min="1" max="999" value="20" /></label><label><span>性别</span><select name="gender"><option>男</option><option>女</option><option>扶她</option><option>男娘</option><option>药娘</option><option>太监</option><option>无性别</option></select></label><label><span>种族</span><input name="race" value="人类" /></label><label class="wide"><span>阵营身份</span><div class="choice-row faction-choices"><label><input type="radio" name="faction" value="执行者" checked><b>执行者</b><small>秩序与守卫</small></label><label><input type="radio" name="faction" value="篡夺者"><b>篡夺者</b><small>混沌与掠夺</small></label><label><input type="radio" name="faction" value="梦魇师"><b>梦魇师</b><small>羁绊与灵魂</small></label><label><input type="radio" name="faction" value="残魂"><b>残魂</b><small>执念与求生</small></label><label><input type="radio" name="faction" value="穿越者"><b>穿越者</b><small>未知来客</small></label></div></label></div>
+          <div class="attribute-builder" id="attributeBuilder"></div><div class="points-left">剩余点数 <b id="pointsLeft">8</b> / 8</div>
+        </section>
+        <section class="setup-step" data-step="1"><div class="setup-shop-head"><div><h3>初始折扣兑换</h3><p>原版 V20260812 商城结构；本终端只绑定当前人物。</p></div><strong>余额 <span id="setupCoins">1000</span></strong></div><div class="setup-shop-workspace"><aside class="setup-shop-sidebar"><input id="setupShopSearch" placeholder="搜索名称、描述或标签"><div class="setup-shop-categories"><button type="button" class="active" data-setup-shop-category="all">全部分类</button><button type="button" data-setup-shop-category="equipment">装备</button><button type="button" data-setup-shop-category="item">道具</button><button type="button" data-setup-shop-category="skill">技能</button></div></aside><div class="setup-shop-content"><div class="setup-rarity-filter" id="setupRarityFilter"><span>品质筛选</span><button type="button" class="active" data-setup-shop-rarity="all">全部</button><button type="button" data-setup-shop-rarity="F">F</button><button type="button" data-setup-shop-rarity="E">E</button><button type="button" data-setup-shop-rarity="D">D</button><button type="button" data-setup-shop-rarity="C">C</button><button type="button" data-setup-shop-rarity="B">B</button><button type="button" data-setup-shop-rarity="A">A</button><button type="button" data-setup-shop-rarity="S">S</button><button type="button" data-setup-shop-rarity="SS">SS</button><button type="button" data-setup-shop-rarity="SSS">SSS</button></div><div id="setupShopItems" class="setup-shop-grid"></div></div></div><div id="setupCart" class="setup-cart"></div><details class="custom-starter"><summary>＋ 创建自定义兑换项</summary><div class="form-grid"><label><span>分类</span><select id="customStarterCategory"><option value="equipment">装备</option><option value="item">道具</option><option value="skill">技能</option></select></label><label><span>名称</span><input id="customStarterName"></label><label><span>品质</span><select id="customStarterTier"><option>F</option><option>E</option><option>D</option><option>C</option><option>B</option><option>A</option><option>S</option><option>SS</option><option>SSS</option></select></label><label><span>消耗空间币</span><input id="customStarterCost" type="number" min="0" value="100"></label><label class="wide"><span>标签（逗号分隔）</span><input id="customStarterTags"></label><label class="wide"><span>描述</span><textarea id="customStarterDescription" rows="2"></textarea></label><label class="wide"><span>效果 JSON</span><textarea id="customStarterEffects" rows="2">{}</textarea></label><button type="button" data-action="add-custom-starter">加入兑换库</button></div></details></section>
+        <section class="setup-step" data-step="2"><h3>世界 / 降临</h3><p>可停留主神空间、选择原版候选世界，或锁定自定义单一世界。</p><div class="choice-row setup-mode-choices"><label><input type="radio" name="mode" value="主神空间" checked><b>主神空间</b><small>待机后再选择任务</small></label><label><input type="radio" name="mode" value="候选世界"><b>候选世界</b><small>使用原版开局世界数据库</small></label><label><input type="radio" name="mode" value="单一世界"><b>单一世界</b><small>自定义长期舞台</small></label></div><div id="setupPlots" class="setup-plot-grid"></div><div class="form-grid"><label><span>自定义世界名称</span><input name="targetWorld" /></label><label><span>时间锚点</span><input name="worldTime" /></label><label><span>切入身份</span><input name="worldIdentity" /></label><label><span>主线状态</span><input name="worldState" /></label><label class="wide"><span>主神任务</span><textarea name="worldGoal" rows="2"></textarea></label><label class="toggle-label wide"><input type="checkbox" name="worldLock"><span><b>锁定世界稳定度</b><small>稳定度固定为 100</small></span></label></div></section>
+        <section class="setup-step" data-step="3"><div class="setup-partner-head"><div><h3>协同实体 / 队友创建</h3><p>按原版费用创建：Ⅰ级 70、Ⅱ级 350、Ⅲ级 1000 空间币。建档后锁定，可删除退款。</p></div><strong id="partnerCostState">未创建</strong></div><label class="toggle-label"><input type="checkbox" name="partnerEnabled"><span><b>携带初始队友</b><small>队友会写入 stat_data.关系列表，并在首轮由 AI 补全战术模块</small></span></label><div class="form-grid"><label><span>姓名</span><input name="partnerName" /></label><label><span>层级</span><select name="partnerTier"><option>Ⅰ</option><option>Ⅱ</option><option>Ⅲ</option></select></label><label><span>种族</span><input name="partnerRace" value="人类" /></label><label><span>性别</span><select name="partnerGender"><option>女</option><option>男</option><option>无性别</option></select></label><label class="wide"><span>外貌</span><textarea name="partnerAppearance" rows="2"></textarea></label><label class="wide"><span>喜爱</span><input name="partnerLikes" /></label><label class="wide"><span>背景故事</span><textarea name="partnerBackground" rows="4"></textarea></label></div></section>
+        <section class="setup-step" data-step="4"><h3>档案确认与持久化</h3><p>保存为人物档案后，可在任何新轮回一键加载，也可导入导出。</p><div id="setupSummary" class="setup-summary"></div><div class="profile-save-row"><input id="profileName" placeholder="档案名称，例如：侦察执行者"><button type="button" data-action="save-profile">保存 / 覆盖档案</button><button type="button" data-action="import-profile">导入</button><input id="profileFile" type="file" accept="application/json,.json" hidden></div><div id="profileList" class="profile-list"></div></section>
+        <footer><button type="button" id="setupPrev" data-action="setup-prev" disabled>上一步</button><button type="button" class="primary-action" id="setupNext" data-action="setup-next">下一步</button><button type="submit" class="primary-action hidden" id="setupSubmit">注入 MVU 并开始</button></footer>
+      </form>
+    </dialog>
+
+    <dialog id="textEditorDialog" class="text-editor-dialog">
+      <form method="dialog" id="textEditorForm"><header><div><small>BUILT-IN TEXT EDITOR</small><h2 id="textEditorTitle">文本编辑器</h2></div><button type="button" data-editor-action="close">×</button></header><div class="text-editor-toolbar"><label>查找 <input id="textEditorFind" autocomplete="off"></label><label data-editor-write>替换 <input id="textEditorReplace" autocomplete="off"></label><button type="button" data-editor-action="find-next">下一个</button><button type="button" data-editor-action="replace" data-editor-write>替换</button><button type="button" data-editor-action="replace-all" data-editor-write>全部替换</button><button type="button" data-editor-action="format" data-editor-json>格式化 JSON</button></div><div class="text-editor-workspace"><div id="textEditorLines" class="text-editor-lines">1</div><textarea id="textEditorValue" spellcheck="false" wrap="off"></textarea></div><footer><span id="textEditorStatus">JSON · 第 1 行，第 1 列</span><div><button type="button" data-editor-action="revert" data-editor-write>恢复打开时内容</button><button type="button" data-editor-action="close">关闭</button><button type="button" data-editor-action="save" data-editor-write class="accent-button">保存</button></div></footer></form>
+    </dialog>
+
+    <div class="toast-stack" id="toasts"></div>
+    <dialog id="confirmDialog"><form method="dialog"><h3 id="dialogTitle">确认操作</h3><p id="dialogText"></p><div><button value="cancel">取消</button><button value="confirm" class="danger">确认</button></div></form></dialog>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
