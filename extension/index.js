@@ -1,4 +1,4 @@
-const VERSION = '0.8.3';
+const VERSION = '0.8.4';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -1129,10 +1129,14 @@ async function execute(command) {
     if (!battle || busy || ['completed', 'abandoned'].includes(battle.status)) return false;
     busy = true; setStatus('本地演算中…', 'working'); render();
     try {
+        // 记录本次命令对应的暂停点（执行前），执行后从该点切出本次行动的完整事件段，
+        // 避免引擎自动推进多步后窗口把本次检定的 attack_check / 行动结算挤出。
+        const eventsBefore = repository.events(battle.id);
+        const lastPauseIndex = eventsBefore.map((item, index) => item.type === 'combat_paused' ? index : -1).filter(index => index >= 0).at(-1) ?? -1;
         await engine.command(battle, command);
         repository.commit(battle);
         mapIntent = null; mapMenu = null;
-        const recentEvents = repository.events(battle.id).slice(-24);
+        const recentEvents = repository.events(battle.id).slice(lastPauseIndex + 1);
         spawnAttackEffects(publicBattle(), recentEvents);
         recordDebug('action_executed', { battleId: battle.id, type: command.type, round: publicBattle()?.round, status: publicBattle()?.status });
         const notice = actionNoticeFromEvents(recentEvents, publicBattle(), command.actorId, command.type);
@@ -1284,7 +1288,27 @@ function actionNoticeFromEvents(events, state, actorId = null, actionType = null
         });
         return { kind: 'action', text: `${actor?.name || event.payload?.actorId || '单位'} · ${parts.join('；') || '行动已结算'}${event.payload?.epCost ? ` · EP -${event.payload.epCost}` : ''}` };
     }
-    if (event.type === 'script_action_resolved') return { kind: 'action', text: `${actor?.name || event.payload?.actorId || '单位'} · 脚本技能已结算 · ${Array.isArray(event.payload?.effects) ? `${event.payload.effects.length} 个效果` : '效果已应用'}` };
+    if (event.type === 'script_action_resolved') {
+        const list = events || [];
+        const eventIndex = list.indexOf(event);
+        const pre = list.slice(0, eventIndex >= 0 ? eventIndex : list.length);
+        const lastBoundary = [...pre].map((item, index) => ['combat_paused', 'combat_created', 'round_started', 'script_action_resolved'].includes(item.type) ? index : -1).filter(index => index >= 0).at(-1) ?? -1;
+        const checks = pre.slice(lastBoundary + 1).filter(item => item.type === 'attack_check' && (!actorId || item.payload?.actorId === actorId));
+        if (checks.length) {
+            const parts = checks.map(check => {
+                const target = state?.combatants?.find(unit => unit.id === check.payload?.targetId);
+                const totalDamage = Number(check.payload?.damage?.final ?? 0);
+                const hpDamage = Number(check.payload?.applied?.hpDamage ?? 0);
+                const absorbed = Number(check.payload?.applied?.absorbed ?? 0);
+                const hp = target ? ` · HP ${target.hp}/${target.maxHp}` : '';
+                const damageText = totalDamage > 0 ? `-${totalDamage} 伤害${absorbed > 0 ? `（护盾吸收 ${absorbed}）` : ''}${hpDamage !== totalDamage ? `，HP -${hpDamage}` : ''}` : '未造成伤害';
+                const outcome = check.payload?.outcome;
+                return `${target?.name || check.payload?.targetId} ${outcome === 'hit' || outcome === 'miracle' ? `命中 ${damageText}` : outcome === 'miss' ? '未命中' : outcome}${hp}`;
+            });
+            return { kind: 'action', text: `${actor?.name || event.payload?.actorId || '单位'} · ${parts.join('；')}` };
+        }
+        return { kind: 'action', text: `${actor?.name || event.payload?.actorId || '单位'} · 脚本技能已结算 · ${Array.isArray(event.payload?.effects) ? `${event.payload.effects.length} 个效果` : '效果已应用'}` };
+    }
     if (event.type === 'stealth_entered') return { kind: 'intel', text: `${actor?.name || event.payload?.actorId || '单位'} 进入潜行 · 视觉改为发现检定 · 移动声源上限 3m` };
     if (event.type === 'stealth_broken') return { kind: 'intel', text: `${actor?.name || event.payload?.actorId || '单位'} 结束潜行 · ${event.payload?.reason || '状态解除'}` };
     if (event.type === 'maneuver_resolved') return { kind: 'move', text: `${actor?.name || event.payload?.actorId || '单位'} · ${event.payload?.maneuver === 'sprint' ? `疾走，额外 ${event.payload.addedMeters}m` : event.payload?.maneuver === 'withdraw' ? `战术脱离 ${Number(event.payload.distanceMeters || 0).toFixed(1)}m` : event.payload?.maneuver === 'evasive' ? `闪避步法，${event.payload.remainingAttacks}次攻击劣势` : event.payload?.maneuver || '机动已结算'}` };
