@@ -1,4 +1,4 @@
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -23,6 +23,7 @@ try {
     bootTrace('dependencies-loaded');
 
 const ROOT_ID = 'battle-orb-root';
+const PANEL_ID = 'battle-orb-panel';
 const FAB_ID = 'battle-orb-fab';
 const MAX_FLOOR_CHARS = 9000;
 
@@ -73,95 +74,106 @@ function applyFabVisibility() {
     if (fab) fab.style.display = fabVisible() ? '' : 'none';
 }
 
-const FAB_POS_KEY = 'battle-orb.fab-pos';
-
-function readFabPosition() {
+function readFloatingPosition(key) {
     try {
-        const value = JSON.parse(localStorage.getItem(FAB_POS_KEY) || 'null');
+        const value = JSON.parse(localStorage.getItem(`battle-orb.${key}-pos`) || 'null');
         return Number.isFinite(value?.x) && Number.isFinite(value?.y) ? value : null;
     } catch { return null; }
 }
 
-function writeFabPosition(position) {
-    try { localStorage.setItem(FAB_POS_KEY, JSON.stringify(position)); } catch {}
+function writeFloatingPosition(key, position) {
+    try { localStorage.setItem(`battle-orb.${key}-pos`, JSON.stringify(position)); } catch {}
 }
 
-function floatingViewportBounds() {
+function floatingViewportBounds(key) {
     const viewport = globalThis.visualViewport;
     const left = Number(viewport?.offsetLeft) || 0;
     const top = Number(viewport?.offsetTop) || 0;
     const width = Number(viewport?.width) || innerWidth || document.documentElement.clientWidth;
     const height = Number(viewport?.height) || innerHeight || document.documentElement.clientHeight;
     const compact = width <= 650 || navigator.maxTouchPoints > 0;
-    const sideMargin = compact ? 12 : 8;
-    const topMargin = compact ? 12 : 8;
-    const bottomMargin = compact ? 36 : 8;
+    const sideMargin = key === 'fab' ? (compact ? 12 : 8) : (compact ? 8 : 6);
+    const topMargin = key === 'fab' ? (compact ? 12 : 8) : (compact ? 8 : 6);
+    const bottomMargin = key === 'fab' ? (compact ? 36 : 8) : (compact ? 12 : 6);
     return { left: left + sideMargin, top: top + topMargin, right: left + width - sideMargin, bottom: top + height - bottomMargin, width, height };
 }
 
-function clampFabCoordinates(x, y, width, height) {
-    const bounds = floatingViewportBounds();
-    const safeWidth = Math.max(1, Math.min(Number(width) || 56, bounds.width));
-    const safeHeight = Math.max(1, Math.min(Number(height) || 56, bounds.height));
+function clampFloatingCoordinates(x, y, width, height, key) {
+    const bounds = floatingViewportBounds(key);
+    const safeWidth = Math.max(1, Math.min(Number(width) || (key === 'fab' ? 56 : 760), bounds.width));
+    const safeHeight = Math.max(1, Math.min(Number(height) || (key === 'fab' ? 56 : 640), bounds.height));
     return {
         x: Math.max(bounds.left, Math.min(Math.max(bounds.left, bounds.right - safeWidth), Number(x) || bounds.left)),
         y: Math.max(bounds.top, Math.min(Math.max(bounds.top, bounds.bottom - safeHeight), Number(y) || bounds.top)),
     };
 }
 
-function makeFabDraggable(fab) {
-    fab.addEventListener('pointerdown', event => {
+function makeDraggable(handle, target, key, clickGuard = false) {
+    handle.addEventListener('pointerdown', event => {
+        if (event.target.closest('button') && handle !== target) return;
         if (event.button !== undefined && event.button !== 0) return;
         event.preventDefault();
-        fab.dataset.boDragging = '1';
-        const rect = fab.getBoundingClientRect();
+        target.dataset.boDragging = '1';
+        const rect = target.getBoundingClientRect();
         const startX = event.clientX; const startY = event.clientY; let moved = false;
         const pointerId = event.pointerId;
-        fab.style.right = 'auto'; fab.style.bottom = 'auto';
+        target.style.right = 'auto'; target.style.bottom = 'auto';
         const move = e => {
             if (e.pointerId !== pointerId) return;
             const dx = e.clientX - startX; const dy = e.clientY - startY;
             moved ||= Math.abs(dx) + Math.abs(dy) > 5;
-            const next = clampFabCoordinates(rect.left + dx, rect.top + dy, rect.width, rect.height);
-            fab.style.left = `${next.x}px`; fab.style.top = `${next.y}px`;
+            const next = clampFloatingCoordinates(rect.left + dx, rect.top + dy, rect.width, rect.height, key);
+            target.style.left = `${next.x}px`; target.style.top = `${next.y}px`;
         };
         const cleanup = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', finish); window.removeEventListener('pointercancel', finish); window.removeEventListener('blur', finish); };
         const finish = e => {
             if (e?.pointerId !== undefined && e.pointerId !== pointerId) return;
-            cleanup(); delete fab.dataset.boDragging;
-            const now = fab.getBoundingClientRect();
-            const next = clampFabCoordinates(now.left, now.top, now.width, now.height);
-            fab.style.left = `${next.x}px`; fab.style.top = `${next.y}px`;
-            writeFabPosition(next);
-            if (moved) { fab.dataset.dragged = '1'; setTimeout(() => fab.dataset.dragged = '0'); }
+            cleanup(); delete target.dataset.boDragging;
+            const now = target.getBoundingClientRect();
+            const next = clampFloatingCoordinates(now.left, now.top, now.width, now.height, key);
+            target.style.left = `${next.x}px`; target.style.top = `${next.y}px`;
+            writeFloatingPosition(key, next);
+            if (clickGuard && moved) { target.dataset.dragged = '1'; setTimeout(() => target.dataset.dragged = '0'); }
         };
         window.addEventListener('pointermove', move); window.addEventListener('pointerup', finish); window.addEventListener('pointercancel', finish); window.addEventListener('blur', finish);
     });
 }
 
-function restoreFabPosition(fab) {
-    if (!fab || fab.dataset.boDragging === '1') return;
-    const rect = fab.getBoundingClientRect();
-    const pos = readFabPosition();
+function restoreFloatingPosition(key, target) {
+    if (!target || target.dataset.boDragging === '1') return;
+    const rect = target.getBoundingClientRect();
+    const pos = readFloatingPosition(key);
     const hasStored = Boolean(pos);
     const fromX = hasStored ? pos.x : rect.left;
     const fromY = hasStored ? pos.y : rect.top;
-    const width = rect.width || fab.offsetWidth || 56;
-    const height = rect.height || fab.offsetHeight || 56;
-    const next = clampFabCoordinates(fromX, fromY, width, height);
-    fab.style.right = 'auto'; fab.style.bottom = 'auto'; fab.style.left = `${next.x}px`; fab.style.top = `${next.y}px`;
-    if (!hasStored || next.x !== pos.x || next.y !== pos.y) writeFabPosition(next);
+    const width = rect.width || target.offsetWidth || (key === 'fab' ? 56 : 760);
+    const height = rect.height || target.offsetHeight || (key === 'fab' ? 56 : 640);
+    const next = clampFloatingCoordinates(fromX, fromY, width, height, key);
+    target.style.right = 'auto'; target.style.bottom = 'auto'; target.style.left = `${next.x}px`; target.style.top = `${next.y}px`;
+    if (!hasStored || next.x !== pos.x || next.y !== pos.y) writeFloatingPosition(key, next);
 }
 
-function installFabClampListeners(fab) {
+function installFloatingClampListeners(entries) {
     let frame = 0;
-    const clamp = () => { frame = 0; restoreFabPosition(fab); };
+    const clamp = () => { frame = 0; for (const [key, target] of entries) restoreFloatingPosition(key, target); };
     const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(clamp); };
     addEventListener('resize', schedule, { passive: true });
-    addEventListener('orientationchange', () => { schedule(); setTimeout(() => restoreFabPosition(fab), 350); }, { passive: true });
+    addEventListener('orientationchange', () => { schedule(); setTimeout(clamp, 350); }, { passive: true });
     globalThis.visualViewport?.addEventListener?.('resize', schedule, { passive: true });
-    setTimeout(() => restoreFabPosition(fab), 250);
-    setTimeout(() => restoreFabPosition(fab), 1000);
+    setTimeout(clamp, 250);
+    setTimeout(clamp, 1000);
+}
+
+function openFloatingPanel(panel) {
+    panel.classList.add('open');
+    panel.style.right = 'auto'; panel.style.bottom = 'auto';
+    const width = panel.offsetWidth || Math.min(760, innerWidth);
+    const height = panel.offsetHeight || Math.min(640, innerHeight);
+    const x = Math.max(0, Math.min(12, innerWidth - Math.min(width, innerWidth)));
+    const y = Math.max(0, Math.min(12, innerHeight - Math.min(height, innerHeight)));
+    panel.style.left = `${x}px`; panel.style.top = `${y}px`;
+    writeFloatingPosition('panel', { x, y });
+    requestAnimationFrame(() => restoreFloatingPosition('panel', panel));
 }
 
 function activeContext() {
@@ -1050,23 +1062,31 @@ function bindPanel() {
 function mount() {
     if (mounted || document.getElementById(ROOT_ID)) return;
     mounted = true;
-    const root = document.createElement('section'); root.id = ROOT_ID; root.innerHTML = `
-      <header class="bo-header"><div><small>BATTLE ORB · TAVERN NATIVE</small><h2>战斗球</h2><p>直接读取当前酒馆楼层与 MVU；本地裁定战斗；战报回写主 AI。</p></div><button id="battle-orb-close" class="bo-close">×</button></header>
-      <div id="battle-orb-status" class="bo-status">准备就绪：点击“读取酒馆”</div>
-      <div class="bo-toolbar"><button id="battle-orb-sync">读取酒馆楼层 / MVU</button><button id="battle-orb-recognize">识别 / 生成战场声明</button><button id="battle-orb-create" disabled>创建二维战场</button></div>
-      <div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div>
-      <details class="bo-fold"><summary>当前 MVU 快照</summary><pre id="battle-orb-mvu">同步后显示</pre></details>
-      <section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="从当前楼层读取，或点击识别让主 AI 草拟"></textarea></section>
-      <section id="battle-orb-field" class="bo-field" hidden><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div><button id="battle-orb-narrate" disabled>战斗完成后回写主 AI</button></header><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details></section>`;
+    const root = document.createElement('div'); root.id = ROOT_ID; root.innerHTML = `
+      <button id="${FAB_ID}" type="button" title="Battle Orb ${VERSION}">⚔</button>
+      <section id="${PANEL_ID}">
+        <header id="battle-orb-head" class="bo-header"><div><small>BATTLE ORB · TAVERN NATIVE</small><h2>战斗球</h2><p>直接读取当前酒馆楼层与 MVU；本地裁定战斗；战报回写主 AI。</p></div><button id="battle-orb-close" class="bo-close">×</button></header>
+        <div id="battle-orb-body" class="bo-body">
+          <div id="battle-orb-status" class="bo-status">准备就绪：点击“读取酒馆”</div>
+          <div class="bo-toolbar"><button id="battle-orb-sync">读取酒馆楼层 / MVU</button><button id="battle-orb-recognize">识别 / 生成战场声明</button><button id="battle-orb-create" disabled>创建二维战场</button></div>
+          <div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div>
+          <details class="bo-fold"><summary>当前 MVU 快照</summary><pre id="battle-orb-mvu">同步后显示</pre></details>
+          <section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="从当前楼层读取，或点击识别让主 AI 草拟"></textarea></section>
+          <section id="battle-orb-field" class="bo-field" hidden><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div><button id="battle-orb-narrate" disabled>战斗完成后回写主 AI</button></header><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details></section>
+        </div>
+      </section>`;
     document.body.append(root);
-    const fab = document.createElement('button'); fab.id = FAB_ID; fab.type = 'button'; fab.textContent = '⚔'; fab.title = `Battle Orb ${VERSION}`; document.body.append(fab);
+    const panel = $(`#${PANEL_ID}`);
+    const fab = $(`#${FAB_ID}`);
     applyFabVisibility();
-    const toggle = () => root.classList.toggle('open');
+    const toggle = () => { if (panel.classList.contains('open')) panel.classList.remove('open'); else openFloatingPanel(panel); };
     fab.addEventListener('click', event => { if (fab.dataset.dragged === '1') return; event.preventDefault(); toggle(); });
-    $('#battle-orb-close').addEventListener('click', () => root.classList.remove('open'));
-    makeFabDraggable(fab);
-    restoreFabPosition(fab);
-    installFabClampListeners(fab);
+    $('#battle-orb-close').addEventListener('click', () => panel.classList.remove('open'));
+    makeDraggable(fab, fab, 'fab', true);
+    makeDraggable($('#battle-orb-head'), panel, 'panel');
+    restoreFloatingPosition('fab', fab);
+    restoreFloatingPosition('panel', panel);
+    installFloatingClampListeners([['fab', fab], ['panel', panel]]);
     bindPanel();
     tavernSnapshot = readTavern();
     void refreshTavernFromGlobals();
@@ -1078,7 +1098,7 @@ function mount() {
             tavernSnapshot = readTavern();
             void refreshTavernFromGlobals();
             const foundDeclaration = battleDeclarationFromFloor();
-            if (foundDeclaration) { declaration = normalizeDeclaration(foundDeclaration); root.classList.add('open'); setStatus('检测到正文 AI 的 BattleDeclaration，可开始本地战斗', 'ok'); render(); }
+            if (foundDeclaration) { declaration = normalizeDeclaration(foundDeclaration); openFloatingPanel(panel); setStatus('检测到正文 AI 的 BattleDeclaration，可开始本地战斗', 'ok'); render(); }
         });
         ctx.eventSource?.on?.(ctx.eventTypes?.CHAT_CHANGED, () => { tavernSnapshot = readTavern(); void refreshTavernFromGlobals(); const foundDeclaration = battleDeclarationFromFloor(); if (foundDeclaration) declaration = normalizeDeclaration(foundDeclaration); render(); });
     } catch (error) { console.warn('[Battle Orb] 酒馆事件监听安装失败', error); }
@@ -1087,11 +1107,13 @@ function mount() {
 
 addEventListener('battle-orb:open-panel', () => {
     if (!document.getElementById(ROOT_ID) && !mounted) mount();
-    document.getElementById(ROOT_ID)?.classList.add('open');
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) openFloatingPanel(panel);
 });
 addEventListener('battle-orb:remount', () => {
     if (!document.getElementById(ROOT_ID)) { mounted = false; mount(); }
-    document.getElementById(ROOT_ID)?.classList.add('open');
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) openFloatingPanel(panel);
 });
 addEventListener('battle-orb:set-fab-visible', event => {
     const fab = document.getElementById(FAB_ID);
