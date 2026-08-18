@@ -1158,6 +1158,21 @@ export class CombatEngine {
             if (command.type === 'lure') this.useLure(state, actor, { x: command.x, y: command.y });
             endTurn = false;
         }
+        else if (command.type === 'script') {
+            const ability = actor.abilities.find(item => item.id === (command.abilityId || 'basic-attack'));
+            if (!ability || !ability.script) throw httpError(400, '脚本能力不存在');
+            if (actor.cooldowns?.[ability.id]) throw httpError(400, `能力冷却中：剩余 ${actor.cooldowns[ability.id]} 回合`);
+            const actionType = ability.actionType || 'main';
+            if (budget[actionType] <= 0) throw httpError(400, `本回合 ${actionType} 行动已用尽`);
+            const targets = (command.targetIds || []).map(id => state.combatants.find(item => item.id === id)).filter(Boolean);
+            if (!targets.length) throw httpError(400, '请选择脚本能力目标');
+            if (targets.length > ability.targetCount) throw httpError(400, '目标数量超过能力上限');
+            for (const target of targets) if (!this.canEngage(state, actor, target, ability)) throw httpError(400, `目标 ${target.id} 尚未发现、超出射程或近战接触位已满`);
+            if (!await this.executeScriptAbility(state, actor, targets, ability)) return;
+            budget[actionType] -= 1;
+            const hasAnotherAttack = actor.abilities.some(item => budget[item.actionType || 'main'] > 0 && !actor.cooldowns?.[item.id] && actor.ep >= item.epCost && this.knownTargets(state, actor).some(target => rangeLegal(state, actor, target, item) && this.canEngage(state, actor, target, item)));
+            endTurn = !hasAnotherAttack && this.movementRemaining(state, actor) <= 1e-6;
+        }
         else {
             const ability = actor.abilities.find(item => item.id === (command.abilityId || 'basic-attack'));
             if (!ability) throw httpError(400, '能力不存在');
@@ -1177,7 +1192,7 @@ export class CombatEngine {
         }
         state.commandHistory ||= [];
         if (!command.redo) {
-            const replayable = ['move', 'move_attack', 'wait', 'sneak', 'unsneak', 'sprint', 'withdraw', 'evasive', 'hide', 'lure'].includes(command.type) || command.abilityId || command.type === 'attack';
+            const replayable = ['move', 'move_attack', 'wait', 'sneak', 'unsneak', 'sprint', 'withdraw', 'evasive', 'hide', 'lure', 'script'].includes(command.type) || command.abilityId || command.type === 'attack';
             if (replayable) {
                 state.commandHistory.push({ type: command.type || 'attack', actorId: actor.id, abilityId: command.abilityId || null, targetIds: Array.isArray(command.targetIds) ? command.targetIds.map(String) : [], x: Number.isFinite(Number(command.x)) ? Number(command.x) : undefined, y: Number.isFinite(Number(command.y)) ? Number(command.y) : undefined, zoneId: command.zoneId || undefined, playerId: command.playerId || state.playerId, seatId: command.seatId || state.seatId, recordedAtRound: state.round, recordedSequence: state.sequence });
                 state.commandHistory = state.commandHistory.slice(-30);
@@ -1515,15 +1530,52 @@ export class CombatEngine {
             this.breakStealth(state, actor, { reason: 'script_ability', source: 'attack' });
             this.emitNoise(state, actor, { reason: 'script_ability', radiusMeters: actor.intelProfile?.attackNoiseMeters });
             if (isMeleeAbility(ability)) for (const target of targets) this.updateKnowledge(state, target, actor, { source: 'melee_contact', reason: 'melee_script_received', force: true });
-            const output = await runScript(ability.script, { ability: { ...ability, script: undefined }, actor: deepClone(actor), targets: deepClone(targets), snapshot: { round: state.round, zones: state.zones } });
+            const scriptRng = this.nextScriptRng(state);
+            const output = await runScript(ability.script, {
+                ability: { ...ability, script: undefined },
+                actor: deepClone(actor),
+                targets: deepClone(targets),
+                units: state.combatants.filter(unit => unit.state !== 'dying').map(unit => ({ id: unit.id, name: unit.name, side: unit.side, hp: unit.hp, maxHp: unit.maxHp, ep: unit.ep, position: unit.position, statuses: unit.statuses })),
+                battlefield: state.battlefield,
+                round: state.round,
+                zones: state.zones,
+                rng: scriptRng,
+            });
             this.applyEffects(state, actor, output.effects);
-            this.event(state, 'script_action_resolved', { actorId: actor.id, abilityId: ability.id, scriptHash: hash, epCost: ability.epCost, effects: output.effects });
+            this.event(state, 'script_action_resolved', { actorId: actor.id, abilityId: ability.id, scriptHash: hash, epCost: ability.epCost, rng: scriptRng, effects: output.effects });
             return true;
         } catch (error) {
             actor.ep += ability.epCost;
             this.pause(state, { type: 'script_error', actorId: actor.id, abilityId: ability.id, scriptHash: hash, error: error.message });
             return false;
         }
+    }
+
+    nextScriptRng(state) {
+        state.scriptRngCount = Number(state.scriptRngCount || 0) + 1;
+        return { seed: `${String(state.seed || 'seed')}:${state.round || 0}:${state.scriptRngCount}`, count: state.scriptRngCount };
+    }
+
+    summonFromTemplate(state, actor, effect) {
+        const templateId = String(effect.templateId || '');
+        const template = state.combatants.find(unit => unit.id === templateId || unit.templateId === templateId || unit.name === templateId);
+        if (!template) return null;
+        const count = Math.max(1, Math.min(8, Number(effect.count || 1)));
+        const anchor = Number.isFinite(Number(effect.x)) && Number.isFinite(Number(effect.y)) ? { x: Number(effect.x), y: Number(effect.y) } : { x: actor.position.x + 2, y: actor.position.y };
+        let created = null;
+        for (let i = 0; i < count; i += 1) {
+            const unit = deepClone(template);
+            unit.id = `${template.id || templateId}-summon-${state.sequence + i + 1}`;
+            unit.declarationId = template.declarationId || template.id || templateId;
+            unit.position = { x: Math.round((anchor.x + i * 1.5) * 100) / 100, y: Math.round(anchor.y * 100) / 100 };
+            unit.state = 'active'; unit.statuses = []; unit.cooldowns = {};
+            unit.hp = unit.maxHp; unit.ep = unit.maxEp || 0;
+            state.combatants.push(unit);
+            state.initiative.push({ unitId: unit.id, total: 0, selected: 0, initiativeDC: unit.initiativeDC || 0, rawRolls: [], rngIndex: -1 });
+            created = created || unit;
+            this.event(state, 'unit_summoned', { actorId: actor.id, templateId, unitId: unit.id, position: unit.position });
+        }
+        return created;
     }
 
     applyEffects(state, actor, effects) {
@@ -1538,6 +1590,8 @@ export class CombatEngine {
             else if (effect.type === 'status' && target) target.statuses.push({ id: effect.status, duration: Math.max(1, Math.round(effect.duration)) });
             else if (effect.type === 'dispel' && target) target.statuses = target.statuses.filter(item => item.id !== effect.status);
             else if (effect.type === 'move' && target && effect.position && Number.isFinite(Number(effect.position.x)) && Number.isFinite(Number(effect.position.y))) this.moveTo(state, target, effect.position, { ignoreBudget: true, source: 'script' });
+            else if (effect.type === 'push' && target && Number.isFinite(Number(effect.dx)) && Number.isFinite(Number(effect.dy))) this.moveTo(state, target, { x: target.position.x + Number(effect.dx), y: target.position.y + Number(effect.dy) }, { ignoreBudget: true, source: 'script_push' });
+            else if (effect.type === 'summon') { const created = this.summonFromTemplate(state, actor, effect); if (!created) throw httpError(400, `脚本召唤模板 ${effect.templateId || '未知'} 不存在`); }
             else if (effect.type === 'resource' && target && ['hp', 'ep', 'thp'].includes(effect.resource)) target[effect.resource] = Math.max(0, Math.min(effect.resource === 'ep' ? target.maxEp : effect.resource === 'hp' ? target.maxHp : Infinity, target[effect.resource] + effect.delta));
             else if (!['log'].includes(effect.type)) throw httpError(400, `脚本效果 ${effect.type} 未通过核心校验`);
             this.event(state, 'script_effect_applied', { actorId: actor.id, effect });
@@ -1639,6 +1693,34 @@ export class CombatEngine {
 
     pause(state, reason) { state.status = 'paused'; state.pauseReason = reason; this.event(state, 'combat_paused', reason); }
     async resume(state) { this.assertWritable(state); state.status = 'running'; state.pauseReason = null; this.event(state, 'combat_resumed'); await this.advanceUntilPause(state, state.mode === 'manual' ? 1000 : 10000); }
+
+    resolveScriptApproval(state, input = {}) {
+        this.assertWritable(state);
+        const unit = state.combatants.find(item => item.id === input.unitId);
+        if (input.mode === 'approve' && input.scriptHash) {
+            this.repository.approveScript(String(input.scriptHash), state.rulesetVersion);
+            if (!state.approvedScripts.includes(String(input.scriptHash))) state.approvedScripts.push(String(input.scriptHash));
+            this.event(state, 'script_approved', { unitId: input.unitId, abilityId: input.abilityId, scriptHash: String(input.scriptHash) });
+        } else if (input.mode === 'reject') {
+            const index = unit?.abilities?.findIndex(ability => ability.id === input.abilityId) ?? -1;
+            if (!unit || index < 0) throw httpError(400, '未找到该脚本能力');
+            unit.abilities.splice(index, 1);
+            this.event(state, 'script_rejected', { unitId: input.unitId, abilityId: input.abilityId });
+        }
+        for (const candidate of state.combatants) for (const ability of candidate.abilities) {
+            if (!ability.script) continue;
+            const hash = ability.scriptHash || scriptHash(ability.script);
+            ability.scriptHash = hash;
+            if (!this.repository.isScriptApproved(hash, state.rulesetVersion)) {
+                state.status = 'awaiting_script_approval';
+                state.pauseReason = { type: 'script_approval', unitId: candidate.id, abilityId: ability.id, inspection: inspectScript(ability.script, ability) };
+                this.event(state, 'script_approval_required', state.pauseReason);
+                return false;
+            }
+        }
+        state.status = 'paused'; state.pauseReason = null;
+        return true;
+    }
     async reaction(state, input = {}) {
         this.assertWritable(state);
         if (!state.pendingReaction) throw httpError(409, '当前没有反应窗口');

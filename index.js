@@ -1,4 +1,4 @@
-const VERSION = '0.6.2';
+const VERSION = '0.7.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -13,13 +13,15 @@ void import('./diagnose.js')
 
 (async function battleOrbBootstrap() {
 try {
-    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl }] = await Promise.all([
+    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl }, sandbox] = await Promise.all([
         import('../../../extensions.js'),
         import('./combat/engine.js'),
         import('./combat/browser-repository.js'),
         import('./combat/model.js'),
         import('./combat/narrative-dsl.js'),
+        import('./combat/sandbox.js'),
     ]);
+    const { inspectScript, testScript } = sandbox;
     bootTrace('dependencies-loaded');
 
 const ROOT_ID = 'battle-orb-root';
@@ -390,14 +392,26 @@ function normalizeDeclaration(input) {
 }
 
 const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆最近剧情和当前 MVU，只输出一个 JSON 对象，不要 Markdown，不要解释，不要计算结果。对象必须包含 schema:"vibe-combat-declaration/v3"、worldLifeLevel、contactEstablished、contactPairs、reason、battlefield(kind/shapeHint/description)、participants。shapeHint 只能是 rectangle/circle/unknown；participants 至少一名 player 和一名 enemy，每个 participant 必须含 id/name/count/side/source/state/relativePosition；已有 MVU 实体 source=existing 并填写 reference，新敌人 source=create。禁止输出 HP、伤害、命中、死亡、坐标或 JSONPatch。`;
-const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)。每个 combatant 必须含 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/position/visionMeters/intelProfile/tacticalProfile/abilities。必须保持 declaration 中的 participant 都出现：玩家 combatant 用原 declarationId，controller=player；敌方可把声明中的群体（count>1）展开成多个独立单位，id 用 原id+序号（如 corpse_01/corpse_02）但 name 保持可识别。每个 ability 必须含 id/name/type(physical|hybrid)/actionType(main|minor)/power/modifier/epCost/minRangeMeters/maxRangeMeters/cooldownRounds/targetCount/aoe；远程武器（弓弩/枪械/法杖/投掷/射击）的 maxRangeMeters 必须 ≥ 6m，近战 ≤ 2.5m。禁止计算战斗结果；玩家方必须 controller=player，敌方 controller=ai。`;
+const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)。每个 combatant 必须含 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/position/visionMeters/intelProfile/tacticalProfile/abilities。必须保持 declaration 中的 participant 都出现：玩家 combatant 用原 declarationId，controller=player；敌方可把声明中的群体（count>1）展开成多个独立单位，id 用 原id+序号（如 corpse_01/corpse_02）但 name 保持可识别。
+
+【能力两种写法】
+1) 声明式：每个 ability 含 id/name/type(physical|hybrid)/actionType(main|minor)/power/modifier/epCost/minRangeMeters/maxRangeMeters/cooldownRounds/targetCount/aoe；用于基础攻击/普通攻击。远程武器（弓弩/枪械/法杖/投掷/射击）的 maxRangeMeters 必须 ≥ 6m，近战 ≤ 2.5m。
+2) 脚本式（推荐用于具名特殊技能/装备技能/战术技能）：在声明式信封字段基础上加 script 字段。脚本运行于沙箱（禁网络/禁 eval/禁 DOM），可读取战场并发射效果，示例：
+const t = api.state().targets[0];
+const roll = api.d100();
+api.damage(t.id, 20 + (roll > 75 ? 10 : 0));   // 暴击
+if (roll > 50) api.status(t.id, "bleed", 2);    // 出血 DoT
+api.push(t.id, 1.5, 0);                          // 击退
+可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（地面 AoE 范围查询）、api.d100()/api.d(n)（确定性骰）、api.damage(targetId,amount,type?)、api.heal、api.status、api.dispel、api.move、api.push(targetId,dx,dy)、api.resource、api.summon(templateId,zoneId,count)、api.log。信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责护甲/死亡/碰撞结算。基础攻击保持声明式即可。
+
+禁止计算战斗结果；玩家方必须 controller=player，敌方 controller=ai。`;
 const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据审查 AI（第二段对抗性检查）。你只审查给定的 CombatModel 并输出"整改建议"列表，绝不重新生成整个模型，绝不允许改动任何与矛盾无关的数值、名单、数量、射程或能力。
 
-【输入】你会收到：完整 CombatModel（每个 combatant 含 abilities 的 id/name/type/actionType/power/modifier/epCost/minRangeMeters/maxRangeMeters/cooldownRounds/targetCount/aoe）、战场声明 declaration。
+【输入】你会收到：完整 CombatModel（每个 combatant 含 abilities 的信封字段与可选 script）、战场声明 declaration。
 
-【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。
+【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。带 script 的脚本能力：脚本内容由本地沙箱校验（100 轮种子测试），你**绝不允许**修改、重写或删除 script 字段，也禁止输出脚本内容。
 
-【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩、枪械等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：能力引用了效果但字段缺失/无数值（缺少 power/modifier/epCost/maxRangeMeters/actionType）必须补齐为合理默认。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
+【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
 
 【输出格式】只输出一个 JSON 数组 suggestions，不要 Markdown。每项形如：
 {"op":"set_ability","declarationId":"..","abilityId":"..","field":"maxRangeMeters","value":15}
@@ -797,9 +811,31 @@ function applyModelSuggestions(model, declaration, suggestions) {
     return { ...model, combatants };
 }
 
+async function validateScriptsLocally(model) {
+    if (!model || !Array.isArray(model.combatants)) return model;
+    let changed = false;
+    const combatants = model.combatants.map(unit => {
+        if (!Array.isArray(unit.abilities)) return unit;
+        const abilities = unit.abilities.map(ability => {
+            if (!ability.script) return ability;
+            try {
+                const inspection = inspectScript(ability.script, ability);
+                return { ...ability, scriptHash: inspection.hash, scriptInspection: inspection };
+            } catch (error) {
+                changed = true;
+                recordDebug('script_downgraded', { unitId: unit.id, abilityId: ability.id, error: String(error.message || error) });
+                const { script, scriptHash, scriptInspection, ...rest } = ability;
+                return rest;
+            }
+        });
+        return { ...unit, abilities };
+    });
+    return changed ? { ...model, combatants } : model;
+}
+
 async function superviseCombatModel(candidate, declaration, snapshot, maxRounds = 2) {
     if (!candidate || typeof candidate !== 'object') return candidate;
-    let current = mergeModel(candidate, declaration);
+    let current = await validateScriptsLocally(mergeModel(candidate, declaration));
     for (let round = 0; round < maxRounds; round += 1) {
         let suggestions = [];
         try {
@@ -814,7 +850,8 @@ async function superviseCombatModel(candidate, declaration, snapshot, maxRounds 
             setStatus(`战斗数据审查第 ${round + 1} 轮失败：${error.message}`, 'warn');
             break;
         }
-        const next = applyModelSuggestions(current, declaration, suggestions);
+        const applied = applyModelSuggestions(current, declaration, suggestions);
+        const next = await validateScriptsLocally(applied);
         if (next === current) return current;
         current = next;
     }
@@ -1411,7 +1448,7 @@ function stageMarkup(stage) {
     }
     const state = publicBattle();
     const completed = stage === 'completed';
-    return `<section id="battle-orb-field" class="bo-field"><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div>${completed ? `<button id="battle-orb-narrate" class="bo-primary" type="button">回写主 AI</button>` : ''}</header><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details>${completed ? `<div class="bo-completed-actions"><button id="battle-orb-new-battle" class="bo-secondary" type="button">发起新战斗</button><button id="battle-orb-tool-debug-inline" class="bo-secondary" type="button">导出 DEBUG</button></div>` : ''}</section>`;
+    return `<section id="battle-orb-field" class="bo-field"><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div>${completed ? `<button id="battle-orb-narrate" class="bo-primary" type="button">回写主 AI</button>` : ''}</header><div id="battle-orb-script-approval"></div><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details>${completed ? `<div class="bo-completed-actions"><button id="battle-orb-new-battle" class="bo-secondary" type="button">发起新战斗</button><button id="battle-orb-tool-debug-inline" class="bo-secondary" type="button">导出 DEBUG</button></div>` : ''}</section>`;
 }
 
 function renderStage() {
@@ -1444,8 +1481,30 @@ function renderStage() {
         const metaBox = $('#battle-orb-battle-meta');
         if (metaBox && state) metaBox.textContent = `${state.title || '遭遇'} · ${state.status} · seed ${String(state.seed || '').slice(0, 12)}`;
         renderTurn(state); renderLedger(state); renderBattlefield(state);
+        renderScriptApproval(state);
     }
     renderView();
+}
+
+function renderScriptApproval(state) {
+    const root = $('#battle-orb-script-approval');
+    if (!root) return;
+    const pause = state?.pauseReason;
+    if (pause?.type !== 'script_approval') { root.innerHTML = ''; return; }
+    const unit = state.combatants.find(item => item.id === pause.unitId);
+    const ability = unit?.abilities?.find(item => item.id === pause.abilityId);
+    const inspection = pause.inspection || ability?.scriptInspection || {};
+    const caps = Array.isArray(inspection.capabilities) ? inspection.capabilities : [];
+    const limits = inspection.limits || {};
+    const source = String(inspection.source || ability?.script || '');
+    root.innerHTML = `<div class="bo-script-approval">
+      <header><b>脚本能力审批</b><small>${escapeHtml(pause.abilityId || '')} · ${escapeHtml(ability?.name || '')}</small></header>
+      <div class="bo-script-meta"><span>哈希 ${escapeHtml(String(inspection.hash || '').slice(0, 16))}…</span><span>${escapeHtml(unit?.name || '')} · ${escapeHtml(ability?.name || '')}</span><span>${escapeHtml(limits.executionMs ?? 25)}ms / ${escapeHtml(limits.memoryMb ?? 16)}MB / ${escapeHtml(limits.maxEffects ?? 64)} 效果</span></div>
+      <div class="bo-script-caps">${caps.map(cap => `<span class="bo-script-cap">${escapeHtml(cap)}</span>`).join('') || '<span class="bo-muted">未调用任何接口</span>'}</div>
+      <pre class="bo-script-source">${escapeHtml(source)}</pre>
+      <div id="battle-orb-script-test" class="bo-script-test">沙箱测试：<button id="battle-orb-script-run-test" class="bo-secondary" type="button">运行 100 轮种子测试</button></div>
+      <div class="bo-script-actions"><button id="battle-orb-script-approve" class="bo-primary" type="button" data-script-hash="${escapeHtml(String(inspection.hash || ''))}" data-script-unit="${escapeHtml(pause.unitId || '')}" data-script-ability="${escapeHtml(pause.abilityId || '')}">批准</button><button id="battle-orb-script-reject" class="bo-secondary" type="button" data-script-unit="${escapeHtml(pause.unitId || '')}" data-script-ability="${escapeHtml(pause.abilityId || '')}">拒绝（移除该能力）</button></div>
+    </div>`;
 }
 
 function render() {
@@ -1722,6 +1781,41 @@ function bindPanel() {
         if (event.target.closest('#battle-orb-llm-cancel')) { llmCancel(); return; }
         if (event.target.closest('#battle-orb-tool-bench-inline')) { void runBenchmark(); return; }
     });
+    document.addEventListener('click', event => {
+        if (event.target.closest('#battle-orb-script-run-test')) {
+            const state = publicBattle();
+            const pause = state?.pauseReason;
+            const unit = state?.combatants?.find(item => item.id === pause?.unitId);
+            const ability = unit?.abilities?.find(item => item.id === pause?.abilityId);
+            if (!ability?.script) return;
+            setStatus('正在运行沙箱测试（100 轮种子用例）…', 'working');
+            void testScript(ability.script, ability).then(result => {
+                const node = $('#battle-orb-script-test');
+                if (node) node.innerHTML = `沙箱测试：${result.passed ? `全部通过（${result.tests} 轮）` : `失败 ${result.failures.length} 轮`}${result.failures?.length ? `<pre>${escapeHtml(JSON.stringify(result.failures.slice(0, 3), null, 2))}</pre>` : ''}`;
+                setStatus(result.passed ? `脚本沙箱测试通过（${result.tests} 轮）` : `脚本沙箱测试失败：${result.failures[0]?.error}`, result.passed ? 'ok' : 'warn');
+            }).catch(error => notify(`沙箱测试失败：${error.message}`, 'error'));
+            return;
+        }
+        const approve = event.target.closest('#battle-orb-script-approve');
+        const reject = event.target.closest('#battle-orb-script-reject');
+        if (approve || reject) {
+            const mode = approve ? 'approve' : 'reject';
+            void (async () => {
+                const btn = approve || reject;
+                busy = true; setStatus(mode === 'approve' ? '正在批准脚本能力并继续战斗…' : '正在移除脚本能力并继续战斗…', 'working'); render();
+                try {
+                    const started = engine.resolveScriptApproval(battle, { mode, scriptHash: btn.dataset.scriptHash, unitId: btn.dataset.scriptUnit, abilityId: btn.dataset.scriptAbility });
+                    repository.commit(battle);
+                    recordDebug(mode === 'approve' ? 'script_approved' : 'script_rejected', { battleId: battle.id, abilityId: btn.dataset.scriptAbility, scriptHash: btn.dataset.scriptHash });
+                    if (started) { await engine.start(battle); repository.commit(battle); }
+                    setStatus(mode === 'approve' ? '脚本能力已批准，战斗继续' : '脚本能力已移除，战斗继续', 'ok');
+                    render();
+                } catch (error) { notify(mode === 'approve' ? `批准失败：${error.message}` : `拒绝失败：${error.message}`, 'error'); }
+                finally { busy = false; render(); }
+            })();
+            return;
+        }
+    });
     document.addEventListener('input', event => {
         if (event.target.id === 'battle-orb-recognize-hint') { settings.recognizeHint = String(event.target.value || '').trim(); saveSettings(); return; }
         if (event.target.id === 'battle-orb-declaration') { try { declaration = normalizeDeclaration(JSON.parse(event.target.value)); } catch { declaration = null; } render(); return; }
@@ -1784,7 +1878,11 @@ function bindPanel() {
         if (action.dataset.boAction === 'move') { mapIntent = { type: 'move' }; render(); return; }
         if (action.dataset.boAction === 'resume') { if (!battle || busy) return; busy = true; void engine.resume(battle).then(() => repository.commit(battle)).catch(error => notify(`推进失败：${error.message}`, 'error')).finally(() => { busy = false; render(); }); return; }
         if (!actorId) return;
-        if (action.dataset.boAction === 'attack') void execute({ type: 'attack', actorId, abilityId: action.dataset.ability, targetIds: [action.dataset.target] });
+        if (action.dataset.boAction === 'attack') {
+            const actorUnit = state?.combatants?.find(unit => unit.id === actorId);
+            const ability = actorUnit?.abilities?.find(item => item.id === action.dataset.ability);
+            void execute({ type: ability?.script ? 'script' : 'attack', actorId, abilityId: action.dataset.ability, targetIds: [action.dataset.target] });
+        }
         else void execute({ type: action.dataset.boAction, actorId });
     });
     document.addEventListener('click', event => { const reactionButton = event.target.closest('[data-bo-reaction]'); if (reactionButton) void reaction(reactionButton.dataset.boReaction); });
