@@ -1,4 +1,4 @@
-const VERSION = '0.7.2';
+const VERSION = '0.7.3';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -405,10 +405,10 @@ api.push(t.id, 1.5, 0);                          // 击退
 可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（地面 AoE 范围查询）、api.d100()/api.d(n)（确定性骰）、api.damage(targetId,amount,type?)、api.heal、api.status、api.dispel、api.move、api.push(targetId,dx,dy)、api.resource、api.summon(templateId,zoneId,count)、api.log。信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责护甲/死亡/碰撞结算。
 
 【基础攻击·硬性要求（违反即被退回修复）】
-- 每个单位必须至少有 1 个免费的基础攻击（普通攻击）：声明式（禁止 script）、actionType=main、epCost=0、power=0、modifier=0（直接使用单位攻击力）、cooldownRounds=0、targetCount=1、aoe=false。
-- 请结合单位实际武器装备与战场声明自行作答攻击模式：单位有几个攻击模式/武器就给几个基础攻击（如持弩又架盾 → 弩基础攻击 + 盾基础攻击各一个），并按武器实际情况定义攻击类型（type）与射程：远程武器（弓/弩/枪械/法杖/投掷/射击）maxRangeMeters ≥ 6m，近战武器（剑/盾/徒手/棍）≤ 2.5m。攻击类型与射程由你根据实际武器装备判断，不要套用模板。
+- 每个单位必须至少有 1 个基础攻击（普通攻击）：声明式（禁止 script，无需审批即可使用）、actionType=main、power=0、modifier=0（直接使用单位攻击力）、cooldownRounds=0、targetCount=1、aoe=false。
+- 请结合单位实际武器装备与战场声明自行作答攻击模式与资源消耗：单位有几个攻击模式/武器就给几个基础攻击（如持弩又架盾 → 弩基础攻击 + 盾基础攻击各一个）。基础攻击默认免费（epCost=0），但若该攻击模式本身有明确的资源消耗设定（如每次射击消耗 EP/弹药），请保留合理的 EP 消耗。判断标准是"实际设定需要消耗多少"：凭空给普通攻击加 EP、或明显不消耗资源的攻击被加了 EP，都是错误；有明确消耗设定的则必须保留。攻击类型（type）与射程也由你根据实际武器装备判断：远程武器（弓/弩/枪械/法杖/投掷/射击）maxRangeMeters ≥ 6m，近战武器（剑/盾/徒手/棍）≤ 2.5m。不要套用模板。
 - 基础攻击 id 依次用 basic-attack、basic-attack-2、…，放在该单位 abilities 最前面。
-- 严禁给基础攻击/普通攻击添加任何 EP 消耗或脚本；脚本式只用于具名特殊技能/战术技能。
+- 脚本式只用于具名特殊技能/战术技能，禁止把基础攻击写成脚本（脚本需审批）。
 - 若输入带有 repairErrors（阶段 1 致命错误清单），必须逐条修复后重新输出完整 CombatModel。
 
 禁止计算战斗结果；玩家方必须 controller=player，敌方 controller=ai。`;
@@ -418,7 +418,7 @@ const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据审查 AI（�
 
 【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。带 script 的脚本能力：脚本内容由本地沙箱校验（100 轮种子测试），你**绝不允许**修改、重写或删除 script 字段，也禁止输出脚本内容。
 
-【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能错误开销（必须检查）：任何基础攻击/普通攻击（id 以 basic-attack 开头，或声明为普通攻击）必须 epCost=0 且为声明式；若其 epCost>0 → 输出 set_ability 建议把 epCost 改为 0；若某单位完全没有基础攻击（没有任何 id 含 basic-attack 的能力）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（按武器类型调整射程与名称，仍必须 epCost=0）。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
+【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能开销合理性（对抗性判断，绝不机械地把所有基础攻击改成 0）：结合该攻击模式的实际设定判断 EP 消耗是否合理——凭空给普通攻击/基础攻击加了 EP、或明显不消耗资源的攻击被加了 EP → 输出 set_ability 建议把 epCost 改为 0；若设定明确需要资源（如每次射击消耗 EP/弹药），应保留合理的 epCost，基础攻击同样允许合理 EP 消耗。若某单位完全没有普通攻击（没有任何声明式主行动攻击）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（名称与射程按武器类型调整，epCost 按实际设定）。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
 
 【输出格式】只输出一个 JSON 数组 suggestions，不要 Markdown。每项形如：
 {"op":"set_ability","declarationId":"..","abilityId":"..","field":"maxRangeMeters","value":15}
@@ -750,25 +750,19 @@ function deconflictPositions(combatants) {
     return units;
 }
 
-// —— 基础攻击·致命错误保底检测 ——
-// 本地绝不自作主张写入任何能力字段（那样会退化模型能力、限制表达自由）。这里
-// 只做几个"致命错误"的保底检测：单位必须能免费普攻、基础攻击不得带 EP 或脚本。
-// 检测到错误只负责在阶段 1 报错并要求战斗 AI 自行修复（重新生成），不做静默修改。
+// —— 普通攻击·致命错误保底检测 ——
+// 本地绝不自作主张写入任何能力字段（那样会退化模型能力、限制表达自由），也不对
+// "EP 是否合理"这类复杂概念做脚本判断（那是战斗 AI 的对抗性审查职责）。这里只做
+// 一个致命错误的保底检测：单位必须至少有一个声明式（非脚本）主行动攻击，否则连
+// 普通攻击都没有，阶段 1 报错并要求战斗 AI 自行修复，不做静默修改。
 function checkCombatModelFatalErrors(model) {
     if (!model || !Array.isArray(model.combatants)) return [];
     const errors = [];
     for (const unit of model.combatants) {
-        const canFreeAttack = (unit.abilities || []).some(ability =>
-            ability.type !== 'maneuver' && !ability.script && Number(ability.epCost || 0) === 0 && ability.actionType === 'main'
+        const hasNormalAttack = (unit.abilities || []).some(ability =>
+            ability.type !== 'maneuver' && !ability.script && ability.actionType === 'main'
         );
-        if (!canFreeAttack) errors.push(`单位 ${unit.id}（${unit.name}）缺少免费的基础攻击（普通攻击）：请结合其实际武器装备补充声明式、epCost=0 的基础攻击`);
-    }
-    for (const unit of model.combatants) {
-        for (const ability of unit.abilities || []) {
-            if (!/^basic-attack/.test(ability.id || '')) continue;
-            if (ability.script) errors.push(`单位 ${unit.id} 的基础攻击 ${ability.id} 不得使用脚本：请改为声明式基础攻击`);
-            if (Number(ability.epCost || 0) > 0) errors.push(`单位 ${unit.id} 的基础攻击 ${ability.id} 不得消耗 EP：epCost 必须为 0`);
-        }
+        if (!hasNormalAttack) errors.push(`单位 ${unit.id}（${unit.name}）缺少普通攻击（基础攻击）：请结合其实际武器装备补充声明式基础攻击（可含合理的 EP 消耗，但必须是非脚本的主行动攻击）`);
     }
     return [...new Set(errors)];
 }
