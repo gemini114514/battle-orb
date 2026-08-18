@@ -1,4 +1,4 @@
-const VERSION = '0.7.5';
+const VERSION = '0.7.6';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -1517,13 +1517,13 @@ function declarationSummaryMarkup(value) {
 
 function stageMarkup(stage) {
     if (stage === 'read') {
-        return `<p class="bo-muted">从当前酒馆楼层读取剧情与 MVU 状态，作为后续识别战场的依据。</p><label class="bo-hint-field"><span>识别提示（可选）</span><input id="battle-orb-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="敌人数量范围 / 规模 / 战术等额外提醒"></label><button id="battle-orb-sync" class="bo-primary" type="button">① 读取楼层与 MVU</button>`;
+        return `<p class="bo-muted">从当前酒馆楼层读取剧情与 MVU 状态，作为后续识别战场的依据。</p><button id="battle-orb-sync" class="bo-primary" type="button">① 读取楼层与 MVU</button>`;
     }
     if (stage === 'recognize') {
-        return `<div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div><button id="battle-orb-recognize" class="bo-primary" type="button">${declaration ? '重新识别 / 修正声明' : '② 识别 / 生成战场声明'}</button><label class="bo-unit-hint"><span>单位修正提示（可选）</span><textarea id="battle-orb-unit-hint" spellcheck="false" placeholder="针对单位给出修正，例如：给玩家加一个测试技能（如“测试圣光”）、调整敌方数量/规模/战术等。会随声明识别与战斗建模一起传给 AI。">${escapeHtml(settings.unitHint || '')}</textarea></label><section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="点击识别让主 AI 草拟，或直接粘贴已有声明"></textarea></section><button id="battle-orb-to-create" class="bo-secondary" type="button" ${declaration ? '' : 'disabled'}>下一步：创建战场 →</button>`;
+        return `<div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div><button id="battle-orb-recognize" class="bo-primary" type="button">${declaration ? '重新识别 / 修正声明' : '② 识别 / 生成战场声明'}</button><label class="bo-hint-field"><span>识别提示（可选）</span><input id="battle-orb-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="可选：额外的识别提醒"></label><section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="点击识别让主 AI 草拟，或直接粘贴已有声明"></textarea></section><button id="battle-orb-to-create" class="bo-secondary" type="button" ${declaration ? '' : 'disabled'}>下一步：创建战场 →</button>`;
     }
     if (stage === 'create') {
-        return `<div id="battle-orb-declaration-summary"></div><button id="battle-orb-create" class="bo-primary" type="button">③ 创建二维战场</button><button id="battle-orb-back-recognize" class="bo-link" type="button">← 返回修改声明</button>`;
+        return `<div id="battle-orb-declaration-summary"></div><label class="bo-unit-hint"><span>单位修正提示（可选）</span><textarea id="battle-orb-unit-hint" spellcheck="false" placeholder="可选：针对单位的修正提示，随战斗建模传给 AI">${escapeHtml(settings.unitHint || '')}</textarea></label><button id="battle-orb-create" class="bo-primary" type="button">③ 创建二维战场</button><button id="battle-orb-back-recognize" class="bo-link" type="button">← 返回修改声明</button>`;
     }
     if (stage === 'approve') {
         return `<section id="battle-orb-approve" class="bo-approve"><div id="battle-orb-script-approval"></div><button id="battle-orb-approve-abandon" class="bo-link" type="button">← 放弃此战斗并返回</button></section>`;
