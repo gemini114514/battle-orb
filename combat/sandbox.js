@@ -41,7 +41,7 @@ export function inspectScript(source, ability = {}) {
     if (textSize > MAX_SOURCE) throw new Error('脚本超过 64KB');
     const forbidden = /\b(?:fetch|XMLHttpRequest|WebSocket|require|process|Deno|Bun|importScripts|eval|Function|document|window|location)\b|\bimport\s*\(/;
     if (forbidden.test(text)) throw new Error('脚本请求了沙箱禁止能力');
-    const apiNames = ['state', 'distance', 'unitsInArea', 'd100', 'd', 'damage', 'heal', 'status', 'dispel', 'move', 'push', 'resource', 'summon', 'log', 'event'];
+    const apiNames = ['state', 'distance', 'unitsInArea', 'd100', 'd', 'attack', 'damage', 'heal', 'status', 'dispel', 'move', 'push', 'resource', 'summon', 'log', 'event'];
     const capabilities = [...new Set([...text.matchAll(/api\.([a-zA-Z]+)\s*\(/g)].map(match => match[1]).filter(name => apiNames.includes(name)))];
     return { hash: scriptHash(text), rulesetVersion: RULESET_VERSION, ability: { id: ability.id, name: ability.name }, source: text, size: textSize, capabilities, limits: { executionMs: 25, memoryMb: 16, maxEffects: MAX_EFFECTS, triggerDepth: 8 } };
 }
@@ -87,6 +87,12 @@ export async function runScript(source, input) {
               d100: () => 1 + Math.floor(rand() * 100),
               d: n => 1 + Math.floor(rand() * Math.max(1, Number(n))),
               damage: (targetId, amount, damageType = "physical") => emit("damage", { targetId: String(targetId), amount: Number(amount), damageType: String(damageType) }),
+              attack: (targetId, options = {}) => emit("attack", {
+                  targetId: String(targetId),
+                  power: options && options.power !== undefined ? Number(options.power) : Number(input.ability && input.ability.power || 0),
+                  modifier: options && options.modifier !== undefined ? Number(options.modifier) : Number(input.ability && input.ability.modifier || 0),
+                  damageType: options && options.damageType || String(input.ability && input.ability.type || 'physical'),
+              }),
               heal: (targetId, amount) => emit("heal", { targetId: String(targetId), amount: Number(amount) }),
               status: (targetId, status, duration = 1) => emit("status", { targetId: String(targetId), status: String(status), duration: Number(duration) }),
               dispel: (targetId, status) => emit("dispel", { targetId: String(targetId), status: String(status) }),

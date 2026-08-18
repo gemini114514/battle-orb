@@ -1291,6 +1291,57 @@ export class CombatEngine {
         this.event(state, 'action_resolved', { actorId: actor.id, abilityId: ability.id, epCost: totalEpCost, targetCostMultiplier: ability.aoe ? 1 : targetCostMultiplier(targets.length), results, counterattack: Boolean(counterattack), triggerSequence });
     }
 
+    // api.attack 的权威战斗检定：与普通攻击完全一致的规则 ——
+    // D100 + 攻击修正 + 位阶修正 + 能力修正 对 目标防御DC（+状态防御加成），
+    // 原始 96-100 为奇迹、1-5 为灾难，命中后经护甲/抗性减伤结算伤害；
+    // 伏击优势（潜行且目标未追踪）、闪避劣势照常生效。脚本只负责“打谁/几下”，
+    // 命中、伤害、护甲、死亡与战果一律由本地引擎裁定。
+    async resolveScriptAttack(state, actor, effect) {
+        const target = state.combatants.find(item => item.id === effect.targetId);
+        if (!target || !living(target)) return;
+        if (!this.canTarget(state, actor, target)) throw httpError(400, `目标 ${target.id} 尚未被发现`);
+        const ability = { id: 'script-attack', name: '脚本攻击', type: String(effect.damageType || 'physical'), actionType: 'main', power: Number(effect.power || 0), modifier: Number(effect.modifier || 0) };
+        const rng = this.rng(state);
+        const stealthAtAttack = this.isStealthed(actor);
+        const ambush = stealthAtAttack && !this.isTracking(this.knowledge(state, target.id, actor.id));
+        this.breakStealth(state, actor, { reason: 'attack', source: 'attack' });
+        this.emitNoise(state, actor, { reason: 'attack', radiusMeters: actor.intelProfile?.attackNoiseMeters, rng });
+        const evasive = target.statuses.find(item => item.id === 'evasive' && Number(item.remainingAttacks || 0) > 0);
+        const roll = rng.d100(evasive ? 'disadvantage' : ambush || actor.statuses.some(item => item.id === 'advantage') ? 'advantage' : actor.statuses.some(item => item.id === 'disadvantage') ? 'disadvantage' : 'normal');
+        const total = roll.selected + actor.attackModifier + actor.tierCorrection + ability.modifier;
+        const effectiveDefenseDC = target.defenseDC + target.statuses.reduce((sum, status) => sum + Number(status.defenseBonus || 0), 0);
+        const hit = total >= effectiveDefenseDC;
+        let damage = null, applied = null;
+        if (hit) {
+            damage = damageValue(actor, target, ability, roll.selected >= 96);
+            applied = applyDamage(target, Math.round(damage.final));
+            if (target.state !== applied.before.state) this.event(state, 'unit_state_changed', { unitId: target.id, from: applied.before.state, to: target.state });
+            if (target.state === 'dying' && applied.before.state === 'active') {
+                actor.kills += 1;
+                if (!state.__passiveExecuting) await this.runOnKillPassives(state, actor, target, rng);
+            }
+            this.checkBossPhase(state, target);
+        }
+        if (evasive) {
+            evasive.remainingAttacks = Math.max(0, Number(evasive.remainingAttacks || 0) - 1);
+            if (!evasive.remainingAttacks) target.statuses = target.statuses.filter(status => status !== evasive);
+            this.event(state, 'evasion_consumed', { targetId: target.id, actorId: actor.id, remainingAttacks: evasive.remainingAttacks });
+        }
+        this.saveRng(state, rng);
+        this.event(state, 'attack_check', {
+            actorId: actor.id, abilityId: ability.id, targetId: target.id,
+            rawRolls: roll.rolls, selected: roll.selected, rngIndex: roll.rngIndex,
+            modifier: total - roll.selected, total, defenseDC: effectiveDefenseDC,
+            outcome: roll.selected <= 5 ? 'disaster' : roll.selected >= 96 ? 'miracle' : hit ? 'hit' : 'miss',
+            damage, applied, source: 'script_attack',
+            attackBasis: {
+                actor: { id: actor.id, attack: actor.attack, magicAttack: actor.magicAttack, attackModifier: actor.attackModifier, tierCorrection: actor.tierCorrection },
+                ability, target: { id: target.id, defenseDC: effectiveDefenseDC, armor: target.armor, resistance: target.resistance },
+                edgeDistanceMeters: Math.round(edgeDistance(actor, target) * 1000) / 1000, contactSlot: null,
+            },
+        });
+    }
+
     counterattackAbility(unit) {
         const passive = (unit.passives || []).find(item => item.id === 'melee-counterattack' && item.enabled !== false);
         if (!passive) return null;
@@ -1634,7 +1685,8 @@ export class CombatEngine {
     async applyEffects(state, actor, effects) {
         for (const effect of effects) {
             const target = state.combatants.find(item => item.id === effect.targetId);
-            if (effect.type === 'damage' && target) {
+            if (effect.type === 'attack' && target) await this.resolveScriptAttack(state, actor, effect);
+            else if (effect.type === 'damage' && target) {
                 const applied = applyDamage(target, Math.max(0, Math.round(effect.amount)));
                 if (target.state !== applied.before.state) this.event(state, 'unit_state_changed', { unitId: target.id, from: applied.before.state, to: target.state });
                 if (target.state === 'dying' && applied.before.state === 'active') {
