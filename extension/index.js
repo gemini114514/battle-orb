@@ -1,4 +1,4 @@
-const VERSION = '0.7.1';
+const VERSION = '0.7.2';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -402,7 +402,14 @@ const roll = api.d100();
 api.damage(t.id, 20 + (roll > 75 ? 10 : 0));   // 暴击
 if (roll > 50) api.status(t.id, "bleed", 2);    // 出血 DoT
 api.push(t.id, 1.5, 0);                          // 击退
-可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（地面 AoE 范围查询）、api.d100()/api.d(n)（确定性骰）、api.damage(targetId,amount,type?)、api.heal、api.status、api.dispel、api.move、api.push(targetId,dx,dy)、api.resource、api.summon(templateId,zoneId,count)、api.log。信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责护甲/死亡/碰撞结算。基础攻击保持声明式即可。
+可用接口：api.state()（回合/战场/actor/targets/units/enemies/allies）、api.distance(aId,bId)、api.unitsInArea(x,y,r)（地面 AoE 范围查询）、api.d100()/api.d(n)（确定性骰）、api.damage(targetId,amount,type?)、api.heal、api.status、api.dispel、api.move、api.push(targetId,dx,dy)、api.resource、api.summon(templateId,zoneId,count)、api.log。信封字段必须写全（epCost/射程/actionType/targetCount/cooldownRounds），脚本负责"发生什么"，引擎负责护甲/死亡/碰撞结算。
+
+【基础攻击·硬性要求（违反即被退回修复）】
+- 每个单位必须至少有 1 个免费的基础攻击（普通攻击）：声明式（禁止 script）、actionType=main、epCost=0、power=0、modifier=0（直接使用单位攻击力）、cooldownRounds=0、targetCount=1、aoe=false。
+- 请结合单位实际武器装备与战场声明自行作答攻击模式：单位有几个攻击模式/武器就给几个基础攻击（如持弩又架盾 → 弩基础攻击 + 盾基础攻击各一个），并按武器实际情况定义攻击类型（type）与射程：远程武器（弓/弩/枪械/法杖/投掷/射击）maxRangeMeters ≥ 6m，近战武器（剑/盾/徒手/棍）≤ 2.5m。攻击类型与射程由你根据实际武器装备判断，不要套用模板。
+- 基础攻击 id 依次用 basic-attack、basic-attack-2、…，放在该单位 abilities 最前面。
+- 严禁给基础攻击/普通攻击添加任何 EP 消耗或脚本；脚本式只用于具名特殊技能/战术技能。
+- 若输入带有 repairErrors（阶段 1 致命错误清单），必须逐条修复后重新输出完整 CombatModel。
 
 禁止计算战斗结果；玩家方必须 controller=player，敌方 controller=ai。`;
 const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据审查 AI（第二段对抗性检查）。你只审查给定的 CombatModel 并输出"整改建议"列表，绝不重新生成整个模型，绝不允许改动任何与矛盾无关的数值、名单、数量、射程或能力。
@@ -411,12 +418,13 @@ const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据审查 AI（�
 
 【能力字段标准】type 只能是 physical|hybrid；actionType 只能是 main|minor；射程用 minRangeMeters/maxRangeMeters（米）。带 script 的脚本能力：脚本内容由本地沙箱校验（100 轮种子测试），你**绝不允许**修改、重写或删除 script 字段，也禁止输出脚本内容。
 
-【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
+【只允许修复这些矛盾】1) 射程矛盾：武器/技能说明或名称表明为远程（弓弩、枪械、法杖、投掷、射击、连弩等）但 maxRangeMeters < 6，则把该能力的 maxRangeMeters 改为与该武器相符的射程（通常 6–30m）；近战技能 maxRangeMeters 应 ≤ 2.5m。2) 未实现的技能效果：声明式能力引用了效果但字段缺失/无数值必须补齐；脚本能力信封字段缺失（epCost/maxRangeMeters/actionType）必须补齐，但不动 script 本体。3) 声明存在但模型缺失的 combatant：用 {"op":"add_combatant","declarationId":"<声明中的 id>"} 补齐。4) 玩家 combatant 必须 controller=player、敌方 controller=ai。5) 数值越界：hp/maxHp/ep/maxEp/power/modifier 小于等于 0、射程为负 → 修正为合理正数。6) 技能错误开销（必须检查）：任何基础攻击/普通攻击（id 以 basic-attack 开头，或声明为普通攻击）必须 epCost=0 且为声明式；若其 epCost>0 → 输出 set_ability 建议把 epCost 改为 0；若某单位完全没有基础攻击（没有任何 id 含 basic-attack 的能力）→ 输出 {"op":"add_ability","declarationId":"..","abilityId":"basic-attack","ability":{"id":"basic-attack","name":"基础攻击","type":"physical","actionType":"main","power":0,"modifier":0,"epCost":0,"minRangeMeters":0,"maxRangeMeters":1.8,"cooldownRounds":0,"targetCount":1,"aoe":false}}（按武器类型调整射程与名称，仍必须 epCost=0）。除此之外的任何字段、任何 combatant 的数量或 HP/EP 具体值，都禁止改动。
 
 【输出格式】只输出一个 JSON 数组 suggestions，不要 Markdown。每项形如：
 {"op":"set_ability","declarationId":"..","abilityId":"..","field":"maxRangeMeters","value":15}
 {"op":"set_combatant","declarationId":"..","field":"controller","value":"player"}
 {"op":"add_combatant","declarationId":".."}
+{"op":"add_ability","declarationId":"..","abilityId":"..","ability":{...}}
 {"op":"note","message":"无需修改或说明"}
 没有需要修改时输出 []。禁止输出 CombatModel 或 declaration 本体，禁止输出非 suggestions 的包装。`;
 
@@ -742,6 +750,29 @@ function deconflictPositions(combatants) {
     return units;
 }
 
+// —— 基础攻击·致命错误保底检测 ——
+// 本地绝不自作主张写入任何能力字段（那样会退化模型能力、限制表达自由）。这里
+// 只做几个"致命错误"的保底检测：单位必须能免费普攻、基础攻击不得带 EP 或脚本。
+// 检测到错误只负责在阶段 1 报错并要求战斗 AI 自行修复（重新生成），不做静默修改。
+function checkCombatModelFatalErrors(model) {
+    if (!model || !Array.isArray(model.combatants)) return [];
+    const errors = [];
+    for (const unit of model.combatants) {
+        const canFreeAttack = (unit.abilities || []).some(ability =>
+            ability.type !== 'maneuver' && !ability.script && Number(ability.epCost || 0) === 0 && ability.actionType === 'main'
+        );
+        if (!canFreeAttack) errors.push(`单位 ${unit.id}（${unit.name}）缺少免费的基础攻击（普通攻击）：请结合其实际武器装备补充声明式、epCost=0 的基础攻击`);
+    }
+    for (const unit of model.combatants) {
+        for (const ability of unit.abilities || []) {
+            if (!/^basic-attack/.test(ability.id || '')) continue;
+            if (ability.script) errors.push(`单位 ${unit.id} 的基础攻击 ${ability.id} 不得使用脚本：请改为声明式基础攻击`);
+            if (Number(ability.epCost || 0) > 0) errors.push(`单位 ${unit.id} 的基础攻击 ${ability.id} 不得消耗 EP：epCost 必须为 0`);
+        }
+    }
+    return [...new Set(errors)];
+}
+
 function mergeModel(candidate, input) {
     const fallback = fallbackModel(input);
     if (!candidate || typeof candidate !== 'object') return fallback;
@@ -806,6 +837,14 @@ function applyModelSuggestions(model, declaration, suggestions) {
         if (combatants.some(u => u.declarationId === s.declarationId || u.id === s.declarationId)) continue;
         const fallback = fallbackModel(declaration).combatants.find(u => u.declarationId === s.declarationId);
         if (fallback) { combatants.push(normalizeCombatant({ declarationId: fallback.declarationId, id: fallback.declarationId, name: fallback.name, side: fallback.side, count: fallback.count }, fallback)); changed = true; }
+    }
+    for (const s of suggestions) {
+        if (!s || s.op !== 'add_ability' || !s.declarationId || !s.abilityId) continue;
+        const target = combatants.find(u => u.declarationId === s.declarationId || u.id === s.declarationId);
+        if (!target || (target.abilities || []).some(a => String(a.id) === String(s.abilityId))) continue;
+        const ability = normalizeAbility(typeof s.ability === 'object' && s.ability ? s.ability : { id: s.abilityId, name: s.abilityId });
+        target.abilities = [...(target.abilities || []), ability];
+        changed = true;
     }
     if (!changed) return model;
     return { ...model, combatants };
@@ -895,18 +934,37 @@ async function createBattle() {
         declarationValidation(declaration);
         busy = true; setStatus('正在用酒馆当前 AI 建立 CombatModel…', 'working'); render();
         tavernSnapshot ||= readTavern();
+        // 第一段生成 + 致命错误保底检测：本地不静默改模型，检测到致命错误就把问题
+        // 回传给战斗 AI 要求其自行修复（最多 2 次修复请求）；仍失败则回退安全默认模型。
         let candidate = null;
-        try {
-            candidate = extractJsonObject(await generateRaw([
-                { role: 'system', content: MODEL_SYSTEM },
-                { role: 'user', content: JSON.stringify({ declaration, mvu: tavernSnapshot.mvu.state }, null, 2) },
-            ], 7000, '战斗建模（第一段生成）'));
-            setStatus('CombatModel 已生成，正在由战斗数据检查 AI 审查修正…', 'working'); render();
-        } catch (error) {
-            if (String(error?.message || '').includes('已取消')) throw error;
-            setStatus(`CombatModel 生成失败，改用本地安全默认模型：${error.message}`, 'warn');
+        let fatalErrors = [];
+        let phaseOneNote = '';
+        for (let attempt = 0; attempt <= 2; attempt += 1) {
+            try {
+                const userPayload = { declaration, mvu: tavernSnapshot.mvu.state };
+                if (attempt > 0 && fatalErrors.length) userPayload.repairErrors = fatalErrors;
+                candidate = extractJsonObject(await generateRaw([
+                    { role: 'system', content: MODEL_SYSTEM },
+                    { role: 'user', content: JSON.stringify(userPayload, null, 2) },
+                ], 7000, attempt ? `战斗建模（第一段 · 修复请求 ${attempt}）` : '战斗建模（第一段生成）'));
+                fatalErrors = checkCombatModelFatalErrors(mergeModel(candidate, declaration));
+                if (!fatalErrors.length) break;
+                recordDebug('modeling_phase1_fatal_errors', { attempt, errors: fatalErrors });
+                setStatus(`第一段建模存在致命错误（第 ${attempt + 1} 次修复请求）：${fatalErrors.join('；')}`, 'warn'); render();
+            } catch (error) {
+                if (String(error?.message || '').includes('已取消')) throw error;
+                setStatus(`CombatModel 生成失败，改用本地安全默认模型：${error.message}`, 'warn');
+                candidate = null;
+                break;
+            }
         }
-        // 第一阶段成功即归档：第二阶段（数据检查 AI）若全部失败，回滚模式将直接用
+        if (fatalErrors.length) {
+            candidate = null;
+            phaseOneNote = '（已回退安全默认模型：致命错误未修复）';
+            recordDebug('modeling_phase1_unrepaired', { errors: fatalErrors });
+            setStatus(`CombatModel 多次修复仍存在致命错误，改用本地安全默认模型：${fatalErrors.join('；')}`, 'warn'); render();
+        }
+        setStatus('CombatModel 已生成，正在由战斗数据检查 AI 审查修正…', 'working'); render();        // 第一阶段成功即归档：第二阶段（数据检查 AI）若全部失败，回滚模式将直接用
         // 这份归档结果创建战场，不再报错或等待。
         const archivedPhaseOne = candidate ? await validateScriptsLocally(mergeModel(candidate, declaration)) : null;
         recordDebug('modeling_phase1_archived', { fast: Boolean(settings.fastModeling), rollback: Boolean(settings.rollbackModeling), combatants: archivedPhaseOne?.combatants?.length || 0 });
@@ -930,6 +988,7 @@ async function createBattle() {
             }
         }
         model = mergeModel(candidate, declaration);
+        recordDebug('modeling_final', { mode: modeNote || '两段式', combatants: model.combatants?.length || 0, basicAttacks: model.combatants?.reduce((sum, unit) => sum + (unit.abilities || []).filter(ability => /^basic-attack/.test(ability.id)).length, 0) || 0 });
         repository = new BrowserCombatRepository();
         engine = new CombatEngine(repository);
         const created = engine.create({ seed: id('tavern'), mode: 'manual', storySessionId: tavernSnapshot.chatId, encounter: model, assetProfiles: model.assetProfiles || [], preparation: { declaration, source: 'tavern-injected' } });
@@ -939,8 +998,8 @@ async function createBattle() {
         repository.commit(battle);
         mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
         stageOverride = null;
-        recordDebug('battle_created', { battleId: battle.id, combatants: model.combatants?.length || 0, title: model.title, ruleset: battle.rulesetVersion, mode: modeNote });
-        setStatus(`战场已创建${modeNote}；骰点、伤害、状态、位置和胜负由本地引擎裁定`, 'ok');
+        recordDebug('battle_created', { battleId: battle.id, combatants: model.combatants?.length || 0, title: model.title, ruleset: battle.rulesetVersion, mode: modeNote || phaseOneNote });
+        setStatus(`战场已创建${modeNote}${phaseOneNote}；骰点、伤害、状态、位置和胜负由本地引擎裁定`, 'ok');
         render();
     } catch (error) { flowError = { step: 'create', message: error.message || '创建失败' }; notify(`创建战场失败：${error.message}`, 'error'); }
     finally { busy = false; render(); }
