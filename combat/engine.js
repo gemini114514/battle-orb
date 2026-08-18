@@ -58,7 +58,7 @@ export class CombatEngine {
             worldLifeLevel: encounter.worldLifeLevel || null,
             schema: encounter.schema || null,
             meleeSlots: { round: 0, targets: {} },
-            flags: {}, noChangeRounds: 0, lastProgressHash: null, approvedScripts: [], commandHistory: [], finalResult: null, pendingEvents: [], createdAt: new Date().toISOString(),
+            flags: {}, noChangeRounds: 0, lastProgressHash: null, approvedScripts: [], commandHistory: [], finalResult: null, pendingEvents: [], participantBench: [], createdAt: new Date().toISOString(),
         };
         this.ensureTacticalState(state);
         state.initialSnapshot = deepClone({ battlefield: state.battlefield, zones: state.zones, combatants: state.combatants, assetProfiles: state.assetProfiles, intel: state.intel, contactEstablished: state.contactEstablished, contactPairs: state.contactPairs, worldLifeLevel: state.worldLifeLevel, schema: state.schema, meleeSlots: state.meleeSlots });
@@ -1952,6 +1952,36 @@ export class CombatEngine {
         this.event(state, 'control_changed', { unitId: unit.id, controller: unit.controller, controlMode: unit.controlMode || 'follow', playerId: unit.playerId, seatId: unit.seatId });
     }
     setMode(state, mode) { if (!MODES.has(mode)) throw httpError(400, '控制模式无效'); state.mode = mode; this.event(state, 'mode_changed', { mode }); }
+    // 进入战场前的部署：选择友方单位是否参战。未参战单位移入 participantBench（仅
+    // 保留在草稿阶段，启动后不再出现在 combatants），可随时重新拉回参战名单。
+    setParticipate(state, input = {}) {
+        this.assertWritable(state);
+        if (state.status !== 'draft') throw httpError(409, '只能在进入战场前调整参战名单');
+        const unitId = String(input.unitId || '');
+        const bench = state.participantBench || (state.participantBench = []);
+        const benchById = new Map(bench.map(unit => [String(unit.id), unit]));
+        const unit = state.combatants.find(item => String(item.id) === unitId) || benchById.get(unitId);
+        if (!unit || unit.side !== 'player') throw httpError(404, '找不到可调整的友方单位');
+        const participates = input.participates === true;
+        const activePlayerCount = state.combatants.filter(item => item.side === 'player').length;
+        if (!participates) {
+            if (activePlayerCount <= 1) throw httpError(400, '至少保留一名友方单位参战');
+            state.combatants = state.combatants.filter(item => item.id !== unit.id);
+            bench.push(unit);
+        } else if (benchById.has(unitId)) {
+            state.combatants.push(unit);
+            state.participantBench = bench.filter(item => item.id !== unit.id);
+        } else {
+            return;
+        }
+        this.rebaseDraft(state);
+        this.event(state, 'participants_changed', { unitId, participates, participating: state.combatants.filter(item => item.side === 'player').map(item => item.id), benched: (state.participantBench || []).map(item => item.id) });
+    }
+    rebaseDraft(state) {
+        state.initialCounts.player = state.combatants.filter(unit => unit.side === 'player').length;
+        state.initialSnapshot = deepClone({ battlefield: state.battlefield, zones: state.zones, combatants: state.combatants, assetProfiles: state.assetProfiles, intel: state.intel, contactEstablished: state.contactEstablished, contactPairs: state.contactPairs, worldLifeLevel: state.worldLifeLevel, schema: state.schema, meleeSlots: state.meleeSlots });
+        state.initialHash = sha256(state.initialSnapshot);
+    }
     rng(state) { return new DeterministicRng(state.seed, state.rng.state, state.rng.index); }
     saveRng(state, rng) { state.rng = rng.snapshot(); }
 }

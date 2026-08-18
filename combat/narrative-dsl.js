@@ -63,3 +63,20 @@ export function buildBattleResultDsl({ state, events, final }) {
     output.push(line(['END', `winner=${quote(final?.winner || 'undecided')}`, `rounds=${number(final?.rounds ?? state.round) ?? 0}`]));
     return output.join('\n');
 }
+
+// 回写主 AI 的 MVU 指令里必须更新击杀数量：按单位生命层级（lifeLevel，缺省用
+// worldLifeLevel）把阵亡敌方累计进后台 `任务.击杀.{层级}` 字典，值 = 原值 + 本场击杀。
+// 与卡内【Patch计数】规则一致：只改对应层级局部路径，不重写整个列表。
+export function buildKillCountPatches(finalCombatants, worldLifeLevel = '', currentKills = {}) {
+    const killsByLayer = {};
+    for (const unit of finalCombatants || []) {
+        if (unit.side !== 'enemy' || unit.state === 'active') continue;
+        const layer = String(unit.lifeLevel || worldLifeLevel || 'Ⅰ');
+        killsByLayer[layer] = (killsByLayer[layer] || 0) + Math.max(1, Number(unit.count) || 1);
+    }
+    return Object.keys(killsByLayer).map(layer => ({
+        op: 'replace',
+        path: `/stat_data/任务/击杀/${layer}`,
+        value: (Number(currentKills[layer]) || 0) + killsByLayer[layer],
+    }));
+}

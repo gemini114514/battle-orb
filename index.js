@@ -1,4 +1,4 @@
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -13,7 +13,7 @@ void import('./diagnose.js')
 
 (async function battleOrbBootstrap() {
 try {
-    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl }, sandbox, { damageValue, isMeleeAbility, rangeLegal, living }] = await Promise.all([
+    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl, buildKillCountPatches }, sandbox, { damageValue, isMeleeAbility, rangeLegal, living }] = await Promise.all([
         import('../../../extensions.js'),
         import('./combat/engine.js'),
         import('./combat/browser-repository.js'),
@@ -22,6 +22,7 @@ try {
         import('./combat/sandbox.js'),
         import('./combat/rules.js'),
     ]);
+    const { compileStrategy } = await import('./combat/strategy.js');
     const { inspectScript, testScript, runScript } = sandbox;
     bootTrace('dependencies-loaded');
 
@@ -37,6 +38,13 @@ let battle = null;
 let declaration = null;
 let model = null;
 let tavernSnapshot = null;
+const COMBAT_STRATEGY_PRESETS = Object.freeze({
+    standard: { label: '标准推进', description: '优先最近目标，保持资源，必要时保护队友。', text: '标准推进：优先攻击最近的合法目标；队友濒危时协助保护；保留约20% EP，不主动友伤。' },
+    focus: { label: '集中火力', description: '优先集火 Boss 或当前标记目标。', text: '集中火力：优先集火 Boss 或标记目标，其次攻击最脆弱目标；队友无需分散追击。' },
+    guerrilla: { label: '游击分割', description: '潜行、诱导、拉扯，避免一次接触整群敌人。', text: '游击分割：先潜行或诱导分割敌群，逐个击破；每次攻击后尽量拉开距离，避免同时接触大量敌人。' },
+    guard: { label: '护卫防守', description: '围绕主角或指定队友，优先阻断近身威胁。', text: '护卫防守：优先保护主角和濒危队友，攻击进入近战范围的敌人；不要为了追击远处目标离开护卫位置。' },
+});
+let deployState = { strategyText: '', activePreset: null, assignments: {} };
 let mapZoom = 1;
 let mapPan = { x: 0, y: 0 };
 let mapIntent = null;
@@ -1323,18 +1331,90 @@ async function createBattle() {
         const created = engine.create({ seed: id('tavern'), mode: 'manual', storySessionId: tavernSnapshot.chatId, encounter: model, assetProfiles: model.assetProfiles || [], preparation: { declaration, source: 'tavern-injected' } });
         battle = repository.get(created.id);
         battle.__combatBenchmark = { spans: {} };
-        await engine.start(battle);
-        repository.commit(battle);
+        deployState = { strategyText: '', activePreset: null, assignments: {} };
         mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
         stageOverride = null;
         recordDebug('battle_created', { battleId: battle.id, combatants: model.combatants?.length || 0, title: model.title, ruleset: battle.rulesetVersion, mode: modeNote || phaseOneNote });
-        setStatus(`战场已创建${modeNote}${phaseOneNote}；骰点、伤害、状态、位置和胜负由本地引擎裁定`, 'ok');
+        setStatus(`战场已建模${modeNote}${phaseOneNote}；请在“编制部署”选择参战、操作方式与战斗策略`, 'ok');
         render();
     } catch (error) { flowError = { step: 'create', message: error.message || '创建失败' }; notify(`创建战场失败：${error.message}`, 'error'); stageOverride = 'create'; }
     finally { busy = false; render(); }
 }
 
 function publicBattle() { return battle && engine ? engine.publicState(battle) : null; }
+
+function deployRosterMarkup(state) {
+    const units = [...(state?.combatants || []), ...(state?.participantBench || [])].filter(unit => unit.side === 'player');
+    const unitById = new Map(units.map(unit => [String(unit.id), unit]));
+    const participatingIds = new Set((state?.combatants || []).filter(unit => unit.side === 'player').map(unit => String(unit.id)));
+    if (!units.length) return '<div class="bo-deploy-empty">没有可配置的友方单位</div>';
+    const strategySelect = (unitId, selected) => `<select class="bo-deploy-strategy-select" data-deploy-unit-strategy="${escapeHtml(unitId)}"><option value="inherit" ${selected === 'inherit' || !selected ? 'selected' : ''}>跟随上方策略</option>${Object.entries(COMBAT_STRATEGY_PRESETS).map(([id, preset]) => `<option value="${id}" ${selected === id ? 'selected' : ''}>${escapeHtml(preset.label)}</option>`).join('')}</select>`;
+    const modeSelect = (unitId, controlMode) => `<select class="bo-deploy-mode-select" data-deploy-unit-mode="${escapeHtml(unitId)}"><option value="follow" ${!controlMode ? 'selected' : ''}>跟随全局</option><option value="manual" ${controlMode === 'manual' ? 'selected' : ''}>本单位手操</option><option value="auto" ${controlMode === 'auto' ? 'selected' : ''}>本单位自动</option></select>`;
+    return units.map(unit => {
+        const participating = participatingIds.has(String(unit.id));
+        const assignment = deployState.assignments?.[String(unit.id)] || 'inherit';
+        return `<div class="bo-deploy-unit ${participating ? '' : 'bo-deploy-unit-benched'}">
+      <label class="bo-deploy-participate"><input type="checkbox" data-deploy-participate="${escapeHtml(unit.id)}" ${participating ? 'checked' : ''}><span>${escapeHtml(unit.name || unit.id)}</span><small>${participating ? '参战' : '未参战'}</small></label>
+      <div class="bo-deploy-unit-controls">${modeSelect(unit.id, unit.controlMode || null)}${strategySelect(unit.id, assignment)}</div>
+    </div>`;
+    }).join('');
+}
+
+function renderDeployPanel(state) {
+    const modeSelect = $('#battle-orb-deploy-mode');
+    if (modeSelect && state) modeSelect.value = state.mode || 'manual';
+    const strategyBox = $('#battle-orb-deploy-strategy');
+    if (strategyBox && strategyBox !== document.activeElement) strategyBox.value = deployState.strategyText;
+    const presets = document.querySelectorAll('.bo-deploy-preset');
+    presets.forEach(button => button.classList.toggle('active', button.dataset.deployPreset === deployState.activePreset));
+    const roster = $('#battle-orb-deploy-roster');
+    if (roster) roster.innerHTML = deployRosterMarkup(state);
+    const preview = $('#battle-orb-deploy-strategy-preview');
+    if (preview) {
+        if (String(deployState.strategyText).trim()) {
+            const compiled = compileStrategy(deployState.strategyText, {});
+            preview.innerHTML = `<dl><dt>编译器</dt><dd>${escapeHtml(compiled.compiler || 'local-parser')}</dd><dt>目标优先级</dt><dd>${compiled.priorities.join(' → ')}</dd><dt>EP 保留</dt><dd>${compiled.preserveEpPercent}%</dd><dt>拉扯/退避</dt><dd>${compiled.retreat ? '是' : '否'}</dd><dt>潜行</dt><dd>${compiled.stealth ? '是' : '否'}</dd><dt>接管阈值</dt><dd>${(compiled.takeoverTriggers || []).map(t => `${t.field} ${t.operator} ${t.value}`).join('；') || '无'}</dd></dl>`;
+        } else preview.innerHTML = '<span class="bo-deploy-preview-empty">策略会先编译为确定性规则，确认后才执行。</span>';
+    }
+    const enter = $('#battle-orb-enter-battle');
+    if (enter) enter.disabled = busy || !state || !(state.combatants || []).some(unit => unit.side === 'player');
+}
+
+function applyDeployStrategy() {
+    if (!battle || !engine) return;
+    try {
+        battle.strategy = compileStrategy(deployState.strategyText || '', { confirmed: Boolean(String(deployState.strategyText).trim()) });
+        const assignments = {};
+        for (const [unitId, presetId] of Object.entries(deployState.assignments || {})) {
+            const preset = COMBAT_STRATEGY_PRESETS[presetId];
+            if (!preset) continue;
+            assignments[String(unitId)] = { ...compileStrategy(preset.text, { confirmed: true }), presetId };
+        }
+        battle.strategy.assignments = assignments;
+        repository.commit(battle);
+    } catch { /* 本地编译失败则保持上次已确认策略 */ }
+}
+
+async function enterBattle() {
+    if (!battle || !engine || busy) return;
+    busy = true; setStatus('正在进入战场…', 'working'); render();
+    try {
+        applyDeployStrategy();
+        await engine.start(battle);
+        repository.commit(battle);
+        mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null;
+        recordDebug('battle_started', { battleId: battle.id, mode: battle.mode, participants: battle.combatants.filter(unit => unit.side === 'player').map(unit => unit.id), strategy: battle.strategy?.compiler || null });
+        setStatus('已进入战场；骰点、伤害、状态、位置和胜负由本地引擎裁定', 'ok');
+        render();
+    } catch (error) { notify(`进入战场失败：${error.message}`, 'error'); }
+    finally { busy = false; render(); }
+}
+
+function resetBattleState() {
+    battle = null; engine = null; repository = null; model = null;
+    deployState = { strategyText: '', activePreset: null, assignments: {} };
+    mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; actionPreview = null;
+}
 
 async function execute(command) {
     if (!battle || busy || ['completed', 'abandoned'].includes(battle.status)) return false;
@@ -1847,9 +1927,10 @@ const STAGE_META = {
     read: { label: '① 读取', hint: '读取当前楼层与 MVU，可选填识别提示' },
     recognize: { label: '② 识别', hint: '识别或生成战场声明' },
     create: { label: '③ 创建战场', hint: '主 AI 建模（可选急速/回滚模式）并创建二维战场' },
-    approve: { label: '④ 脚本审批', hint: '逐能力审查脚本源码后批准或移除' },
-    combat: { label: '⑤ 战斗中', hint: '本地引擎权威裁定战斗' },
-    completed: { label: '⑥ 完成', hint: '回写主 AI 或发起新战斗' },
+    deploy: { label: '④ 编制部署', hint: '选择友方参战、操作方式与战斗策略后进入战场' },
+    approve: { label: '⑤ 脚本审批', hint: '逐能力审查脚本源码后批准或移除' },
+    combat: { label: '⑥ 战斗中', hint: '本地引擎权威裁定战斗' },
+    completed: { label: '⑦ 完成', hint: '回写主 AI 或发起新战斗' },
 };
 
 function currentStage() {
@@ -1858,6 +1939,7 @@ function currentStage() {
     if (!declaration) return 'recognize';
     const battleState = publicBattle();
     if (!battleState) return 'create';
+    if (battleState.status === 'draft') return 'deploy';
     if (battleState.pauseReason?.type === 'script_approval') return 'approve';
     return battleState.status === 'completed' ? 'completed' : 'combat';
 }
@@ -1886,6 +1968,14 @@ function stageMarkup(stage) {
     }
     if (stage === 'create') {
         return `<div id="battle-orb-declaration-summary"></div><label class="bo-unit-hint"><span>单位修正提示（可选）</span><textarea id="battle-orb-unit-hint" spellcheck="false" placeholder="可选：针对单位的修正提示，随战斗建模传给 AI">${escapeHtml(settings.unitHint || '')}</textarea></label><button id="battle-orb-create" class="bo-primary" type="button">③ 创建二维战场</button><button id="battle-orb-back-recognize" class="bo-link" type="button">← 返回修改声明</button>`;
+    }
+    if (stage === 'deploy') {
+        return `<section class="bo-deploy">
+  <section class="bo-deploy-block"><header><b>战斗模式</b><small>控制方式：自动 / 半自动 / 纯手操</small></header><select id="battle-orb-deploy-mode" class="bo-deploy-mode"><option value="manual">纯手操：我方每步都由你指挥</option><option value="semi">半自动：已确认策略的单位自动行动，其余手操</option><option value="auto">自动：全部由本地引擎演算</option></select></section>
+  <section class="bo-deploy-block"><header><b>战斗策略</b><small>预设 → 可再编辑，本地编译为确定性规则</small></header><div class="bo-deploy-presets">${Object.entries(COMBAT_STRATEGY_PRESETS).map(([id, preset]) => `<button type="button" class="bo-deploy-preset" data-deploy-preset="${id}" title="${escapeHtml(preset.description)}">${escapeHtml(preset.label)}</button>`).join('')}</div><textarea id="battle-orb-deploy-strategy" rows="3" spellcheck="false" placeholder="例如：优先集火 Boss；HP 低于 50% 或击杀一半敌人时由我接管；保留 20% EP。"></textarea><div id="battle-orb-deploy-strategy-preview" class="bo-deploy-preview"></div></section>
+  <section class="bo-deploy-block"><header><b>友方单位</b><small>勾选参战，并选择各单位操作方式与策略</small></header><div id="battle-orb-deploy-roster" class="bo-deploy-roster"></div></section>
+  <div class="bo-deploy-actions"><button id="battle-orb-enter-battle" class="bo-primary" type="button">进入战场 →</button><button id="battle-orb-back-create" class="bo-link" type="button">← 放弃并返回重新声明</button></div>
+</section>`;
     }
     if (stage === 'approve') {
         return `<section id="battle-orb-approve" class="bo-approve"><div id="battle-orb-script-approval"></div><button id="battle-orb-approve-abandon" class="bo-link" type="button">← 放弃此战斗并返回</button></section>`;
@@ -1921,6 +2011,8 @@ function renderStage() {
         const summary = $('#battle-orb-declaration-summary');
         if (summary) summary.innerHTML = declarationSummaryMarkup(declaration);
         const createButton = $('#battle-orb-create'); if (createButton) createButton.disabled = busy;
+    } else if (stage === 'deploy') {
+        renderDeployPanel(state);
     } else if (stage === 'approve') {
         renderScriptApproval(state);
     } else {
@@ -2207,7 +2299,9 @@ async function narrate() {
         const dsl = buildBattleResultDsl({ state, events, final });
         const recent = (tavernSnapshot || readTavern()).recent;
         const checks = (final.checkResults || []).slice(-20).map(check => `- ${check.actorId || ''} → ${check.targetId || ''}：D100 ${check.selected} + ${check.modifier} = ${check.total} / DC ${check.defenseDC}，${check.outcome || 'resolved'}`).join('\n');
-        const patch = Array.isArray(final.mvuPatch) ? final.mvuPatch : [];
+        const currentMvu = tavernSnapshot?.mvu?.state?.stat_data || {};
+        const killPatches = buildKillCountPatches(final.finalState?.combatants || [], state.worldLifeLevel || '', currentMvu?.['任务']?.击杀 || {});
+        const patch = [...(Array.isArray(final.mvuPatch) ? final.mvuPatch : []), ...killPatches];
         const recordExtra = { battleOrb: { battleId, replayHash: final.eventHash || null, result: final, importedAt: new Date().toISOString() } };
         const checksBlock = checks ? `<CheckResult>\n${checks}\n</CheckResult>\n\n` : '';
         const patchBlock = `<UpdateVariable><JSONPatch>\n${JSON.stringify(patch, null, 2)}\n</JSONPatch></UpdateVariable>`;
@@ -2394,6 +2488,7 @@ function exportPromptTrace() {
 
 function startNewBattle() {
     battle = null; engine = null; repository = null; model = null; declaration = null; tavernSnapshot = null;
+    deployState = { strategyText: '', activePreset: null, assignments: {} };
     mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; actionNotice = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
     flowError = null; stageOverride = 'read'; lastStage = null;
     setStatus('已重置；从读取阶段开始新战斗', 'ok');
@@ -2409,8 +2504,19 @@ function resetToStageOne() {
 
 function bindPanel() {
     document.addEventListener('click', event => {
-        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts, #battle-orb-preview-confirm, #battle-orb-preview-cancel');
+        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-enter-battle, #battle-orb-back-create, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts, #battle-orb-preview-confirm, #battle-orb-preview-cancel, [data-deploy-preset]');
         if (!target) return;
+        const presetButton = event.target.closest('[data-deploy-preset]');
+        if (presetButton) {
+            const preset = COMBAT_STRATEGY_PRESETS[presetButton.dataset.deployPreset];
+            if (preset) {
+                deployState.strategyText = preset.text;
+                deployState.activePreset = presetButton.dataset.deployPreset;
+                applyDeployStrategy();
+                render();
+            }
+            return;
+        }
         if (target.id === 'battle-orb-preview-confirm') { confirmActionPreview(); return; }
         if (target.id === 'battle-orb-preview-cancel') { cancelActionPreview(); return; }
         if (target.id === 'battle-orb-sync') {
@@ -2431,9 +2537,12 @@ function bindPanel() {
         if (target.id === 'battle-orb-narrate') { void narrate(); return; }
         if (target.id === 'battle-orb-to-create') { stageOverride = 'create'; render(); return; }
         if (target.id === 'battle-orb-back-recognize') { stageOverride = 'recognize'; render(); return; }
+        if (target.id === 'battle-orb-enter-battle') { void enterBattle(); return; }
+        if (target.id === 'battle-orb-back-create') { resetBattleState(); stageOverride = 'recognize'; lastStage = null; setStatus('已放弃当前战场，返回修改声明', 'ok'); render(); return; }
         if (target.id === 'battle-orb-new-battle') { startNewBattle(); return; }
         if (target.id === 'battle-orb-approve-abandon') {
             battle = null; engine = null; repository = null; model = null;
+            deployState = { strategyText: '', activePreset: null, assignments: {} };
             mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; actionNotice = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
             stageOverride = 'create'; lastStage = null;
             setStatus('已放弃当前战斗，可返回修改声明或重新创建', 'ok');
@@ -2508,6 +2617,13 @@ function bindPanel() {
         }
     });
     document.addEventListener('input', event => {
+        if (event.target.id === 'battle-orb-deploy-strategy') {
+            deployState.strategyText = String(event.target.value || '');
+            deployState.activePreset = null;
+            applyDeployStrategy();
+            render();
+            return;
+        }
         if (event.target.id === 'battle-orb-recognize-hint') { settings.recognizeHint = String(event.target.value || '').trim(); saveSettings(); return; }
         if (event.target.id === 'battle-orb-unit-hint') { settings.unitHint = String(event.target.value || '').trim(); saveSettings(); return; }
         if (event.target.id === 'battle-orb-declaration') { try { declaration = normalizeDeclaration(JSON.parse(event.target.value)); } catch { declaration = null; } render(); return; }
@@ -2525,6 +2641,35 @@ function bindPanel() {
         }
     });
     document.addEventListener('change', event => {
+        const deployMode = event.target.closest('#battle-orb-deploy-mode');
+        if (deployMode) {
+            try { if (battle && engine) { engine.setMode(battle, deployMode.value); repository.commit(battle); } setStatus(`战斗模式已切换：${deployMode.value === 'auto' ? '自动' : deployMode.value === 'semi' ? '半自动' : '纯手操'}`, 'ok'); }
+            catch (error) { notify(`模式切换失败：${error.message}`, 'error'); }
+            render();
+            return;
+        }
+        const deployParticipate = event.target.closest('[data-deploy-participate]');
+        if (deployParticipate) {
+            try { if (battle && engine) { engine.setParticipate(battle, { unitId: deployParticipate.dataset.deployParticipate, participates: deployParticipate.checked }); repository.commit(battle); } }
+            catch (error) { notify(`参战名单调整失败：${error.message}`, 'error'); }
+            render();
+            return;
+        }
+        const deployUnitMode = event.target.closest('[data-deploy-unit-mode]');
+        if (deployUnitMode) {
+            try { if (battle && engine) { engine.setControl(battle, { unitId: deployUnitMode.dataset.deployUnitMode, modeOverride: deployUnitMode.value === 'follow' ? null : deployUnitMode.value }); repository.commit(battle); } }
+            catch (error) { notify(`单位操作方式切换失败：${error.message}`, 'error'); }
+            render();
+            return;
+        }
+        const deployUnitStrategy = event.target.closest('[data-deploy-unit-strategy]');
+        if (deployUnitStrategy) {
+            if (deployUnitStrategy.value === 'inherit') delete deployState.assignments[deployUnitStrategy.dataset.deployUnitStrategy];
+            else deployState.assignments[deployUnitStrategy.dataset.deployUnitStrategy] = deployUnitStrategy.value;
+            applyDeployStrategy();
+            render();
+            return;
+        }
         const provider = event.target.closest('#battle-orb-api-decl-provider, #battle-orb-api-model-provider');
         if (provider) {
             const kind = provider.id.includes('decl') ? 'declaration' : 'modeling';
