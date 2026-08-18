@@ -1,4 +1,4 @@
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -52,10 +52,21 @@ let busy = false;
 let mounted = false;
 
 const SETTINGS_KEY = 'battle-orb.settings';
-let settings = { writeVerdictBasis: true };
+let settings = { writeVerdictBasis: true, recognizeHint: '' };
 let flowError = null;
-try { settings = { writeVerdictBasis: true, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { /* keep defaults */ }
+try { settings = { writeVerdictBasis: true, recognizeHint: '', ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { /* keep defaults */ }
 const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} };
+
+let stageOverride = null;
+let lastStage = null;
+let promptHistory = [];
+let debugTrace = [];
+let llmTask = null;
+let llmInterval = 0;
+let benchmarkResult = null;
+const DEBUG_EXPORT_VALUE_LIMIT = 6 * 1024 * 1024;
+const DEBUG_TRACE_VALUE_LIMIT = 200000;
+const DEBUG_TRACE_LIMIT = 200;
 
 const $ = selector => document.querySelector(selector);
 const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
@@ -66,11 +77,6 @@ function notify(message, type = 'info') {
     const fn = globalThis.toastr?.[type];
     if (typeof fn === 'function') fn(message, 'Battle Orb');
     setStatus(message, type);
-}
-
-function setStatus(message, kind = 'info') {
-    const node = $('#battle-orb-status');
-    if (node) { node.textContent = String(message || ''); node.dataset.kind = kind; }
 }
 
 function fabVisible() {
@@ -386,14 +392,195 @@ const DECLARATION_SYSTEM = `你是 Battle Orb 的战场声明器。阅读酒馆�
 const MODEL_SYSTEM = `你是 Battle Orb 的战斗建模器。只输出一个完整 JSON CombatModel，不要 Markdown、解释或战报。必须包含 schema:"vibe-combat-model/v3"、title、location、battlefield、zones、combatants。battlefield 使用 rectangle(widthMeters/heightMeters/center) 或 circle(radiusMeters/center)；每个 combatant 必须有 id/declarationId/name/side/controller/hp/maxHp/ep/maxEp/attack/attackModifier/defenseDC/initiativeDC/armor/resistance/position/visionMeters/intelProfile/tacticalProfile/abilities。能力至少包含 basic-attack，禁止计算战斗结果；玩家方必须 controller=player，敌方 controller=ai。`;
 const MODEL_SUPERVISOR_SYSTEM = `你是 Battle Orb 的战斗数据检查 AI（第二段对抗性审查）。检查给定的 CombatModel 是否自洽，并直接输出修正后的完整 JSON，不要 Markdown、解释或只输出差异。重点检查并修正：1) 武器/能力射程矛盾——例如配置了远程武器却只带近战能力、或近战武器却配置远程能力，能力射程必须与武器类型相符；2) 未实现的技能效果——引用了效果但未定义、或效果无数值的必须补齐或删除，能力必须至少包含 basic-attack；3) 与战场声明不符——participants 中声明存在的实体缺失、或出现声明外的实体；4) 玩家方必须 controller=player，敌方 controller=ai；5) 数值越界（HP/EP 为 0 或负、射程为负等）必须修正。可以连续多次修正，但最终只输出一个完整、可用的 CombatModel JSON。`;
 
-async function generateRaw(messages, responseLength = 4000) {
+function safeJson(value, limit = DEBUG_TRACE_VALUE_LIMIT) {
+    if (value === undefined) return undefined;
+    try {
+        const json = JSON.stringify(value);
+        if (json.length <= limit) return JSON.parse(json);
+        return { truncated: true, bytes: json.length, preview: json.slice(0, limit) };
+    } catch (error) { return { unserializable: true, error: String(error?.message || error), value: String(value) }; }
+}
+
+function recordDebug(kind, data = {}) {
+    const entry = { at: new Date().toISOString(), kind, ...safeJson(data, DEBUG_TRACE_VALUE_LIMIT) };
+    debugTrace = [...debugTrace, entry].slice(-DEBUG_TRACE_LIMIT);
+    return entry;
+}
+
+function renderLlmBar() {
+    const bar = $('#battle-orb-llm-bar');
+    if (!bar) return;
+    if (!llmTask) { bar.hidden = true; return; }
+    bar.hidden = false;
+    const label = $('#battle-orb-llm-label'); if (label) label.textContent = llmTask.label || 'LLM 调用中…';
+    const time = $('#battle-orb-llm-time'); if (time) { const elapsed = Math.max(0, Math.floor((Date.now() - llmTask.startedAt) / 1000)); time.textContent = `${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`; }
+    const fill = bar.querySelector('.bo-llm-fill'); if (fill) fill.style.width = '100%';
+}
+
+function llmBegin(label) {
+    if (llmTask) llmEnd();
+    const token = Symbol('llm-task');
+    llmTask = { token, label, startedAt: Date.now(), cancelled: false, resolveCancel: null };
+    renderLlmBar();
+    if (!llmInterval) llmInterval = setInterval(() => renderLlmBar(), 250);
+    return token;
+}
+
+function llmCancel() {
+    if (!llmTask) return;
+    llmTask.cancelled = true;
+    if (llmTask.resolveCancel) llmTask.resolveCancel();
+    renderLlmBar();
+}
+
+function llmEnd(token) {
+    if (llmTask && (!token || llmTask.token === token)) llmTask = null;
+    if (!llmTask && llmInterval) { clearInterval(llmInterval); llmInterval = 0; }
+    renderLlmBar();
+}
+
+async function withLlmTask(label, fn) {
+    const token = llmBegin(label);
+    let resolveCancel = null;
+    const cancelPromise = new Promise(resolve => { resolveCancel = resolve; });
+    llmTask.resolveCancel = resolveCancel;
+    try {
+        return await Promise.race([fn(), cancelPromise.then(() => { throw new Error('LLM 任务已取消'); })]);
+    } finally { llmEnd(token); }
+}
+
+function recordPrompt(stage, messages, detail = {}) {
+    const entry = {
+        at: new Date().toISOString(),
+        stage,
+        messages: Array.isArray(messages) ? messages.map(message => ({ role: message?.role || 'user', content: String(message?.content || '').slice(0, 60000) })) : [],
+        ok: Boolean(detail.ok),
+        error: detail.error || null,
+        durationMs: detail.durationMs ?? null,
+        response: safeJson(detail.response, 40000),
+    };
+    promptHistory = [...promptHistory, entry].slice(-60);
+    return entry;
+}
+
+async function generateRaw(messages, responseLength = 4000, label = 'LLM 调用') {
     const ctx = activeContext();
     if (typeof ctx.generateRaw !== 'function') throw new Error('当前酒馆版本没有 generateRaw 扩展接口');
-    return ctx.generateRaw({ prompt: messages, responseLength, trimNames: false });
+    const startedAt = performance.now();
+    let ok = false;
+    let response = null;
+    let failure = null;
+    try {
+        response = await withLlmTask(label, () => ctx.generateRaw({ prompt: messages, responseLength, trimNames: false }));
+        ok = true;
+        return response;
+    } catch (error) {
+        failure = error;
+        throw error;
+    } finally {
+        const durationMs = Math.round((performance.now() - startedAt) * 10) / 10;
+        recordPrompt(label, messages, { ok, error: failure?.message || null, durationMs, response });
+        recordDebug('llm_call', { stage: label, ok, durationMs, error: failure?.message || null, messageCount: Array.isArray(messages) ? messages.length : 0 });
+    }
 }
 
 function currentPlayerMvu() {
     return tavernSnapshot?.mvu?.state?.stat_data?.主角 || {};
+}
+
+function benchmarkEncounter() {
+    const playerMvu = currentPlayerMvu();
+    const playerHp = Math.max(1, Number(playerMvu.HP || 100));
+    const playerMaxHp = Math.max(playerHp, Number(playerMvu.HP_MAX || playerHp));
+    const hero = {
+        id: 'bench-hero', declarationId: 'bench-hero', name: '基准主角', side: 'player', controller: 'auto', hp: playerHp, maxHp: playerMaxHp, ep: 0, maxEp: 0,
+        attack: 20, magicAttack: 0, attackModifier: 2, defenseDC: 50, initiativeDC: 55, armor: 0, resistance: 0, radiusMeters: .5, speedMeters: 6,
+        position: { x: -12, y: 0 }, facingDegrees: 0, fovDegrees: 120, visionMeters: 30,
+        intelProfile: { presence: 'obvious', stealthBonus: 0, perceptionBonus: 0, commandBonus: 0, hearingMeters: 15, intelligenceRangeMeters: 0, intelligenceBonus: 0, movementNoiseMeters: 12, attackNoiseMeters: 32 },
+        tacticalProfile: { archetype: 'squad', groupId: 'bench-heroes', objective: 'engage', focusRule: 'nearest', coordinationRadiusMeters: 18 },
+        abilities: [{ id: 'basic-attack', name: '基准攻击', type: 'physical', actionType: 'main', power: 0, modifier: 0, epCost: 0, minRangeMeters: 0, maxRangeMeters: 1.5, cooldownRounds: 0, targetCount: 1, aoe: false }],
+    };
+    const zombies = Array.from({ length: 100 }, (_, index) => {
+        const angle = (index / 100) * Math.PI * 2;
+        const radius = 12 + (index % 7) * 1.6;
+        return {
+            id: `bench-z-${index}`, declarationId: `bench-z-${index}`, name: '本能丧尸', side: 'enemy', controller: 'auto', hp: 6, maxHp: 6, ep: 0, maxEp: 0,
+            attack: 3, magicAttack: 0, attackModifier: -1, defenseDC: 40, initiativeDC: 0, armor: 0, resistance: 0, radiusMeters: .45, speedMeters: 3,
+            position: { x: hero.position.x + Math.cos(angle) * radius, y: hero.position.y + Math.sin(angle) * radius }, facingDegrees: 0, fovDegrees: 120, visionMeters: 10,
+            intelProfile: { presence: 'obvious', stealthBonus: 0, perceptionBonus: 0, commandBonus: 0, hearingMeters: 8, intelligenceRangeMeters: 0, intelligenceBonus: 0, movementNoiseMeters: 6, attackNoiseMeters: 10 },
+            tacticalProfile: { archetype: 'scattered', groupId: 'bench-zombies', objective: 'search', focusRule: 'nearest', coordinationRadiusMeters: 0 },
+            abilities: [{ id: 'basic-attack', name: '撕咬', type: 'physical', actionType: 'main', power: 0, modifier: 0, epCost: 0, minRangeMeters: 0, maxRangeMeters: 1.5, cooldownRounds: 0, targetCount: 1, aoe: false }],
+        };
+    });
+    return {
+        schema: 'vibe-combat-model/v3', worldLifeLevel: 'Ⅰ', contactEstablished: true, title: '基准测试 · 本能丧尸群 1 对 100', location: '基准测试场',
+        battlefield: { shape: 'circle', name: '基准测试场', radiusMeters: 36, center: { x: 0, y: 0 } },
+        zones: [{ id: 'field', name: '主战区', adjacent: [], capacity: 999 }], assetProfiles: [],
+        combatants: [hero, ...zombies],
+    };
+}
+
+async function runBenchmark() {
+    if (busy) return;
+    busy = true; setStatus('正在运行本地战斗基准测试（1 对 100）…', 'working'); render();
+    const startedAt = performance.now();
+    try {
+        const benchRepo = new BrowserCombatRepository();
+        const benchEngine = new CombatEngine(benchRepo);
+        const encounter = benchmarkEncounter();
+        const created = benchEngine.create({ seed: id('bench'), mode: 'auto', transient: true, storySessionId: 'benchmark', encounter });
+        const battle = benchRepo.get(created.id);
+        battle.__combatBenchmark = { spans: {} };
+        await benchEngine.start(battle);
+        const durationMs = Math.round((performance.now() - startedAt) * 10) / 10;
+        const spans = Object.entries(battle.__combatBenchmark?.spans || {}).map(([name, span]) => ({ name, ...span })).sort((a, b) => b.totalMs - a.totalMs);
+        benchmarkResult = {
+            format: 'battle-orb-benchmark', version: 1, ranAt: new Date().toISOString(), durationMs,
+            combatants: 101, rounds: battle.round, winner: battle.finalResult?.winner || battle.status,
+            eventCount: benchRepo.events(battle.id).length,
+            engineVersion: battle.rulesetVersion, seed: String(battle.seed || '').slice(0, 16),
+            spans: safeJson(spans, DEBUG_TRACE_VALUE_LIMIT),
+        };
+        recordDebug('benchmark_completed', benchmarkResult);
+        setStatus(`基准测试完成：${durationMs}ms · ${battle.round} 回合 · 胜者 ${benchmarkResult.winner}`, 'ok');
+        notify(`基准测试完成：${durationMs}ms（${battle.round} 回合，101 单位）`, 'success');
+        renderBenchmark();
+    } catch (error) {
+        recordDebug('benchmark_failed', { error: String(error?.message || error) });
+        notify(`基准测试失败：${error.message}`, 'error');
+    } finally { busy = false; render(); }
+}
+
+function renderBenchmark() {
+    const fold = $('#battle-orb-benchmark-fold');
+    if (!fold) return;
+    if (!benchmarkResult) { fold.hidden = true; fold.innerHTML = ''; return; }
+    fold.hidden = false;
+    const spans = Array.isArray(benchmarkResult.spans) ? benchmarkResult.spans : [];
+    const topSpans = spans.slice(0, 8).map(span => `<tr><td>${escapeHtml(span.name)}</td><td>${span.count}</td><td>${span.totalMs.toFixed(1)}</td><td>${span.maxMs.toFixed(1)}</td></tr>`).join('');
+    fold.innerHTML = `<details class="bo-fold" open><summary>基准测试：${benchmarkResult.durationMs}ms · ${benchmarkResult.rounds} 回合 · 101 单位</summary><div class="bo-bench-summary"><span>胜者 ${escapeHtml(benchmarkResult.winner)}</span><span>事件 ${benchmarkResult.eventCount}</span><span>引擎 ${escapeHtml(benchmarkResult.engineVersion)}</span><span>seed ${escapeHtml(benchmarkResult.seed)}</span></div><table class="bo-bench-table"><thead><tr><th>阶段</th><th>次数</th><th>总计 ms</th><th>峰值 ms</th></tr></thead><tbody>${topSpans || '<tr><td colspan="4">无阶段统计</td></tr>'}</tbody></table></details>`;
+}
+
+async function exportDebug() {
+    const state = publicBattle();
+    const payload = {
+        format: 'battle-orb-combat-debug', version: VERSION, exportedAt: new Date().toISOString(),
+        battleId: battle?.id || null,
+        page: { href: location.href, userAgent: navigator.userAgent, viewport: { width: innerWidth, height: innerHeight, devicePixelRatio } },
+        client: {
+            stage: currentStage(), state: safeJson(state, DEBUG_EXPORT_VALUE_LIMIT),
+            events: safeJson(repository?.events(battle?.id) || [], DEBUG_EXPORT_VALUE_LIMIT),
+            benchmark: safeJson(battle?.__combatBenchmark?.spans || {}, DEBUG_TRACE_VALUE_LIMIT),
+            benchmarkResult: safeJson(benchmarkResult, DEBUG_TRACE_VALUE_LIMIT),
+        },
+        llmTrace: safeJson(promptHistory, DEBUG_EXPORT_VALUE_LIMIT),
+        debugTrace: safeJson(debugTrace, DEBUG_EXPORT_VALUE_LIMIT),
+        settings: safeJson(settings, DEBUG_TRACE_VALUE_LIMIT),
+    };
+    const file = `战斗球-DEBUG-${battle?.id || 'idle'}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })); link.download = file; link.click(); URL.revokeObjectURL(link.href);
+    recordDebug('debug_exported', { battleId: battle?.id || null, traceCount: debugTrace.length, llmCount: promptHistory.length, file });
+    notify(`DEBUG 已导出：${debugTrace.length} 条记录 · ${promptHistory.length} 次 LLM 调用`, 'success');
 }
 
 function fallbackModel(input) {
@@ -448,7 +635,7 @@ async function superviseCombatModel(candidate, declaration, snapshot, maxRounds 
             revised = extractJsonObject(await generateRaw([
                 { role: 'system', content: MODEL_SUPERVISOR_SYSTEM },
                 { role: 'user', content: JSON.stringify({ declaration, mvu: snapshot?.mvu?.state, combatModel: current }, null, 2) },
-            ], 7000));
+            ], 7000, `战斗数据检查（第二段 · 第 ${round + 1} 轮）`));
         } catch (error) { setStatus(`战斗数据检查 AI 第 ${round + 1} 轮修正失败：${error.message}`, 'warn'); break; }
         if (!revised || typeof revised !== 'object') break;
         const normalized = mergeModel(revised, declaration);
@@ -473,10 +660,11 @@ async function recognize() {
         const content = tagged ? tagged : extractJsonObject(await generateRaw([
             { role: 'system', content: DECLARATION_SYSTEM },
             { role: 'user', content: JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}) }, null, 2) },
-        ], 2600));
+        ], 2600, '识别战场声明'));
         declaration = normalizeDeclaration(content);
         declarationValidation(declaration);
-        $('#battle-orb-declaration').value = JSON.stringify(declaration, null, 2);
+        const declarationBox = $('#battle-orb-declaration'); if (declarationBox) declarationBox.value = JSON.stringify(declaration, null, 2);
+        stageOverride = 'recognize';
         render();
         setStatus(tagged ? '已从当前楼层读取 BattleDeclaration' : '已由酒馆当前 AI 草拟战场声明', 'ok');
     } catch (error) { flowError = { step: 'recognize', message: error.message || '识别失败' }; notify(`识别战场失败：${error.message}`, 'error'); }
@@ -489,7 +677,8 @@ async function createBattle() {
         flowError = null;
         if (!declaration) await recognize();
         if (!declaration) return;
-        declaration = normalizeDeclaration(extractJsonObject($('#battle-orb-declaration').value));
+        const declarationBox = $('#battle-orb-declaration');
+        if (declarationBox) declaration = normalizeDeclaration(extractJsonObject(declarationBox.value));
         declarationValidation(declaration);
         busy = true; setStatus('正在用酒馆当前 AI 建立 CombatModel…', 'working'); render();
         tavernSnapshot ||= readTavern();
@@ -498,7 +687,7 @@ async function createBattle() {
             candidate = extractJsonObject(await generateRaw([
                 { role: 'system', content: MODEL_SYSTEM },
                 { role: 'user', content: JSON.stringify({ declaration, mvu: tavernSnapshot.mvu.state }, null, 2) },
-            ], 7000));
+            ], 7000, '战斗建模（第一段生成）'));
             setStatus('CombatModel 已生成，正在由战斗数据检查 AI 审查修正…', 'working'); render();
         } catch (error) { setStatus(`CombatModel 生成失败，改用本地安全默认模型：${error.message}`, 'warn'); }
         candidate = await superviseCombatModel(candidate, declaration, tavernSnapshot);
@@ -507,9 +696,12 @@ async function createBattle() {
         engine = new CombatEngine(repository);
         const created = engine.create({ seed: id('tavern'), mode: 'manual', storySessionId: tavernSnapshot.chatId, encounter: model, assetProfiles: model.assetProfiles || [], preparation: { declaration, source: 'tavern-injected' } });
         battle = repository.get(created.id);
+        battle.__combatBenchmark = { spans: {} };
         await engine.start(battle);
         repository.commit(battle);
         mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
+        stageOverride = null;
+        recordDebug('battle_created', { battleId: battle.id, combatants: model.combatants?.length || 0, title: model.title, ruleset: battle.rulesetVersion });
         setStatus('战场已创建；骰点、伤害、状态、位置和胜负由本地引擎裁定', 'ok');
         render();
     } catch (error) { flowError = { step: 'create', message: error.message || '创建失败' }; notify(`创建战场失败：${error.message}`, 'error'); }
@@ -527,6 +719,7 @@ async function execute(command) {
         mapIntent = null; mapMenu = null;
         const recentEvents = repository.events(battle.id).slice(-24);
         spawnAttackEffects(publicBattle(), recentEvents);
+        recordDebug('action_executed', { battleId: battle.id, type: command.type, round: publicBattle()?.round, status: publicBattle()?.status });
         const notice = actionNoticeFromEvents(recentEvents, publicBattle(), command.actorId, command.type);
         showActionNotice(notice);
         if (notice) setStatus(notice.text, notice.kind);
@@ -996,39 +1189,97 @@ function renderLedger(state) {
     node.innerHTML = events.length ? events.map(event => `<div><span>#${event.sequence}</span> ${escapeHtml(event.type)} <small>${escapeHtml(JSON.stringify(event.payload || {}).slice(0, 180))}</small></div>`).join('') : '<div class="bo-muted">暂无裁定事件</div>';
 }
 
-function renderSteps() {
-    const steps = [
-        ['read', 'battle-orb-sync', '①', '读取', '楼层 + MVU', Boolean(tavernSnapshot)],
-        ['recognize', 'battle-orb-recognize', '②', '识别', '战场声明', Boolean(declaration)],
-        ['create', 'battle-orb-create', '③', '创建战场', 'CombatModel', Boolean(publicBattle())],
+const STAGE_META = {
+    read: { label: '① 读取', hint: '读取当前楼层与 MVU，可选填识别提示' },
+    recognize: { label: '② 识别', hint: '识别或生成战场声明' },
+    create: { label: '③ 创建战场', hint: '主 AI 建模（两段式审查）并创建二维战场' },
+    combat: { label: '④ 战斗中', hint: '本地引擎权威裁定战斗' },
+    completed: { label: '⑤ 完成', hint: '回写主 AI 或发起新战斗' },
+};
+
+function currentStage() {
+    if (stageOverride) return stageOverride;
+    if (!tavernSnapshot) return 'read';
+    if (!declaration) return 'recognize';
+    if (!publicBattle()) return 'create';
+    return publicBattle().status === 'completed' ? 'completed' : 'combat';
+}
+
+function declarationSummaryMarkup(value) {
+    const declaration = value || {};
+    const participants = Array.isArray(declaration.participants) ? declaration.participants : [];
+    const battlefield = declaration.battlefield || {};
+    const players = participants.filter(item => item?.side === 'player');
+    const enemies = participants.filter(item => item?.side === 'enemy');
+    const rows = [
+        ['世界层级', String(declaration.worldLifeLevel || '—')],
+        ['战场', String(declaration.battlefield?.kind || battlefield.description || '—')],
+        ['玩家方', `${players.length} 名${players.reduce((sum, item) => sum + (Number(item.count) || 1), 0) > players.length ? `（合计 ${players.reduce((sum, item) => sum + (Number(item.count) || 1), 0)} 单位）` : ''}`],
+        ['敌方', `${enemies.length} 名${enemies.reduce((sum, item) => sum + (Number(item.count) || 1), 0) > enemies.length ? `（合计 ${enemies.reduce((sum, item) => sum + (Number(item.count) || 1), 0)} 单位）` : ''}`],
     ];
-    for (const [key, id, badge, label, hint, done] of steps) {
-        const button = $(`#${id}`);
-        if (!button) continue;
-        const failed = flowError?.step === key;
-        button.classList.toggle('done', done);
-        button.classList.toggle('failed', failed);
-        button.classList.toggle('active', !done && !failed && !busy && (key === 'read' || (key === 'recognize' && Boolean(tavernSnapshot)) || (key === 'create' && Boolean(declaration))));
-        button.disabled = busy || (key === 'create' && !declaration);
-        button.innerHTML = `<i>${failed ? '↻' : badge}</i><b>${failed ? '重试' : label}</b><small>${failed ? (flowError?.message || '') : hint}</small>`;
+    return `<section class="bo-decl-summary"><header><b>BattleDeclaration</b><small>${escapeHtml(declaration.reason || '待创建战场')}</small></header>${rows.map(([key, value]) => `<div><span>${key}</span><b>${escapeHtml(value)}</b></div>`).join('')}<small class="bo-decl-note">可在上一阶段继续修改声明。</small></section>`;
+}
+
+function stageMarkup(stage) {
+    if (stage === 'read') {
+        return `<p class="bo-muted">从当前酒馆楼层读取剧情与 MVU 状态，作为后续识别战场的依据。</p><label class="bo-hint-field"><span>识别提示（可选）</span><input id="battle-orb-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="敌人数量范围 / 规模 / 战术等额外提醒"></label><button id="battle-orb-sync" class="bo-primary" type="button">① 读取楼层与 MVU</button>`;
     }
+    if (stage === 'recognize') {
+        return `<div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div><button id="battle-orb-recognize" class="bo-primary" type="button">${declaration ? '重新识别 / 修正声明' : '② 识别 / 生成战场声明'}</button><section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="点击识别让主 AI 草拟，或直接粘贴已有声明"></textarea></section><button id="battle-orb-to-create" class="bo-secondary" type="button" ${declaration ? '' : 'disabled'}>下一步：创建战场 →</button>`;
+    }
+    if (stage === 'create') {
+        return `<div id="battle-orb-declaration-summary"></div><button id="battle-orb-create" class="bo-primary" type="button">③ 创建二维战场（两段式 AI 审查）</button><button id="battle-orb-back-recognize" class="bo-link" type="button">← 返回修改声明</button>`;
+    }
+    const state = publicBattle();
+    const completed = stage === 'completed';
+    return `<section id="battle-orb-field" class="bo-field"><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div>${completed ? `<button id="battle-orb-narrate" class="bo-primary" type="button">回写主 AI</button>` : ''}</header><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details>${completed ? `<div class="bo-completed-actions"><button id="battle-orb-new-battle" class="bo-secondary" type="button">发起新战斗</button><button id="battle-orb-tool-debug-inline" class="bo-secondary" type="button">导出 DEBUG</button></div>` : ''}</section>`;
+}
+
+function renderStage() {
+    const root = $('#battle-orb-stage');
+    if (!root) return;
+    const stage = currentStage();
+    const meta = STAGE_META[stage];
+    const label = $('#battle-orb-stage-label'); if (label) label.textContent = meta.label;
+    const hint = $('#battle-orb-stage-hint'); if (hint) hint.textContent = meta.hint;
+    if (stage !== lastStage) {
+        lastStage = stage;
+        root.innerHTML = stageMarkup(stage);
+    }
+    const state = publicBattle();
+    mapState = state;
+    if (stage === 'recognize') {
+        const floor = $('#battle-orb-floor');
+        if (floor) floor.textContent = tavernSnapshot ? `已读取 ${tavernSnapshot.messages.length} 楼 · MVU ${tavernSnapshot.mvu.applied} 条 Patch · ${tavernSnapshot.mvu.source}` : '尚未读取当前酒馆聊天';
+        const declarationBox = $('#battle-orb-declaration');
+        if (declarationBox && declaration && declarationBox !== document.activeElement) declarationBox.value = JSON.stringify(declaration, null, 2);
+        const nextButton = $('#battle-orb-to-create'); if (nextButton) nextButton.disabled = busy || !declaration;
+        const recognizeButton = $('#battle-orb-recognize'); if (recognizeButton) recognizeButton.disabled = busy;
+    } else if (stage === 'create') {
+        const summary = $('#battle-orb-declaration-summary');
+        if (summary) summary.innerHTML = declarationSummaryMarkup(declaration);
+        const createButton = $('#battle-orb-create'); if (createButton) createButton.disabled = busy;
+    } else {
+        const field = $('#battle-orb-field'); if (field) field.hidden = !state;
+        const narrateButton = $('#battle-orb-narrate'); if (narrateButton) narrateButton.disabled = busy || !state || state.status !== 'completed';
+        const metaBox = $('#battle-orb-battle-meta');
+        if (metaBox && state) metaBox.textContent = `${state.title || '遭遇'} · ${state.status} · seed ${String(state.seed || '').slice(0, 12)}`;
+        renderTurn(state); renderLedger(state); renderBattlefield(state);
+    }
+    renderBenchmark();
 }
 
 function render() {
-    const floor = $('#battle-orb-floor');
-    if (floor) floor.textContent = tavernSnapshot ? `已读取 ${tavernSnapshot.messages.length} 楼 · MVU ${tavernSnapshot.mvu.applied} 条 Patch · ${tavernSnapshot.mvu.source}` : '尚未读取当前酒馆聊天';
-    const mvu = $('#battle-orb-mvu');
-    if (mvu) mvu.textContent = tavernSnapshot ? JSON.stringify(tavernSnapshot.mvu.state, null, 2) : '同步后显示';
-    const declarationBox = $('#battle-orb-declaration');
-    if (declarationBox && declaration && declarationBox !== document.activeElement) declarationBox.value = JSON.stringify(declaration, null, 2);
-    const state = publicBattle();
-    mapState = state;
-    const field = $('#battle-orb-field'); if (field) field.hidden = !state;
-    const narrateButton = $('#battle-orb-narrate'); if (narrateButton) narrateButton.disabled = busy || !state || state.status !== 'completed';
-    const meta = $('#battle-orb-battle-meta');
-    if (meta && state) meta.textContent = `${state.title || '遭遇'} · ${state.status} · seed ${String(state.seed || '').slice(0, 12)}`;
-    renderTurn(state); renderLedger(state); renderBattlefield(state);
-    renderSteps();
+    const status = $('#battle-orb-status');
+    if (status) status.dataset.kind = setStatusLastKind || '';
+    renderStage();
+}
+
+let setStatusLastKind = '';
+function setStatus(message, kind = 'info') {
+    const node = $('#battle-orb-status');
+    setStatusLastKind = kind;
+    if (node) { node.textContent = String(message || ''); node.dataset.kind = kind; }
 }
 
 function assistantName() {
@@ -1096,7 +1347,7 @@ async function narrate() {
             prose = String(await generateRaw([
                 { role: 'system', content: '你是酒馆主 AI 的战后叙事融合器。只能依据本地 BATTLE_RESULT_DSL 写中文剧情，不能改写命中、伤害、位置、伤亡、胜负或 MVU Patch；只输出正文，不要 JSON、不要分析。' },
                 { role: 'user', content: `战前最近剧情：\n${JSON.stringify(recent)}\n\n本地权威战报：\n${dsl}` },
-            ], 6000)).replace(/<UpdateVariable>[\s\S]*?<\/UpdateVariable>/gi, '').trim();
+            ], 6000, '战后剧情创作')).replace(/<UpdateVariable>[\s\S]*?<\/UpdateVariable>/gi, '').trim();
         } catch (error) {
             prose = `本地战斗在第 ${final.rounds || state.round || 0} 回合完成。胜者：${final.winner === 'player' ? '玩家方' : final.winner === 'enemy' ? '敌方' : '未决'}。正文 AI 暂不可用，本楼保留本地权威战报与 MVU 更新。`;
             setStatus(`正文 AI 暂不可用，使用本地战报模板回写：${error.message}`, 'warn');
@@ -1178,24 +1429,104 @@ async function handleMapClick(event) {
     return true;
 }
 
+function renderSettingsFold() {
+    const fold = $('#battle-orb-settings-fold');
+    if (!fold) return;
+    const floorInfo = tavernSnapshot ? `<div id="battle-orb-floor" class="bo-floor">已读取 ${tavernSnapshot.messages.length} 楼 · MVU ${tavernSnapshot.mvu.applied} 条 Patch · ${tavernSnapshot.mvu.source}</div>` : '<div class="bo-floor">尚未读取楼层</div>';
+    fold.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示与判断依据设置已持久化到浏览器本地。</p>`;
+    const mvu = fold.querySelector('#battle-orb-mvu');
+    if (mvu) mvu.textContent = tavernSnapshot ? JSON.stringify(tavernSnapshot.mvu.state, null, 2) : '同步后显示';
+}
+
+function renderPromptsFold() {
+    const fold = $('#battle-orb-prompts-fold');
+    if (!fold) return;
+    const entries = promptHistory.length ? [...promptHistory].reverse().map(entry => {
+        const messages = Array.isArray(entry.messages) ? entry.messages.map(message => `<div class="bo-prompt-msg"><b>${escapeHtml(message.role || '')}</b><pre>${escapeHtml(String(message.content || '').slice(0, 3000))}</pre></div>`).join('') : '';
+        const response = entry.ok ? `<details class="bo-fold"><summary>模型返回（${entry.durationMs ?? '—'}ms）</summary><pre>${escapeHtml(String(entry.response?.preview ?? JSON.stringify(entry.response) ?? '')).slice(0, 4000)}</pre></details>` : `<span class="bo-prompt-error">${escapeHtml(entry.error || '失败')}</span>`;
+        return `<article class="bo-prompt-entry"><header><b>${escapeHtml(entry.stage || 'LLM 调用')}</b><small>${escapeHtml(entry.at)} · ${entry.durationMs ?? '—'}ms · ${entry.ok ? '成功' : '失败'}</small></header>${messages}${response}</article>`;
+    }).join('') : '<p class="bo-muted">暂无 LLM 调用记录。识别 / 创建战场 / 回写都会记录完整提示词。</p>';
+    fold.innerHTML = `<div class="bo-prompts-head"><b>工作阶段提示词</b><small>识别、建模（两段式）、战后剧情都会记录可查</small></div><div class="bo-prompts-list">${entries}</div><button id="battle-orb-export-prompts" class="bo-secondary" type="button">导出 Prompt 追踪 JSON</button>`;
+}
+
+function exportPromptTrace() {
+    const payload = { format: 'battle-orb-prompt-trace', version: 1, exportedAt: new Date().toISOString(), battleId: battle?.id || null, stage: currentStage(), llmTrace: safeJson(promptHistory, DEBUG_EXPORT_VALUE_LIMIT) };
+    const file = `战斗球-PromptTrace-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })); link.download = file; link.click(); URL.revokeObjectURL(link.href);
+    notify(`Prompt 追踪已导出：${promptHistory.length} 条`, 'success');
+}
+
+function startNewBattle() {
+    battle = null; engine = null; repository = null; model = null; declaration = null; tavernSnapshot = null;
+    mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; actionNotice = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
+    flowError = null; stageOverride = 'read'; lastStage = null;
+    setStatus('已重置；从读取阶段开始新战斗', 'ok');
+    render();
+}
+
 function bindPanel() {
-    $('#battle-orb-sync')?.addEventListener('click', async () => {
-        flowError = null;
-        try {
-            tavernSnapshot = readTavern();
-            await refreshTavernFromGlobals();
-            const found = battleDeclarationFromFloor();
-            if (found) declaration = normalizeDeclaration(found);
-            render();
-            setStatus(`已读取 ${tavernSnapshot.messages.length} 楼与 ${tavernSnapshot.mvu.applied} 条 MVU Patch（${tavernSnapshot.mvu.source}）`, 'ok');
-        } catch (error) { flowError = { step: 'read', message: error.message || '读取失败' }; notify(`读取失败：${error.message}`, 'error'); render(); }
+    document.addEventListener('click', event => {
+        const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-new-battle, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts');
+        if (!target) return;
+        if (target.id === 'battle-orb-sync') {
+            flowError = null;
+            try {
+                tavernSnapshot = readTavern();
+                void refreshTavernFromGlobals();
+                const found = battleDeclarationFromFloor();
+                if (found) declaration = normalizeDeclaration(found);
+                stageOverride = null;
+                render();
+                setStatus(`已读取 ${tavernSnapshot.messages.length} 楼与 ${tavernSnapshot.mvu.applied} 条 MVU Patch（${tavernSnapshot.mvu.source}）`, 'ok');
+            } catch (error) { flowError = { step: 'read', message: error.message || '读取失败' }; notify(`读取失败：${error.message}`, 'error'); render(); }
+            return;
+        }
+        if (target.id === 'battle-orb-recognize') { void recognize(); return; }
+        if (target.id === 'battle-orb-create') { void createBattle(); return; }
+        if (target.id === 'battle-orb-narrate') { void narrate(); return; }
+        if (target.id === 'battle-orb-to-create') { stageOverride = 'create'; render(); return; }
+        if (target.id === 'battle-orb-back-recognize') { stageOverride = 'recognize'; render(); return; }
+        if (target.id === 'battle-orb-new-battle') { startNewBattle(); return; }
+        if (target.id === 'battle-orb-tool-debug-inline' || target.id === 'battle-orb-export-prompts') {
+            if (target.id === 'battle-orb-export-prompts') exportPromptTrace();
+            else void exportDebug();
+            return;
+        }
+        if (target.id === 'battle-orb-reset-fab') {
+            const fab = document.getElementById(FAB_ID);
+            if (fab) { fab.style.right = '22px'; fab.style.bottom = '22px'; fab.style.left = 'auto'; fab.style.top = 'auto'; }
+            try { localStorage.removeItem('battle-orb.fab-pos'); } catch {}
+            setStatus('悬浮球位置已重置', 'ok');
+            return;
+        }
     });
-    $('#battle-orb-recognize')?.addEventListener('click', () => void recognize());
-    $('#battle-orb-create')?.addEventListener('click', () => void createBattle());
-    $('#battle-orb-narrate')?.addEventListener('click', () => void narrate());
-    $('#battle-orb-write-verdict')?.addEventListener('change', event => { settings.writeVerdictBasis = Boolean(event.target.checked); saveSettings(); setStatus(settings.writeVerdictBasis ? '判断依据回写正文：战斗记录正式插入楼层后再创作剧情' : '只写回剧情：仅把剧情写回楼层', 'ok'); });
-    $('#battle-orb-recognize-hint')?.addEventListener('input', event => { settings.recognizeHint = String(event.target.value || '').trim(); saveSettings(); });
-    $('#battle-orb-declaration')?.addEventListener('input', event => { try { declaration = normalizeDeclaration(JSON.parse(event.target.value)); } catch { declaration = null; } render(); });
+    document.addEventListener('click', event => {
+        const toggle = event.target.closest('#battle-orb-tool-settings, #battle-orb-tool-prompts');
+        if (!toggle) return;
+        const settingsFold = $('#battle-orb-settings-fold');
+        const promptsFold = $('#battle-orb-prompts-fold');
+        if (toggle.id === 'battle-orb-tool-settings') {
+            const next = settingsFold.hidden;
+            settingsFold.hidden = !next;
+            if (next) renderSettingsFold();
+            if (!next) promptsFold.hidden = true;
+        } else {
+            const next = promptsFold.hidden;
+            promptsFold.hidden = !next;
+            if (next) renderPromptsFold();
+            if (!next) settingsFold.hidden = true;
+        }
+    });
+    document.addEventListener('click', event => {
+        if (event.target.closest('#battle-orb-tool-debug')) void exportDebug();
+        else if (event.target.closest('#battle-orb-tool-bench')) void runBenchmark();
+        else if (event.target.closest('#battle-orb-llm-cancel')) llmCancel();
+    });
+    document.addEventListener('input', event => {
+        if (event.target.id === 'battle-orb-recognize-hint') { settings.recognizeHint = String(event.target.value || '').trim(); saveSettings(); return; }
+        if (event.target.id === 'battle-orb-declaration') { try { declaration = normalizeDeclaration(JSON.parse(event.target.value)); } catch { declaration = null; } render(); return; }
+        if (event.target.id === 'battle-orb-write-verdict') { settings.writeVerdictBasis = Boolean(event.target.checked); saveSettings(); setStatus(settings.writeVerdictBasis ? '判断依据回写正文：战斗记录正式插入楼层后再创作剧情' : '只写回剧情：仅把剧情写回楼层', 'ok'); return; }
+    });
     document.addEventListener('click', async event => {
         const action = event.target.closest('[data-action]')?.dataset.action;
         if (event.target.closest('#battle-orb-map')) { if (await handleMapClick(event)) return; }
@@ -1265,20 +1596,28 @@ function mount() {
     const root = document.createElement('div'); root.id = ROOT_ID; root.innerHTML = `
       <button id="${FAB_ID}" type="button" title="Battle Orb ${VERSION}">⚔</button>
       <section id="${PANEL_ID}">
-        <header id="battle-orb-head" class="bo-header"><div><small>BATTLE ORB · TAVERN NATIVE</small><h2>战斗球</h2><p>直接读取当前酒馆楼层与 MVU；本地裁定战斗；战报回写主 AI。</p></div><button id="battle-orb-close" class="bo-close">×</button></header>
-        <div id="battle-orb-body" class="bo-body">
-          <div class="bo-steps">
-            <button id="battle-orb-sync" class="bo-step" type="button"><i>①</i><b>读取</b><small>楼层 + MVU</small></button>
-            <button id="battle-orb-recognize" class="bo-step" type="button"><i>②</i><b>识别</b><small>战场声明</small></button>
-            <button id="battle-orb-create" class="bo-step" type="button"><i>③</i><b>创建战场</b><small>CombatModel</small></button>
+        <header id="battle-orb-head" class="bo-header">
+          <div><small>BATTLE ORB · TAVERN NATIVE</small><h2>战斗球 <span id="battle-orb-stage-label" class="bo-stage-label">① 读取</span></h2><p id="battle-orb-stage-hint" class="bo-stage-hint">读取当前楼层与 MVU，可选填识别提示</p></div>
+          <div class="bo-tools">
+            <button id="battle-orb-tool-settings" class="bo-tool" type="button" title="设置">⚙</button>
+            <button id="battle-orb-tool-prompts" class="bo-tool" type="button" title="提示词">◈</button>
+            <button id="battle-orb-tool-debug" class="bo-tool" type="button" title="导出 DEBUG">⭳</button>
+            <button id="battle-orb-tool-bench" class="bo-tool" type="button" title="基准测试">⚡</button>
+            <button id="battle-orb-close" class="bo-close" type="button">×</button>
           </div>
-          <label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label>
-          <label class="bo-hint-field"><span>识别提示（可选）</span><input id="battle-orb-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="敌人数量范围 / 规模 / 战术等额外提醒"></label>
-          <div id="battle-orb-status" class="bo-status">准备就绪：点击“读取”</div>
-          <div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div>
-          <details class="bo-fold"><summary>当前 MVU 快照</summary><pre id="battle-orb-mvu">同步后显示</pre></details>
-          <section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="从当前楼层读取，或点击识别让主 AI 草拟"></textarea></section>
-          <section id="battle-orb-field" class="bo-field" hidden><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div><button id="battle-orb-narrate" disabled>战斗完成后回写主 AI</button></header><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details></section>
+        </header>
+        <div id="battle-orb-llm-bar" class="bo-llm-bar" hidden>
+          <span id="battle-orb-llm-label" class="bo-llm-label">LLM 调用中…</span>
+          <div class="bo-llm-track"><div class="bo-llm-fill"></div></div>
+          <span id="battle-orb-llm-time" class="bo-llm-time">00:00</span>
+          <button id="battle-orb-llm-cancel" class="bo-llm-cancel" type="button">取消</button>
+        </div>
+        <div id="battle-orb-body" class="bo-body">
+          <div id="battle-orb-status" class="bo-status">准备就绪：点击“① 读取楼层与 MVU”</div>
+          <section id="battle-orb-stage" class="bo-stage"></section>
+          <section id="battle-orb-settings-fold" class="bo-fold-panel" hidden></section>
+          <section id="battle-orb-prompts-fold" class="bo-fold-panel" hidden></section>
+          <section id="battle-orb-benchmark-fold" class="bo-fold-panel" hidden></section>
         </div>
       </section>`;
     document.body.append(root);
@@ -1294,9 +1633,7 @@ function mount() {
     restoreFloatingPosition('panel', panel);
     installFloatingClampListeners([['fab', fab], ['panel', panel]]);
     bindPanel();
-    tavernSnapshot = readTavern();
-    void refreshTavernFromGlobals();
-    const found = battleDeclarationFromFloor(); if (found) declaration = normalizeDeclaration(found);
+    stageOverride = 'read';
     render();
     try {
         const ctx = activeContext();
@@ -1304,7 +1641,7 @@ function mount() {
             tavernSnapshot = readTavern();
             void refreshTavernFromGlobals();
             const foundDeclaration = battleDeclarationFromFloor();
-            if (foundDeclaration) { declaration = normalizeDeclaration(foundDeclaration); openFloatingPanel(panel); setStatus('检测到正文 AI 的 BattleDeclaration，可开始本地战斗', 'ok'); render(); }
+            if (foundDeclaration) { declaration = normalizeDeclaration(foundDeclaration); stageOverride = null; openFloatingPanel(panel); setStatus('检测到正文 AI 的 BattleDeclaration，可开始本地战斗', 'ok'); render(); }
         });
         ctx.eventSource?.on?.(ctx.eventTypes?.CHAT_CHANGED, () => { tavernSnapshot = readTavern(); void refreshTavernFromGlobals(); const foundDeclaration = battleDeclarationFromFloor(); if (foundDeclaration) declaration = normalizeDeclaration(foundDeclaration); render(); });
     } catch (error) { console.warn('[Battle Orb] 酒馆事件监听安装失败', error); }
