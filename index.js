@@ -1,4 +1,4 @@
-const VERSION = '0.7.3';
+const VERSION = '0.7.4';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -54,9 +54,9 @@ let busy = false;
 let mounted = false;
 
 const SETTINGS_KEY = 'battle-orb.settings';
-let settings = { writeVerdictBasis: true, recognizeHint: '', fastModeling: false, rollbackModeling: false };
+let settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false };
 let flowError = null;
-try { settings = { writeVerdictBasis: true, recognizeHint: '', fastModeling: false, rollbackModeling: false, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { /* keep defaults */ }
+try { settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { /* keep defaults */ }
 const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} };
 
 let stageOverride = null;
@@ -874,7 +874,7 @@ async function superviseCombatModel(candidate, declaration, snapshot, maxRounds 
         try {
             const raw = await generateRaw([
                 { role: 'system', content: MODEL_SUPERVISOR_SYSTEM },
-                { role: 'user', content: JSON.stringify({ declaration, combatModel: current }, null, 2) },
+                { role: 'user', content: JSON.stringify({ declaration, combatModel: current, ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2) },
             ], 5000, `战斗数据审查（第二段 · 第 ${round + 1} 轮）`);
             const parsed = extractJsonObject(raw);
             suggestions = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
@@ -905,7 +905,7 @@ async function recognize() {
         const tagged = battleDeclarationFromFloor();
         const content = tagged ? tagged : extractJsonObject(await generateRaw([
             { role: 'system', content: DECLARATION_SYSTEM },
-            { role: 'user', content: JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}) }, null, 2) },
+            { role: 'user', content: JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2) },
         ], 2600, '识别战场声明'));
         declaration = normalizeDeclaration(content);
         declarationValidation(declaration);
@@ -937,6 +937,7 @@ async function createBattle() {
             try {
                 const userPayload = { declaration, mvu: tavernSnapshot.mvu.state };
                 if (attempt > 0 && fatalErrors.length) userPayload.repairErrors = fatalErrors;
+                if (String(settings.unitHint || '').trim()) userPayload.unitHint = String(settings.unitHint).trim();
                 candidate = extractJsonObject(await generateRaw([
                     { role: 'system', content: MODEL_SYSTEM },
                     { role: 'user', content: JSON.stringify(userPayload, null, 2) },
@@ -1519,7 +1520,7 @@ function stageMarkup(stage) {
         return `<p class="bo-muted">从当前酒馆楼层读取剧情与 MVU 状态，作为后续识别战场的依据。</p><label class="bo-hint-field"><span>识别提示（可选）</span><input id="battle-orb-recognize-hint" type="text" value="${escapeHtml(settings.recognizeHint || '')}" placeholder="敌人数量范围 / 规模 / 战术等额外提醒"></label><button id="battle-orb-sync" class="bo-primary" type="button">① 读取楼层与 MVU</button>`;
     }
     if (stage === 'recognize') {
-        return `<div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div><button id="battle-orb-recognize" class="bo-primary" type="button">${declaration ? '重新识别 / 修正声明' : '② 识别 / 生成战场声明'}</button><section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="点击识别让主 AI 草拟，或直接粘贴已有声明"></textarea></section><button id="battle-orb-to-create" class="bo-secondary" type="button" ${declaration ? '' : 'disabled'}>下一步：创建战场 →</button>`;
+        return `<div id="battle-orb-floor" class="bo-floor">尚未读取当前酒馆聊天</div><button id="battle-orb-recognize" class="bo-primary" type="button">${declaration ? '重新识别 / 修正声明' : '② 识别 / 生成战场声明'}</button><label class="bo-hint-field"><span>单位修正提示（可选）</span><textarea id="battle-orb-unit-hint" spellcheck="false" placeholder="针对单位给出修正，例如：给玩家加一个测试技能（如“测试圣光”）、调整敌方数量/规模/战术等。会随声明识别与战斗建模一起传给 AI。">${escapeHtml(settings.unitHint || '')}</textarea></label><section class="bo-declaration"><header><b>BattleDeclaration</b><small>可人工修正后创建</small></header><textarea id="battle-orb-declaration" spellcheck="false" placeholder="点击识别让主 AI 草拟，或直接粘贴已有声明"></textarea></section><button id="battle-orb-to-create" class="bo-secondary" type="button" ${declaration ? '' : 'disabled'}>下一步：创建战场 →</button>`;
     }
     if (stage === 'create') {
         return `<div id="battle-orb-declaration-summary"></div><button id="battle-orb-create" class="bo-primary" type="button">③ 创建二维战场</button><button id="battle-orb-back-recognize" class="bo-link" type="button">← 返回修改声明</button>`;
@@ -1813,6 +1814,13 @@ function startNewBattle() {
     render();
 }
 
+// 右上角重置按钮：确认后清空当前流程并返回阶段 1（① 读取）。
+function resetToStageOne() {
+    const inProgress = Boolean(publicBattle() || declaration);
+    if (inProgress && !globalThis.confirm('确定重置并返回阶段 1（① 读取）？当前战斗与声明将被清空。')) return;
+    startNewBattle();
+}
+
 function bindPanel() {
     document.addEventListener('click', event => {
         const target = event.target.closest('#battle-orb-sync, #battle-orb-recognize, #battle-orb-create, #battle-orb-narrate, #battle-orb-to-create, #battle-orb-back-recognize, #battle-orb-new-battle, #battle-orb-approve-abandon, #battle-orb-tool-debug-inline, #battle-orb-reset-fab, #battle-orb-export-prompts');
@@ -1867,6 +1875,7 @@ function bindPanel() {
         const back = event.target.closest('#battle-orb-view-back-settings, #battle-orb-view-back-prompts, #battle-orb-view-back-bench');
         if (back) { setView('stage'); return; }
         if (event.target.closest('#battle-orb-tool-debug')) { void exportDebug(); return; }
+        if (event.target.closest('#battle-orb-tool-reset')) { resetToStageOne(); return; }
         if (event.target.closest('#battle-orb-llm-cancel')) { llmCancel(); return; }
         if (event.target.closest('#battle-orb-tool-bench-inline')) { void runBenchmark(); return; }
     });
@@ -1907,6 +1916,7 @@ function bindPanel() {
     });
     document.addEventListener('input', event => {
         if (event.target.id === 'battle-orb-recognize-hint') { settings.recognizeHint = String(event.target.value || '').trim(); saveSettings(); return; }
+        if (event.target.id === 'battle-orb-unit-hint') { settings.unitHint = String(event.target.value || '').trim(); saveSettings(); return; }
         if (event.target.id === 'battle-orb-declaration') { try { declaration = normalizeDeclaration(JSON.parse(event.target.value)); } catch { declaration = null; } render(); return; }
         if (event.target.id === 'battle-orb-write-verdict') { settings.writeVerdictBasis = Boolean(event.target.checked); saveSettings(); setStatus(settings.writeVerdictBasis ? '判断依据回写正文：战斗记录正式插入楼层后再创作剧情' : '只写回剧情：仅把剧情写回楼层', 'ok'); return; }
         if (event.target.id === 'battle-orb-fast-modeling') { settings.fastModeling = Boolean(event.target.checked); saveSettings(); setStatus(settings.fastModeling ? '急速模式：创建战场时将跳过二阶段检查' : '已关闭急速模式，恢复两段式审查', 'ok'); return; }
@@ -1992,6 +2002,7 @@ function mount() {
             <button id="battle-orb-tool-prompts" class="bo-tool" type="button" title="提示词">◈</button>
             <button id="battle-orb-tool-debug" class="bo-tool" type="button" title="导出 DEBUG">⭳</button>
             <button id="battle-orb-tool-bench" class="bo-tool" type="button" title="基准测试">⚡</button>
+            <button id="battle-orb-tool-reset" class="bo-tool" type="button" title="重置并返回阶段 1">↺</button>
             <button id="battle-orb-close" class="bo-close" type="button">×</button>
           </div>
         </header>
