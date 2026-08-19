@@ -1,4 +1,4 @@
-const VERSION = '0.24.0';
+const VERSION = '0.24.1';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -807,6 +807,9 @@ function isTransientLlmError(error) {
     if (/已取消/.test(message)) return false;
     return NETWORK_TRANSIENT_RE.test(message);
 }
+function isNetworkDownError(error) {
+    return Boolean(error && error.isNetworkDown === true);
+}
 function networkRetryLimit() {
     return Math.max(2, Math.min(20, Number(settings.networkRetries) || 6));
 }
@@ -824,6 +827,7 @@ async function generateRaw(messages, responseLength = 4000, label = 'LLM 调用'
     const attempts = networkRetryLimit();
     const startedAt = performance.now();
     let lastFailure = null;
+    let networkWarned = false;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
         try {
             let response;
@@ -843,6 +847,10 @@ async function generateRaw(messages, responseLength = 4000, label = 'LLM 调用'
             if (attempt < attempts - 1 && isTransientLlmError(error)) {
                 const delayMs = llmRetryDelayMs(attempt, error);
                 recordDebug('llm_retry', { stage: label, attempt: attempt + 1, remaining: attempts - attempt - 1, delayMs, error: String(error.message || error) });
+                if (!networkWarned) {
+                    networkWarned = true;
+                    notify(`工作 API 渠道异常（${String(error.message || error).slice(0, 160)}）— 正在自动重试（第 ${attempt + 2}/${attempts} 次），若持续不可用将中止本次流程`, 'error');
+                }
                 setStatus(`${label}：网络波动（${String(error.message || error).slice(0, 140)}），${delayMs}ms 后自动重试（第 ${attempt + 2}/${attempts} 次）…`, 'warn'); render();
                 await sleep(delayMs);
                 if (autoCancelRequested) throw new Error('LLM 任务已取消');
@@ -855,7 +863,11 @@ async function generateRaw(messages, responseLength = 4000, label = 'LLM 调用'
     const failure = lastFailure || new Error(`${label}失败`);
     recordPrompt(label, messages, { ok: false, error: failure?.message || null, durationMs });
     recordDebug('llm_call', { stage: label, ok: false, durationMs, error: failure?.message || null, messageCount: Array.isArray(messages) ? messages.length : 0 });
-    if (isTransientLlmError(failure)) throw new Error(`${label}：网络持续异常，已自动重试 ${attempts - 1} 次仍失败 — ${failure.message}`);
+    if (isTransientLlmError(failure)) {
+        const down = new Error(`${label}：工作 API 渠道持续异常（服务不可用），已自动重试 ${attempts - 1} 次仍失败 — ${failure.message}。已中止本次流程，请确认渠道/网络恢复后重试。`);
+        down.isNetworkDown = true;
+        throw down;
+    }
     throw failure;
 }
 
@@ -1255,7 +1267,7 @@ async function superviseCombatModel(candidate, declaration, snapshot, maxRounds 
             const parsed = extractJsonObject(raw);
             suggestions = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
         } catch (error) {
-            if (String(error?.message || '').includes('已取消')) throw error;
+            if (String(error?.message || '').includes('已取消') || isNetworkDownError(error)) throw error;
             setStatus(`战斗数据审查第 ${round + 1} 轮失败：${error.message}`, 'warn');
             return { model: current, phase2Failed: true };
         }
@@ -1287,7 +1299,7 @@ async function withRetry(fn, label) {
     for (let attempt = 0; attempt < limit; attempt += 1) {
         try { return await fn(attempt); }
         catch (error) {
-            if (String(error?.message || '').includes('已取消')) throw error;
+            if (String(error?.message || '').includes('已取消') || isNetworkDownError(error)) throw error;
             lastError = error;
             if (attempt < limit - 1) {
                 const delayMs = Math.round(Math.min(600 * Math.pow(2, attempt), 8000) * (0.75 + Math.random() * 0.5));
@@ -1375,7 +1387,7 @@ async function createBattleCore() {
                 recordDebug('modeling_phase1_fatal_errors', { attempt, errors: fatalErrors });
                 setStatus(`第一段建模存在致命错误（第 ${attempt + 1} 次修复请求）：${fatalErrors.join('；')}`, 'warn'); render();
             } catch (error) {
-                if (String(error?.message || '').includes('已取消')) throw error;
+                if (String(error?.message || '').includes('已取消') || isNetworkDownError(error)) throw error;
                 recordDebug('modeling_phase1_generation_error', { attempt, error: String(error.message || error) });
                 setStatus(`CombatModel 第 ${attempt + 1}/${attempts} 次生成失败：${error.message}`, 'warn'); render();
                 if (attempt < attempts - 1) continue;
@@ -1500,6 +1512,7 @@ async function runFullAuto() {
                 return;
             } catch (error) {
                 if (isAutoCancelledError(error)) throw error;
+                if (isNetworkDownError(error)) throw error;
                 lastError = error;
                 recordDebug('full_auto_attempt_error', { attempt, step: autoState.step, error: String(error.message || error) });
                 if (attempt < limit - 1) {
