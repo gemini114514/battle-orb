@@ -2,6 +2,10 @@ import { sha256, RULESET_VERSION } from './util.js';
 
 const MAX_SOURCE = 64 * 1024;
 const MAX_EFFECTS = 64;
+// 单次脚本执行的挂钟上限。不能设太小：QuickJS 首跑需冷启动编译，且脚本输入会包含整场
+// combatants（数百单位时序列化 + 解析可能超过 25ms），过紧会被误判为 interrupted 中止，
+// 导致半自动/全自动“啥也没做就报错”。250ms 仍能挡住死循环，但不会误杀正常脚本。
+const SCRIPT_EXECUTION_MS = 250;
 let quickJsPromise;
 let browserBundlePromise;
 
@@ -43,7 +47,7 @@ export function inspectScript(source, ability = {}) {
     if (forbidden.test(text)) throw new Error('脚本请求了沙箱禁止能力');
     const apiNames = ['state', 'distance', 'unitsInArea', 'd100', 'd', 'attack', 'damage', 'heal', 'status', 'dispel', 'move', 'push', 'resource', 'modify', 'summon', 'check', 'lock', 'log', 'event'];
     const capabilities = [...new Set([...text.matchAll(/api\.([a-zA-Z]+)\s*\(/g)].map(match => match[1]).filter(name => apiNames.includes(name)))];
-    return { hash: scriptHash(text), rulesetVersion: RULESET_VERSION, ability: { id: ability.id, name: ability.name }, source: text, size: textSize, capabilities, limits: { executionMs: 25, memoryMb: 16, maxEffects: MAX_EFFECTS, triggerDepth: 8 } };
+    return { hash: scriptHash(text), rulesetVersion: RULESET_VERSION, ability: { id: ability.id, name: ability.name }, source: text, size: textSize, capabilities, limits: { executionMs: SCRIPT_EXECUTION_MS, memoryMb: 16, maxEffects: MAX_EFFECTS, triggerDepth: 8 } };
 }
 
 function seededRandom(seedText) {
@@ -66,7 +70,7 @@ export async function runScript(source, input) {
     const runtime = QuickJS.newRuntime();
     runtime.setMemoryLimit(16 * 1024 * 1024);
     runtime.setMaxStackSize(512 * 1024);
-    const deadline = Date.now() + 25;
+    const deadline = Date.now() + SCRIPT_EXECUTION_MS;
     runtime.setInterruptHandler(() => Date.now() > deadline);
     const vm = runtime.newContext();
     try {

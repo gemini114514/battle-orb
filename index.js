@@ -1,4 +1,4 @@
-const VERSION = '0.24.3';
+const VERSION = '0.24.4';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -68,6 +68,9 @@ let actionNotice = null;
 let actionNoticeTimer = null;
 // 2D 战斗界面行动选项区默认折叠（敌人×技能按钮会指数级膨胀）；展开/折叠状态在重绘间保留。
 let turnOptionsOpen = false;
+// 战斗中为本回合单位临时选择的策略预设（半自动/全自动按钮上方的下拉）。单位 id -> 预设 id
+// 或 'inherit'（跟随部署阶段确认的全局策略）。仅影响本场战斗本单位的自动演算。
+let turnStrategyByUnit = {};
 const forcedUnitIds = new Set();
 let attackEffects = [];
 let combatEffectFrame = 0;
@@ -2190,6 +2193,28 @@ function renderBattlefield(state) {
     });
 }
 
+// 战斗内半自动/全自动的策略下拉：把选定预设作为当前单位的临时指派（覆盖部署阶段的全局策略）。
+// 生效于 engine.strategyFor —— 半自动/全自动演算与本单位自动暂停判定都会读到它。
+function turnStrategyOptionMarkup(actorId) {
+    const current = turnStrategyByUnit[String(actorId)] || 'inherit';
+    const options = [['inherit', '跟随部署策略'], ...Object.entries(COMBAT_STRATEGY_PRESETS).map(([id, preset]) => [id, preset.label])];
+    return `<select class="bo-turn-strategy-select" data-bo-turn-strategy="${escapeHtml(actorId)}" ${busy ? 'disabled' : ''}>${options.map(([id, label]) => `<option value="${id}" ${current === id ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select>`;
+}
+
+function strategyBehaviorMarkup(strategy) {
+    const compiled = strategy || {};
+    const rows = [
+        ['目标优先级', (compiled.priorities || []).join(' → ')],
+        ['EP 保留', `${compiled.preserveEpPercent}%`],
+        ['拉扯/退避', compiled.retreat ? '是' : '否'],
+        ['潜行', compiled.stealth ? '是' : '否'],
+        ['游击分割', compiled.guerrilla ? '是' : '否'],
+        ['反应策略', compiled.reactionPolicy === 'conserve' ? '保留' : '自动'],
+    ];
+    if ((compiled.takeoverTriggers || []).length) rows.push(['接管阈值', compiled.takeoverTriggers.map(t => `${t.field} ${t.operator} ${t.value}`).join('；')]);
+    return `<dl>${rows.map(([key, value]) => `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(String(value))}</dd>`).join('')}</dl>`;
+}
+
 function renderTurn(state) {
     const root = $('#battle-orb-turn'); if (!root) return;
     const actor = state?.combatants?.find(unit => unit.id === state.activeUnitId);
@@ -2206,7 +2231,15 @@ function renderTurn(state) {
     const completed = state.status === 'completed';
     const disabled = busy || completed ? 'disabled' : '';
     const optionsBody = `<div class="bo-action-grid">${actionButtons || '<span class="bo-muted">当前没有可选攻击目标</span>'}</div><div class="bo-action-grid">${manualGrid}</div>${reactionButtons ? `<div class="bo-action-grid">${reactionButtons}</div>` : ''}${mapIntent?.type === 'move' ? '<small class="bo-hint">请点击二维战场上的目标位置。</small>' : ''}`;
-    root.innerHTML = `<div class="bo-turn-head"><b>${escapeHtml(actor?.name || '等待演算')}</b><span>${escapeHtml(state.status)} · 第 ${state.round || 0} 回合</span></div><p>${escapeHtml(state.pauseReason ? JSON.stringify(state.pauseReason) : '本地引擎正在推进')}</p><div class="bo-auto-runbar"><button class="bo-secondary" data-bo-action="semi-auto" ${disabled} title="按当前战斗策略演算当前单位这一回合（移动进射程→攻击→拉扯），随后交还控制">半自动 · 按策略行动</button><button class="bo-primary" data-bo-action="full-auto" ${disabled} title="按当前战斗策略自动走回合直到战斗结束">全自动 · 战斗至结束</button>${busy ? '<span class="bo-muted">演算中…</span>' : ''}</div><div class="bo-turn-options ${optionsOpen ? 'open' : ''}"><button class="bo-turn-options-toggle" type="button" data-bo-action="toggle-options" ${disabled}>行动选项${optionCount ? `（${optionCount}）` : ''}${reactionButtons ? ' · ⚠ 反应窗口' : ''} · ${optionsOpen ? '收起 ▲' : '展开 ▼'}</button>${optionsOpen ? `<div class="bo-turn-options-body">${optionsBody}</div>` : ''}</div>`;
+    // 半自动/全自动按钮上方的策略选择 + 行为预览：选择即应用到当前单位（临时指派），
+    // 预览实时显示该策略编译后的行为，让玩家在按下“半自动”前先看清这一回合它会做什么。
+    let strategySection = '';
+    if (playerTurn && actor) {
+        const effective = engine?.strategyFor ? engine.strategyFor(state, actor) : (state.strategy || {});
+        const preview = effective?.confirmed ? strategyBehaviorMarkup(effective) : '<span class="bo-muted">当前没有已确认策略：半自动将按默认最近目标推进（优先 0 EP 最高输出）。</span>';
+        strategySection = `<div class="bo-turn-strategy"><label>本回合策略</label>${turnStrategyOptionMarkup(actor.id)}<div class="bo-turn-strategy-preview">${preview}</div></div>`;
+    }
+    root.innerHTML = `<div class="bo-turn-head"><b>${escapeHtml(actor?.name || '等待演算')}</b><span>${escapeHtml(state.status)} · 第 ${state.round || 0} 回合</span></div><p>${escapeHtml(state.pauseReason ? JSON.stringify(state.pauseReason) : '本地引擎正在推进')}</p>${strategySection}<div class="bo-auto-runbar"><button class="bo-secondary" data-bo-action="semi-auto" ${disabled} title="按当前战斗策略演算当前单位这一回合（移动进射程→攻击→拉扯），随后交还控制">半自动 · 按策略行动</button><button class="bo-primary" data-bo-action="full-auto" ${disabled} title="按当前战斗策略自动走回合直到战斗结束">全自动 · 战斗至结束</button>${busy ? '<span class="bo-muted">演算中…</span>' : ''}</div><div class="bo-turn-options ${optionsOpen ? 'open' : ''}"><button class="bo-turn-options-toggle" type="button" data-bo-action="toggle-options" ${disabled}>行动选项${optionCount ? `（${optionCount}）` : ''}${reactionButtons ? ' · ⚠ 反应窗口' : ''} · ${optionsOpen ? '收起 ▲' : '展开 ▼'}</button>${optionsOpen ? `<div class="bo-turn-options-body">${optionsBody}</div>` : ''}</div>`;
 }
 
 function renderLedger(state) {
@@ -3225,6 +3258,28 @@ function bindPanel() {
         else void execute({ type: action.dataset.boAction, actorId });
     });
     document.addEventListener('click', event => { const reactionButton = event.target.closest('[data-bo-reaction]'); if (reactionButton) void reaction(reactionButton.dataset.boReaction); });
+    // 战斗内策略下拉：选择即应用到当前单位（临时指派），随后重绘出行为预览。
+    document.addEventListener('change', event => {
+        const select = event.target.closest('[data-bo-turn-strategy]');
+        if (!select) return;
+        const actorId = String(select.dataset.boTurnStrategy);
+        const presetId = String(select.value || 'inherit');
+        turnStrategyByUnit[actorId] = presetId;
+        if (battle && engine) {
+            try {
+                battle.strategy ||= {};
+                battle.strategy.assignments ||= {};
+                if (presetId === 'inherit' || !COMBAT_STRATEGY_PRESETS[presetId]) delete battle.strategy.assignments[actorId];
+                else {
+                    const preset = COMBAT_STRATEGY_PRESETS[presetId];
+                    battle.strategy.assignments[actorId] = { ...compileStrategy(preset.text, { confirmed: true }), presetId };
+                }
+                repository.commit(battle);
+            } catch (error) { notify(`策略应用失败：${error.message}`, 'error'); }
+        }
+        setStatus(`当前单位策略：${presetId === 'inherit' || !COMBAT_STRATEGY_PRESETS[presetId] ? '跟随部署策略' : COMBAT_STRATEGY_PRESETS[presetId].label}`, 'ok');
+        render();
+    });
 }
 
 function mount() {
