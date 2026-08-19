@@ -1,4 +1,4 @@
-const VERSION = '0.21.0';
+const VERSION = '0.22.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -2157,7 +2157,7 @@ function stageMarkup(stage) {
     }
     const state = publicBattle();
     const completed = stage === 'completed';
-    return `<section id="battle-orb-field" class="bo-field"><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div>${completed ? `<button id="battle-orb-narrate" class="bo-primary" type="button">回写主 AI</button>` : ''}</header><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-turn" class="bo-turn"></div><div id="battle-orb-preview"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details><div class="bo-preview-toggle"><label><input id="battle-orb-preview-toggle" type="checkbox" ${settings.previewCombat ? 'checked' : ''}><span>释放前预览检定与伤害（可撤回，范围技能无需点目标）</span></label></div>${completed ? `<div class="bo-completed-actions"><button id="battle-orb-new-battle" class="bo-secondary" type="button">发起新战斗</button><button id="battle-orb-tool-debug-inline" class="bo-secondary" type="button">导出 DEBUG</button></div>` : ''}</section>`;
+    return `<section id="battle-orb-field" class="bo-field"><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div>${completed ? `<button id="battle-orb-narrate" class="bo-primary" type="button">回写主 AI</button>` : ''}</header><div class="bo-field-map"><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-preview"></div></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details><div class="bo-preview-toggle"><label><input id="battle-orb-preview-toggle" type="checkbox" ${settings.previewCombat ? 'checked' : ''}><span>释放前预览检定与伤害（可撤回，范围技能无需点目标）</span></label></div>${completed ? `<div class="bo-completed-actions"><button id="battle-orb-new-battle" class="bo-secondary" type="button">发起新战斗</button><button id="battle-orb-tool-debug-inline" class="bo-secondary" type="button">导出 DEBUG</button></div>` : ''}</section>`;
 }
 
 function renderStage() {
