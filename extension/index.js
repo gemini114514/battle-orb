@@ -1,4 +1,4 @@
-const VERSION = '0.24.1';
+const VERSION = '0.24.2';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -938,6 +938,36 @@ async function runBenchmark() {
     } finally { busy = false; render(); }
 }
 
+function battleDebugSummaries() {
+    const state = publicBattle();
+    return {
+        stage: currentStage(),
+        status: state?.status || null,
+        round: state?.round || 0,
+        actorId: state?.activeUnitId ?? state?.cursor ?? null,
+        pauseReason: state?.pauseReason || null,
+        flags: state?.flags || null,
+        battlefield: state?.battlefield || null,
+        contactEstablished: Boolean(state?.contactEstablished),
+        contactPairs: state?.contactPairs || [],
+        engagements: state?.engagements || {},
+        meleeSlots: state?.meleeSlots || null,
+        intel: state?.intel || null,
+        combatants: (state?.combatants || []).map(unit => ({
+            id: unit.id, name: unit.name, side: unit.side, controller: unit.controller, count: unit.count, state: unit.state,
+            hp: unit.hp, maxHp: unit.maxHp, ep: unit.ep, maxEp: unit.maxEp, thp: unit.thp,
+            attack: unit.attack, attackModifier: unit.attackModifier, magicAttack: unit.magicAttack,
+            defenseDC: unit.defenseDC, initiativeDC: unit.initiativeDC, position: unit.position, speedMeters: unit.speedMeters, range: unit.range,
+            abilities: (unit.abilities || []).map(ability => ({
+                id: ability.id, name: ability.name, type: ability.type, actionType: ability.actionType, power: ability.power, modifier: ability.modifier,
+                epCost: ability.epCost, minRangeMeters: ability.minRangeMeters, maxRangeMeters: ability.maxRangeMeters, targetCount: ability.targetCount,
+                aoe: ability.aoe, weakPoint: ability.weakPoint, cooldownRemaining: ability.cooldownRemaining ?? null, script: ability.script ? '<script>' : null,
+            })),
+            passives: (unit.passives || []).map(passive => passive.id),
+        })),
+    };
+}
+
 async function exportDebug() {
     const state = publicBattle();
     const payload = {
@@ -949,6 +979,11 @@ async function exportDebug() {
             events: safeJson(repository?.events(battle?.id) || [], DEBUG_EXPORT_VALUE_LIMIT),
             benchmark: safeJson(battle?.__combatBenchmark?.spans || {}, DEBUG_TRACE_VALUE_LIMIT),
             benchmarkResult: safeJson(benchmarkResult, DEBUG_TRACE_VALUE_LIMIT),
+        },
+        battle: {
+            model: safeJson(model || null, DEBUG_EXPORT_VALUE_LIMIT),
+            declaration: safeJson(declaration || null, DEBUG_EXPORT_VALUE_LIMIT),
+            summaries: safeJson(battleDebugSummaries(), DEBUG_EXPORT_VALUE_LIMIT),
         },
         llmTrace: safeJson(promptHistory, DEBUG_EXPORT_VALUE_LIMIT),
         debugTrace: safeJson(debugTrace, DEBUG_EXPORT_VALUE_LIMIT),
@@ -3263,6 +3298,7 @@ globalThis.__battleOrbDebug = {
     events: () => repository && battle ? repository.events(battle.id).slice(-80) : [],
     autoState: () => ({ ...autoState }),
     declaration: () => declaration ? clone(declaration) : null,
+    battleSummaries: () => battleDebugSummaries(),
     applyModelSuggestions: (model, declaration, suggestions) => applyModelSuggestions(model, declaration, suggestions),
     mergeModel: (candidate, input) => mergeModel(candidate, input),
 };
