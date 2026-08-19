@@ -7,6 +7,11 @@ export const MVU_LLM_BUDGET_CHARS = 18000;
 export const MVU_LLM_PRUNE_DEPTH = 3;
 export const MVU_LLM_ENTRIES_PER_CATEGORY = 12;
 export const MVU_LLM_ALWAYS_KEEP = ['主角', '系统状态', '任务'];
+// 战斗建模关键数据保护：武器/装备与最终属性（世界书约定最终属性内含每把已装备武器的 ATK/MATK）
+// 绝不因有界投影被裁掉——此前每层只留前 12 个 key + 深度≥3 折叠，会把排在后面的 ATK/MATK、
+// 装备、武器整块丢弃，导致建模只能给出徒手攻击 + attack=1（“没攻击方式”）。命中这些 key 的
+// 子树：不截断 key、深度上限放宽 3 层、数组不截断。
+const MVU_LLM_PROTECTED_KEY_RE = /装备|武器|最终属性/;
 
 const replayCache = { chatId: null, signature: '', state: null, applied: 0 };
 
@@ -81,15 +86,24 @@ export function cachedReplayMvu(chatId, messages) {
 }
 
 // 有界 MVU 投影：为 LLM 上下文裁剪 stat_data 树，避免把几百楼累积出的超大快照整棵喂给模型。
-// 主角/系统状态/任务 恒保留（战斗最相关且体积小）；其余分类按 key 序截取前 N 项、
-// 深度超过 PRUNE_DEPTH 的子树折叠为 {__pruned__}；序列化总长超过预算的尾部分类直接舍弃。
-export function pruneMvuNode(value, depth, entriesLimit, maxDepth) {
+// 主角/系统状态/任务 恒保留（战斗最相关且体积小），且其直接 key 不截断（noSlice），确保排在
+// 后面的 装备/武器/技能 等 key 不被 12 项截断丢掉；其余分类按 key 序截取前 N 项、
+// 深度超过 PRUNE_DEPTH 的子树折叠为 {__pruned__}；命中保护 key（装备/武器/最终属性）的子树
+// 不截断 key、深度上限放宽 3 层、数组不截断。序列化总长超过预算的尾部分类直接舍弃。
+export function pruneMvuNode(value, depth, entriesLimit, maxDepth, options = {}) {
     if (value === null || typeof value !== 'object') return value;
-    if (Array.isArray(value)) return value.slice(0, entriesLimit);
-    if (depth >= maxDepth) return { __pruned__: true };
+    if (Array.isArray(value)) return options.protected ? value : value.slice(0, entriesLimit);
+    const effectiveDepth = options.protected ? maxDepth + 3 : maxDepth;
+    if (depth >= effectiveDepth) return { __pruned__: true };
+    const keys = Object.keys(value);
+    const limited = options.noSlice || options.protected ? keys : keys.slice(0, entriesLimit);
     const output = {};
-    for (const key of Object.keys(value).slice(0, entriesLimit)) {
-        output[key] = pruneMvuNode(value[key], depth + 1, entriesLimit, maxDepth);
+    for (const key of limited) {
+        const child = value[key];
+        const childProtected = options.protected || MVU_LLM_PROTECTED_KEY_RE.test(key);
+        output[key] = child && typeof child === 'object' && !Array.isArray(child)
+            ? pruneMvuNode(child, depth + 1, entriesLimit, maxDepth, { noSlice: options.noSlice || childProtected, protected: childProtected })
+            : child;
     }
     return output;
 }
@@ -106,7 +120,7 @@ export function boundedMvuForLlm(state, budgetChars = MVU_LLM_BUDGET_CHARS) {
         ...Object.keys(source).filter(key => !MVU_LLM_ALWAYS_KEEP.includes(key)),
     ];
     for (const key of order) {
-        const pruned = pruneMvuNode(source[key], 0, MVU_LLM_ENTRIES_PER_CATEGORY, MVU_LLM_PRUNE_DEPTH);
+        const pruned = pruneMvuNode(source[key], 0, MVU_LLM_ENTRIES_PER_CATEGORY, MVU_LLM_PRUNE_DEPTH, { noSlice: MVU_LLM_ALWAYS_KEEP.includes(key) });
         const nodeSize = measure(pruned);
         if (size + nodeSize > budgetChars && !MVU_LLM_ALWAYS_KEEP.includes(key)) continue;
         output[key] = pruned;

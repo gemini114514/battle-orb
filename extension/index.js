@@ -1,4 +1,4 @@
-const VERSION = '0.24.2';
+const VERSION = '0.24.3';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -1346,6 +1346,19 @@ async function withRetry(fn, label) {
     throw lastError || new Error(`${label}失败`);
 }
 
+// 对话层整段 MVU 默认原样完整发送给识别/建模 AI：装备/武器/技能/最终属性(含 ATK/MATK) 必须
+// 完整送达，不得被有界投影截断导致“没攻击方式/伤害 1 点”。仅当整段序列化超过超大上限
+// （防止撑爆上下文）才回退到有界投影护栏，并明确提示 + 记录 debug。
+const MVU_FULL_LLM_CEILING_CHARS = 250000;
+function mvuForLlm(state) {
+    let json = '';
+    try { json = JSON.stringify(state || {}); } catch { json = ''; }
+    if (json && json.length <= MVU_FULL_LLM_CEILING_CHARS) return state || {};
+    recordDebug('mvu_full_fallback', { reason: `整段 MVU 序列化 ${json.length} 字符超过上限 ${MVU_FULL_LLM_CEILING_CHARS}，回退有界投影` });
+    setStatus(`整段 MVU 过大（${json.length} 字符 > ${MVU_FULL_LLM_CEILING_CHARS}），已改用有界投影发送；若装备/武器信息缺失请精简对话层 MVU 记录`, 'warn'); render();
+    return boundedMvuForLlm(state);
+}
+
 async function recognizeCore() {
     tavernSnapshot = readTavern();
     const tagged = battleDeclarationFromFloor();
@@ -1356,7 +1369,7 @@ async function recognizeCore() {
         if (declarationBox) declarationBox.value = JSON.stringify(declaration, null, 2);
         return tagged;
     }
-    const declarationPrompt = () => JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: boundedMvuForLlm(tavernSnapshot.mvu.state), ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2);
+    const declarationPrompt = () => JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: mvuForLlm(tavernSnapshot.mvu.state), ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2);
     let candidate = normalizeDeclaration(extractJsonObject(await generateRaw([{ role: 'system', content: DECLARATION_SYSTEM }, { role: 'user', content: declarationPrompt() }], 2600, '识别战场声明', 'declaration')));
     // 二步式：识别出的声明校验失败时，把错误回传要求主 AI 修正一次，而不是直接致命报错。
     let errors = declarationValidationReport(candidate);
@@ -1410,7 +1423,7 @@ async function createBattleCore() {
     let phaseOneNote = '';
     for (let attempt = 0; attempt < attempts; attempt += 1) {
             try {
-                const userPayload = { declaration, mvu: boundedMvuForLlm(tavernSnapshot.mvu.state) };
+                const userPayload = { declaration, mvu: mvuForLlm(tavernSnapshot.mvu.state) };
                 if (attempt > 0 && fatalErrors.length) userPayload.repairErrors = fatalErrors;
                 if (String(settings.unitHint || '').trim()) userPayload.unitHint = String(settings.unitHint).trim();
                 candidate = extractJsonObject(await generateRaw([
