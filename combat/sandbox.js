@@ -8,6 +8,12 @@ const MAX_EFFECTS = 64;
 const SCRIPT_EXECUTION_MS = 250;
 let quickJsPromise;
 let browserBundlePromise;
+// Reuse a single QuickJS runtime across script calls.  Creating a fresh
+// runtime per call re-instantiates the whole WASM module (tens of ms, and the
+// first call also pays the one-time compile), which is the dominant part of
+// script-run time in battles with script abilities.  A runtime is isolated per
+// call anyway because every invocation evaluates in a brand-new context.
+let sharedRuntimePromise;
 
 export function scriptHash(source) { return sha256(`${RULESET_VERSION}\n${String(source).trim().replace(/\r\n/g, '\n')}`); }
 
@@ -67,9 +73,15 @@ function seededRandom(seedText) {
 export async function runScript(source, input) {
     const inspection = inspectScript(source, input.ability);
     const QuickJS = await loadQuickJs();
-    const runtime = QuickJS.newRuntime();
-    runtime.setMemoryLimit(16 * 1024 * 1024);
-    runtime.setMaxStackSize(512 * 1024);
+    if (!sharedRuntimePromise) {
+        sharedRuntimePromise = (async () => {
+            const runtime = QuickJS.newRuntime();
+            runtime.setMemoryLimit(16 * 1024 * 1024);
+            runtime.setMaxStackSize(512 * 1024);
+            return runtime;
+        })();
+    }
+    const runtime = await sharedRuntimePromise;
     const deadline = Date.now() + SCRIPT_EXECUTION_MS;
     runtime.setInterruptHandler(() => Date.now() > deadline);
     const vm = runtime.newContext();
@@ -146,7 +158,7 @@ export async function runScript(source, input) {
         const serialized = vm.dump(result.value); result.value.dispose();
         const effects = JSON.parse(serialized);
         return { inspection, effects };
-    } finally { vm.dispose(); runtime.dispose(); }
+    } finally { vm.dispose(); }
 }
 
 export async function testScript(source, ability = {}) {

@@ -4,6 +4,9 @@ import { inspectScript, runScript, scriptHash } from './sandbox.js';
 import { canonical, deepClone, DeterministicRng, makeId, RULESET_VERSION, seed256, sha256 } from './util.js';
 
 const MODES = new Set(['manual', 'semi', 'auto']);
+// advanceUntilPause 每处理这么多步就让出一次事件循环（setTimeout 宏任务），
+// 让浏览器在两次演算之间重绘界面，避免大型战场推进时主线程被一次占满导致 UI 冻结。
+const ADVANCE_YIELD_EVERY = 128;
 const sideIndexCache = new WeakMap();
 const AWARENESS_RANK = Object.freeze({ unaware: 0, suspicious: 1, tracking: 2, engaged: 3 });
 const clockMs = () => globalThis.process?.hrtime?.bigint ? Number(globalThis.process.hrtime.bigint()) / 1e6 : globalThis.performance?.now?.() || Date.now();
@@ -241,7 +244,36 @@ export class CombatEngine {
 
     event(state, type, payload = {}) {
         const previousHash = state.lastEventHash || 'GENESIS';
-        const body = { battleId: state.id, sequence: ++state.sequence, timestamp: new Date().toISOString(), round: state.round, type, payload };
+        // `new Date().toISOString()` is called once per event, and a horde
+        // round emits thousands of them — cache one ISO string per round.
+        let timestamp = state.__roundTimestamp;
+        if (typeof timestamp !== 'string' || state.__roundTimestampRound !== state.round) {
+            timestamp = new Date().toISOString();
+            state.__roundTimestamp = timestamp;
+            state.__roundTimestampRound = state.round;
+        }
+        // Lite 事件模式（可选，默认关闭）：大型尸潮回合会刷出数千条纯噪音事件
+        // （unit_waited / unit_searching 等），占满账本与 DEBUG 导出。开启后把
+        // 同一单位同一回合连续出现的同类型噪音事件合并成一条带 count 的汇总，
+        // 关键事件（命中/死亡/状态/位置/感知变化）完全不受影响。合并是确定性的，
+        // 因此回放哈希链在相同开关下保持一致。
+        if (state.__liteEvents && (type === 'unit_waited' || type === 'unit_searching') && payload?.actorId) {
+            const last = state.pendingEvents[state.pendingEvents.length - 1];
+            const key = `${type}:${payload.actorId}:${payload.reason || ''}`;
+            if (last && last.type === type && last.payload?.actorId === payload.actorId && last.payload?.reason === (payload.reason || '') && last.__lite === key && state.round === last.round) {
+                last.payload.count = Number(last.payload.count || 1) + 1;
+                return last;
+            }
+            payload = { ...payload, count: 1 };
+            const liteEvent = this.emitEventBody(state, type, payload, previousHash, timestamp);
+            liteEvent.__lite = key;
+            return liteEvent;
+        }
+        return this.emitEventBody(state, type, payload, previousHash, timestamp);
+    }
+
+    emitEventBody(state, type, payload, previousHash, timestamp) {
+        const body = { battleId: state.id, sequence: ++state.sequence, timestamp, round: state.round, type, payload };
         const deterministicBody = { sequence: body.sequence, round: body.round, type, payload };
         const event = { ...body, previousHash, hash: sha256(`${previousHash}\n${canonical(deterministicBody)}`) };
         state.lastEventHash = event.hash;
@@ -256,25 +288,36 @@ export class CombatEngine {
         state.meleeSlots ||= { round: state.round || 0, targets: {} }; state.meleeSlots.targets ||= {};
         state.commandHistory ||= [];
         state.flowTrace ||= [];
-        for (const unit of state.combatants) {
-            unit.attributes ||= normalizeAttributes(unit);
-            unit.intelProfile ||= normalizeIntelProfile(unit);
-            unit.tacticalProfile ||= normalizeTacticalProfile(unit);
-            unit.baseSpeedMeters = Number.isFinite(Number(unit.baseSpeedMeters)) ? Number(unit.baseSpeedMeters) : Number(unit.speedMeters || 6);
-            unit.speedMeters = unit.baseSpeedMeters;
-            unit.fovDegrees = Number.isFinite(Number(unit.fovDegrees)) ? Number(unit.fovDegrees) : 120;
-            unit.maxExertion = Number.isFinite(Number(unit.maxExertion)) ? Number(unit.maxExertion) : exertionMaximum(unit);
-            unit.exertion = Math.max(0, Math.min(unit.maxExertion, Number.isFinite(Number(unit.exertion)) ? Number(unit.exertion) : unit.maxExertion));
-            unit.homePosition ||= { ...unit.position };
-            unit.passives = normalizePassives(unit.passives, unit.abilities);
-            state.intel.knowledge[unit.id] ||= {};
+        // The per-combatant normalisation is O(combatants) and only needs to
+        // happen once per battle (it is a one-way identity pass).  knownTargets
+        // calls this method on every horde action, so short-circuit here once
+        // the tactical state has already been prepared.
+        if (!state.__tacticalPrepared) {
+            state.__tacticalPrepared = true;
+            for (const unit of state.combatants) {
+                unit.attributes ||= normalizeAttributes(unit);
+                unit.intelProfile ||= normalizeIntelProfile(unit);
+                unit.tacticalProfile ||= normalizeTacticalProfile(unit);
+                unit.baseSpeedMeters = Number.isFinite(Number(unit.baseSpeedMeters)) ? Number(unit.baseSpeedMeters) : Number(unit.speedMeters || 6);
+                unit.speedMeters = unit.baseSpeedMeters;
+                unit.fovDegrees = Number.isFinite(Number(unit.fovDegrees)) ? Number(unit.fovDegrees) : 120;
+                unit.maxExertion = Number.isFinite(Number(unit.maxExertion)) ? Number(unit.maxExertion) : exertionMaximum(unit);
+                unit.exertion = Math.max(0, Math.min(unit.maxExertion, Number.isFinite(Number(unit.exertion)) ? Number(unit.exertion) : unit.maxExertion));
+                unit.homePosition ||= { ...unit.position };
+                unit.passives = normalizePassives(unit.passives, unit.abilities);
+                state.intel.knowledge[unit.id] ||= {};
+            }
         }
-        const sideIndexKey = state.combatants.map(unit => `${unit.id}:${unit.side}`).join('|');
+        // Cheap numeric fingerprint instead of a full id:side join: the join
+        // allocated a new ~2KB string on every ensureTacticalState call, and
+        // that method runs thousands of times per horde round.
+        let sideIndexKey = 0;
+        for (const unit of state.combatants) sideIndexKey = (sideIndexKey * 31 + (unit.side === 'enemy' ? 1 : unit.side === 'neutral' ? 2 : 3)) | 0;
         const cached = sideIndexCache.get(state);
-        if (!cached || cached.key !== sideIndexKey) {
+        if (!cached || cached.key !== sideIndexKey || cached.length !== state.combatants.length) {
             const index = { player: [], enemy: [], neutral: [] };
             for (const unit of state.combatants) (index[unit.side] ||= []).push(unit);
-            sideIndexCache.set(state, { key: sideIndexKey, index });
+            sideIndexCache.set(state, { key: sideIndexKey, length: state.combatants.length, index });
         }
     }
 
@@ -361,7 +404,13 @@ export class CombatEngine {
     knownTargets(state, observer) {
         // 中立单位如果被玩家在编制部署中勾选参战，只把敌对单位视为目标：它协助玩家
         // 对抗敌人，绝不攻击玩家方或其它中立单位（绝不内讧）。
-        const pool = enemiesOf(state, observer);
+        // Use the cached side index instead of re-filtering every combatant on
+        // each call: knownTargets is the hottest method in a large horde
+        // (thousands of calls per round over 300+ units).
+        this.ensureTacticalState(state);
+        const index = sideIndexCache.get(state)?.index || (state.combatants.reduce((acc, unit) => { (acc[unit.side] ||= []).push(unit); return acc; }, {}));
+        const opposingSide = observer.side === 'enemy' ? 'player' : observer.side === 'player' ? 'enemy' : 'enemy';
+        const pool = (index[opposingSide] || []).filter(living);
         if (observer.side === 'neutral') return pool.filter(target => target.side === 'enemy' && this.canTarget(state, observer, target));
         return pool.filter(target => this.canTarget(state, observer, target));
     }
@@ -553,11 +602,26 @@ export class CombatEngine {
         // Intelligence is only cross-faction.  Construct the two directed
         // player/enemy products directly: a 1v1000 AOE state change therefore
         // remains O(player × enemy), not an accidental million-unit scan.
-        const players = state.combatants.filter(unit => living(unit) && unit.side === 'player');
-        const enemies = state.combatants.filter(unit => living(unit) && unit.side === 'enemy');
+        // When only a handful of units changed (the common movement case),
+        // restrict the scan to pairs that actually involve one of them instead
+        // of rebuilding the whole product on every horde action.
+        const sideIndex = sideIndexCache.get(state)?.index;
+        const players = (sideIndex?.player || []).filter(living);
+        const enemies = (sideIndex?.enemy || []).filter(living);
         const changed = new Set((affectedIds || []).map(String));
-        for (const observer of players) for (const target of enemies) if (initial || changed.has(observer.id) || changed.has(target.id)) add(observer, target);
-        for (const observer of enemies) for (const target of players) if (initial || changed.has(observer.id) || changed.has(target.id)) add(observer, target);
+        if (initial || !changed.size) {
+            for (const observer of players) for (const target of enemies) add(observer, target);
+            for (const observer of enemies) for (const target of players) add(observer, target);
+        } else {
+            const touched = new Set();
+            for (const unit of state.combatants) if (changed.has(unit.id)) touched.add(unit.id);
+            const touchedEnemies = enemies.filter(unit => touched.has(unit.id));
+            const touchedPlayers = players.filter(unit => touched.has(unit.id));
+            for (const observer of players) for (const target of touchedEnemies) add(observer, target);
+            for (const observer of touchedPlayers) for (const target of enemies) add(observer, target);
+            for (const observer of enemies) for (const target of touchedPlayers) add(observer, target);
+            for (const observer of touchedEnemies) for (const target of players) add(observer, target);
+        }
         for (const { observer, target } of pairs.values()) {
             const distance = centerDistance(observer, target);
             if (this.inVisualField(observer, target)) this.attemptDetection(state, observer, target, { source: 'visual', reason, rng });
@@ -809,6 +873,11 @@ export class CombatEngine {
     async advanceUntilPauseMeasured(state, maxActions = 1000) {
         let actions = 0;
         while (state.status === 'running' && actions < maxActions) {
+            // 每处理一批单位就让出一次宏任务，浏览器得以在两次演算之间重绘/响应点击。
+            // 300 单位战场一回合通常要推几千步，若完全不让出，主线程会被一次性占满，
+            // 半自动/全自动期间界面完全卡死（等效于把引擎扔进 Worker 的体验收益，但无需
+            // 改动引擎/界面间的同步调用契约）。步数阈值是人为的：局部让出成本极小。
+            if (actions > 0 && actions % ADVANCE_YIELD_EVERY === 0) await new Promise(resolve => setTimeout(resolve, 0));
             const actor = this.currentActor(state);
             if (!actor) { this.finishRound(state); continue; }
             if (actor.statuses.some(status => ['interrupted', 'stunned', 'controlled'].includes(status.id) || status.skipTurn)) { this.event(state, 'turn_skipped', { actorId: actor.id, statuses: actor.statuses.filter(status => ['interrupted', 'stunned', 'controlled'].includes(status.id) || status.skipTurn).map(status => status.id) }); state.cursor += 1; actions += 1; continue; }
@@ -860,31 +929,39 @@ export class CombatEngine {
 
     selectTarget(state, actor) {
         const targets = this.knownTargets(state, actor);
+        if (!targets.length) return undefined;
         const strategy = this.strategyFor(state, actor);
+        // A full `.sort().at(0)` is O(n log n) and is the hottest line in a
+        // large horde: selectTarget runs ~3× per automatic action, each time
+        // over every known enemy.  The comparator below is a total order
+        // (priority deltas, then id), so a single-pass argmin returns the
+        // exact same winner as the old sort — deterministically, in O(n).
+        const choose = comparator => {
+            let best = targets[0];
+            for (let i = 1; i < targets.length; i += 1) if (comparator(targets[i], best) < 0) best = targets[i];
+            return best;
+        };
         if (actor.side === 'player' && strategy?.guerrilla) {
-            return [...targets].sort((a, b) => {
-                const localPressure = target => targets.filter(other => other.id !== target.id && centerDistance(other, target) <= 7 + Number(target.radiusMeters || .5) + Number(other.radiusMeters || .5)).length;
-                // Do not march past a reachable pursuer merely because a
-                // distant token has one fewer neighbour. Distance remains
-                // primary; local density breaks near-distance ties.
-                const score = target => edgeDistance(actor, target) * 4 + localPressure(target) * 5;
-                const tactical = score(a) - score(b); if (tactical) return tactical;
-                // Finish an already isolated wounded target before opening a
-                // new contact; this prevents the policy from attracting a
-                // second cluster to every partially damaged zombie.
+            // Precompute distances once instead of on every comparator call.
+            const distances = new Map(targets.map(target => [target.id, edgeDistance(actor, target)]));
+            const localPressure = target => targets.reduce((count, other) => count + (other.id !== target.id && centerDistance(other, target) <= 7 + Number(target.radiusMeters || .5) + Number(other.radiusMeters || .5) ? 1 : 0), 0);
+            const scores = new Map(targets.map(target => [target.id, distances.get(target.id) * 4 + localPressure(target) * 5]));
+            return choose((a, b) => {
+                const tactical = scores.get(a.id) - scores.get(b.id); if (tactical) return tactical;
                 const health = a.hp / a.maxHp - b.hp / b.maxHp; if (health) return health;
-                return edgeDistance(a, actor) - edgeDistance(b, actor) || a.id.localeCompare(b.id);
-            })[0];
+                return distances.get(a.id) - distances.get(b.id) || a.id.localeCompare(b.id);
+            });
         }
         const focusRule = actor.tacticalProfile?.focusRule || 'nearest';
         const priorities = actor.side === 'player' && strategy?.priorities?.length ? strategy.priorities : focusRule === 'weakest' ? ['weakest', 'nearest', 'boss'] : focusRule === 'marked' ? ['marked', 'nearest', 'weakest'] : ['nearest', 'weakest', 'boss'];
-        return [...targets].sort((a, b) => {
+        const distances = new Map(targets.map(target => [target.id, edgeDistance(actor, target)]));
+        return choose((a, b) => {
             for (const priority of priorities) {
-                const delta = priority === 'weakest' ? a.hp - b.hp : priority === 'boss' ? Number(b.boss) - Number(a.boss) : priority === 'marked' ? Number(!b.statuses.some(status => status.id === 'marked')) - Number(!a.statuses.some(status => status.id === 'marked')) : edgeDistance(a, actor) - edgeDistance(b, actor);
+                const delta = priority === 'weakest' ? a.hp - b.hp : priority === 'boss' ? Number(b.boss) - Number(a.boss) : priority === 'marked' ? Number(!b.statuses.some(status => status.id === 'marked')) - Number(!a.statuses.some(status => status.id === 'marked')) : distances.get(a.id) - distances.get(b.id);
                 if (delta) return delta;
             }
             return a.id.localeCompare(b.id);
-        })[0];
+        });
     }
 
     async resolveAutomaticAction(state, actor) {
