@@ -1,4 +1,4 @@
-const VERSION = '0.22.0';
+const VERSION = '0.23.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -66,6 +66,8 @@ let selectedUnitId = null;
 let inspectorUnitId = null;
 let actionNotice = null;
 let actionNoticeTimer = null;
+// 2D 战斗界面行动选项区默认折叠（敌人×技能按钮会指数级膨胀）；展开/折叠状态在重绘间保留。
+let turnOptionsOpen = false;
 const forcedUnitIds = new Set();
 let attackEffects = [];
 let combatEffectFrame = 0;
@@ -1579,6 +1581,25 @@ async function reaction(choice) {
     finally { busy = false; render(); }
 }
 
+// 半自动：把当前单位这一回合交给策略演算（移动进射程 → 攻击 → 拉扯脱离），
+// 随后停在下一个需要玩家决策的暂停点，把控制权交还玩家。
+async function runSemiAuto() {
+    if (!battle || busy || ['completed', 'abandoned'].includes(battle.status)) return;
+    busy = true; setStatus('半自动：正在按策略演算当前行动…', 'working'); render();
+    try { await engine.semiAutoStep(battle); repository.commit(battle); }
+    catch (error) { notify(`半自动演算失败：${error.message}`, 'error'); }
+    finally { busy = false; render(); }
+}
+
+// 全自动：用同一份策略自动走回合直到战斗结束（自动按策略处理反应/接管/濒死暂停）。
+async function runCombatAuto() {
+    if (!battle || busy || ['completed', 'abandoned'].includes(battle.status)) return;
+    busy = true; setStatus('全自动：正在按策略战斗至结束…', 'working'); render();
+    try { await engine.runToCompletion(battle); repository.commit(battle); }
+    catch (error) { notify(`全自动战斗失败：${error.message}`, 'error'); }
+    finally { busy = false; render(); }
+}
+
 function battlefieldTransform(canvas, battlefield) {
     const rect = canvas.getBoundingClientRect();
     const pad = 22;
@@ -2061,9 +2082,18 @@ function renderTurn(state) {
     const actor = state?.combatants?.find(unit => unit.id === state.activeUnitId);
     if (!state) { root.innerHTML = '<div class="bo-empty">创建战场后显示当前行动。</div>'; return; }
     const targets = state.combatants.filter(unit => unit.side === 'enemy' && unit.state === 'active');
-    const actionButtons = actor?.controller === 'player' && state.status === 'paused' ? (actor.abilities || []).flatMap(ability => targets.map(target => `<button class="bo-action" data-bo-action="attack" data-ability="${escapeHtml(ability.id)}" data-target="${escapeHtml(target.id)}">${escapeHtml(ability.name || ability.id)} → ${escapeHtml(target.name)}</button>`)).join('') : '';
+    const playerTurn = Boolean(actor?.controller === 'player' && state.status === 'paused');
+    const actionButtons = playerTurn ? (actor.abilities || []).flatMap(ability => targets.map(target => `<button class="bo-action" data-bo-action="attack" data-ability="${escapeHtml(ability.id)}" data-target="${escapeHtml(target.id)}">${escapeHtml(ability.name || ability.id)} → ${escapeHtml(target.name)}</button>`)).join('') : '';
     const reactionButtons = state.pauseReason?.type === 'reaction_window' || state.pauseReason?.type === 'boss_phase' ? ['interrupt', 'defend', 'policy'].map(choice => `<button class="bo-action" data-bo-reaction="${choice}">${choice === 'interrupt' ? '尝试打断' : choice === 'defend' ? '防御' : '按策略处理'}</button>`).join('') : '';
-    root.innerHTML = `<div class="bo-turn-head"><b>${escapeHtml(actor?.name || '等待演算')}</b><span>${escapeHtml(state.status)} · 第 ${state.round || 0} 回合</span></div><p>${escapeHtml(state.pauseReason ? JSON.stringify(state.pauseReason) : '本地引擎正在推进')}</p><div class="bo-action-grid">${actionButtons || '<span class="bo-muted">当前没有可选攻击目标</span>'}</div><div class="bo-action-grid"><button class="bo-action" data-bo-action="move">点地图移动</button><button class="bo-action" data-bo-action="wait">等待</button><button class="bo-action" data-bo-action="hide">潜行</button><button class="bo-action" data-bo-action="resume">继续推进</button></div><div class="bo-action-grid">${reactionButtons}</div>${mapIntent?.type === 'move' ? '<small class="bo-hint">请点击二维战场上的目标位置。</small>' : ''}`;
+    const manualGrid = '<button class="bo-action" data-bo-action="move">点地图移动</button><button class="bo-action" data-bo-action="wait">等待</button><button class="bo-action" data-bo-action="hide">潜行</button><button class="bo-action" data-bo-action="resume">继续推进</button>';
+    // 敌人数量 × 技能数量的攻击按钮会指数级膨胀：默认折叠，需要时才展开。
+    // 用自定义按钮切换（不用原生 <details>，否则浏览器会自动把面板滚到底部，把地图挤出视口）。
+    const optionCount = playerTurn ? `${actor.abilities.length} 技能 × ${targets.length} 目标` : '';
+    const optionsOpen = Boolean(reactionButtons) || turnOptionsOpen;
+    const completed = state.status === 'completed';
+    const disabled = busy || completed ? 'disabled' : '';
+    const optionsBody = `<div class="bo-action-grid">${actionButtons || '<span class="bo-muted">当前没有可选攻击目标</span>'}</div><div class="bo-action-grid">${manualGrid}</div>${reactionButtons ? `<div class="bo-action-grid">${reactionButtons}</div>` : ''}${mapIntent?.type === 'move' ? '<small class="bo-hint">请点击二维战场上的目标位置。</small>' : ''}`;
+    root.innerHTML = `<div class="bo-turn-head"><b>${escapeHtml(actor?.name || '等待演算')}</b><span>${escapeHtml(state.status)} · 第 ${state.round || 0} 回合</span></div><p>${escapeHtml(state.pauseReason ? JSON.stringify(state.pauseReason) : '本地引擎正在推进')}</p><div class="bo-auto-runbar"><button class="bo-secondary" data-bo-action="semi-auto" ${disabled} title="按当前战斗策略演算当前单位这一回合（移动进射程→攻击→拉扯），随后交还控制">半自动 · 按策略行动</button><button class="bo-primary" data-bo-action="full-auto" ${disabled} title="按当前战斗策略自动走回合直到战斗结束">全自动 · 战斗至结束</button>${busy ? '<span class="bo-muted">演算中…</span>' : ''}</div><div class="bo-turn-options ${optionsOpen ? 'open' : ''}"><button class="bo-turn-options-toggle" type="button" data-bo-action="toggle-options" ${disabled}>行动选项${optionCount ? `（${optionCount}）` : ''}${reactionButtons ? ' · ⚠ 反应窗口' : ''} · ${optionsOpen ? '收起 ▲' : '展开 ▼'}</button>${optionsOpen ? `<div class="bo-turn-options-body">${optionsBody}</div>` : ''}</div>`;
 }
 
 function renderLedger(state) {
@@ -3068,6 +3098,9 @@ function bindPanel() {
         const state = publicBattle(); const actorId = state?.activeUnitId;
         if (action.dataset.boAction === 'move') { mapIntent = { type: 'move' }; render(); return; }
         if (action.dataset.boAction === 'resume') { if (!battle || busy) return; busy = true; void engine.resume(battle).then(() => repository.commit(battle)).catch(error => notify(`推进失败：${error.message}`, 'error')).finally(() => { busy = false; render(); }); return; }
+        if (action.dataset.boAction === 'toggle-options') { turnOptionsOpen = !turnOptionsOpen; render(); return; }
+        if (action.dataset.boAction === 'semi-auto') { void runSemiAuto(); return; }
+        if (action.dataset.boAction === 'full-auto') { void runCombatAuto(); return; }
         if (!actorId) return;
         if (action.dataset.boAction === 'attack') {
             const actorUnit = state?.combatants?.find(unit => unit.id === actorId);
@@ -3161,6 +3194,7 @@ globalThis.__battleOrbDebug = {
     settings: () => ({ ...settings }),
     flowError: () => flowError ? { ...flowError } : null,
     state: () => publicBattle(),
+    events: () => repository && battle ? repository.events(battle.id).slice(-80) : [],
     autoState: () => ({ ...autoState }),
     declaration: () => declaration ? clone(declaration) : null,
     applyModelSuggestions: (model, declaration, suggestions) => applyModelSuggestions(model, declaration, suggestions),

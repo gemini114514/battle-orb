@@ -950,7 +950,9 @@ export class CombatEngine {
             target = this.selectTarget(state, actor) || target;
             available = actor.abilities.filter(ability => actor.ep >= ability.epCost && !actor.cooldowns?.[ability.id] && this.canEngage(state, actor, target, ability) && (!ability.script || this.repository.isScriptApproved(ability.scriptHash || scriptHash(ability.script), state.rulesetVersion)));
         }
-        const ability = available.find(item => item.id !== 'basic-attack') || available[0];
+        const ability = actor.side === 'player' && state.autoPilot
+            ? this.pickPilotAbility(actor, target, available)
+            : available.find(item => item.id !== 'basic-attack') || available[0];
         if (!ability) { state.flags.noLegalAction = true; this.event(state, 'unit_waited', { actorId: actor.id, reason: 'no_legal_action', targetId: target?.id || null, targetDistance: target ? edgeDistance(actor, target) : null, movementRemaining: this.movementRemaining(state, actor), knownTargetIds: this.knownTargets(state, actor).map(unit => unit.id).slice(0, 24), abilityDiagnostics: actor.abilities.map(item => ({ id: item.id, affordable: actor.ep >= item.epCost, cooldown: Number(actor.cooldowns?.[item.id] || 0), inRange: target ? rangeLegal(state, actor, target, item) : false, canEngage: target ? this.canEngage(state, actor, target, item) : false })) }); state.cursor += 1; return; }
         const targets = (ability.aoe || ability.targetCount > 1) ? this.knownTargets(state, actor).filter(item => this.canEngage(state, actor, item, ability)).slice(0, ability.targetCount) : [target];
         while (!ability.aoe && targets.length > 1 && actor.ep < Math.ceil(ability.epCost * targetCostMultiplier(targets.length))) targets.pop();
@@ -971,6 +973,24 @@ export class CombatEngine {
             if (retreatTarget) { const moved = this.retreatFromTarget(state, actor, retreatTarget); if (moved) this.consumeMovement(state, actor, moved); }
         }
         state.cursor += 1;
+    }
+
+    // 半自动/全自动的策略能力挑选（仅玩家方、且处于新式自动驾驶 autoPilot 期间）：
+    // 优先"不消耗 EP、输出预期最高"的主动行动 —— 先走到射程（由移动逻辑负责），
+    // 再选取 0 EP 且按确定性伤害期望最高的攻击，最后才考虑消耗 EP 的高输出手段。
+    expectedOutput(actor, target, ability) {
+        try { return Math.max(0, Number(damageValue(actor, target, ability)?.final || 0)); }
+        catch { return Math.max(0, Number(actor.attack || 0) + Number(ability.power || 0) + Number(ability.modifier || 0)); }
+    }
+
+    pickPilotAbility(actor, target, available) {
+        const ranked = [...available].sort((a, b) => {
+            const epA = Number(a.epCost || 0) > 0 ? 1 : 0;
+            const epB = Number(b.epCost || 0) > 0 ? 1 : 0;
+            if (epA !== epB) return epA - epB;
+            return this.expectedOutput(actor, target, b) - this.expectedOutput(actor, target, a);
+        });
+        return ranked[0] || available[0];
     }
 
     meleeBlockRange(unit, target) {
@@ -1998,6 +2018,64 @@ export class CombatEngine {
 
     pause(state, reason) { state.status = 'paused'; state.pauseReason = reason; this.event(state, 'combat_paused', reason); }
     async resume(state) { this.assertWritable(state); state.status = 'running'; state.pauseReason = null; this.event(state, 'combat_resumed'); await this.advanceUntilPause(state, state.mode === 'manual' ? 1000 : 10000); }
+
+    // 半自动：把当前单位这一回合交给策略演算（即使平时由玩家手操）——移动进射程 →
+    // 0 EP 输出最高的主动攻击 → 拉扯脱离。演算完当前单位后立即交还控制：只继续推进到
+    // 下一个需要玩家决策的暂停点（下一个手操单位 / 濒死 / 反应窗口），不再连带多回合演算。
+    async semiAutoStep(state) {
+        this.assertWritable(state);
+        const actor = this.currentActor(state);
+        if (!actor) { await this.resume(state); return; }
+        const priorMode = state.mode;
+        const priorAutoPilot = Boolean(state.autoPilot);
+        state.autoPilot = actor.side === 'player';
+        state.status = 'running'; state.pauseReason = null;
+        this.event(state, 'combat_resumed', { source: 'semi_auto', actorId: actor.id });
+        try {
+            if (actor.statuses.some(status => ['interrupted', 'stunned', 'controlled'].includes(status.id) || status.skipTurn)) {
+                state.cursor += 1;
+                this.event(state, 'turn_skipped', { actorId: actor.id, statuses: actor.statuses.filter(status => ['interrupted', 'stunned', 'controlled'].includes(status.id) || status.skipTurn).map(status => status.id) });
+            } else {
+                await this.resolveAutomaticAction(state, actor);
+            }
+            this.afterAction(state);
+            if (state.status === 'running') await this.advanceUntilPause(state, 2000);
+        } finally {
+            state.autoPilot = priorAutoPilot;
+            state.mode = priorMode;
+        }
+    }
+
+    // 全自动：用同一份策略自动走回合直到战斗结束。运行期间临时切到 auto 模式并按策略
+    // 自动处理反应窗口/接管触发/濒死暂停/脚本审批（autoApprove），结束后恢复原模式。
+    async runToCompletion(state, { maxRounds = 500 } = {}) {
+        this.assertWritable(state);
+        const priorMode = state.mode;
+        const priorAutoPilot = Boolean(state.autoPilot);
+        const priorAutoApprove = this.repository.autoApprove;
+        this.repository.autoApprove = true;
+        state.autoPilot = true;
+        state.mode = 'auto';
+        state.status = 'running'; state.pauseReason = null;
+        this.event(state, 'combat_resumed', { source: 'full_auto' });
+        try {
+            let rounds = 0;
+            while (state.status === 'running' && rounds < maxRounds) {
+                await this.advanceUntilPause(state, 5000);
+                rounds += 1;
+                if (state.status !== 'running') break;
+                const reason = state.pauseReason?.type;
+                if (['manual_turn', 'takeover_trigger', 'player_dying', 'safety_limit'].includes(reason)) { state.status = 'running'; state.pauseReason = null; continue; }
+                if (reason === 'reaction_window' || reason === 'boss_phase') { this.resolveAutoReaction(state); state.status = 'running'; state.pauseReason = null; continue; }
+                if (reason === 'script_approval') { await this.resolveScriptApproval(state, { mode: 'approve' }); state.status = 'running'; state.pauseReason = null; continue; }
+                break;
+            }
+        } finally {
+            this.repository.autoApprove = priorAutoApprove;
+            state.autoPilot = priorAutoPilot;
+            state.mode = priorMode;
+        }
+    }
 
     resolveScriptApproval(state, input = {}) {
         this.assertWritable(state);
