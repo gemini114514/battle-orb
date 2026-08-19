@@ -1,4 +1,4 @@
-const VERSION = '0.23.0';
+const VERSION = '0.24.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -78,14 +78,18 @@ let mounted = false;
 const SETTINGS_KEY = 'battle-orb.settings';
 const WORK_API_DEFAULT = { provider: 'tavern', baseUrl: '', path: '/v1/chat/completions', apiKey: '', model: '', temperature: 0.4, extraHeaders: '{}', extraBody: '{}', profiles: [], activeProfile: '' };
 const defaultWorkApi = () => ({ ...WORK_API_DEFAULT });
-let settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, maxRetries: 3, debugMode: false, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() } };
+let settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, maxRetries: 3, networkRetries: 6, debugMode: false, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() } };
 let flowError = null;
+// 本战场由降级建模创建时（已回滚第一阶段 / 已回退安全默认模型）置为非空，
+// 用于在战斗面板顶部渲染常驻警告，避免"建模失败却静默开战"。
+let battleModelWarning = '';
 try {
     const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
     // ?battleOrbDebug=1 强制 DEBUG 界面（自动化冒烟测试用）；真实用户用设置中的 bool 控制。
     if (new URLSearchParams(location.search).get('battleOrbDebug') === '1') stored.debugMode = true;
-    settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, maxRetries: 3, debugMode: false, previewCombat: true, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() }, ...stored };
+    settings = { writeVerdictBasis: true, recognizeHint: '', unitHint: '', fastModeling: false, rollbackModeling: false, maxRetries: 3, networkRetries: 6, debugMode: false, previewCombat: true, api: { declaration: defaultWorkApi(), modeling: defaultWorkApi() }, ...stored };
     settings.maxRetries = Math.max(1, Math.min(1000, Number(settings.maxRetries) || 3));
+    settings.networkRetries = Math.max(2, Math.min(20, Number(settings.networkRetries) || 6));
     settings.debugMode = Boolean(settings.debugMode);
     for (const kind of ['declaration', 'modeling']) {
         settings.api[kind] = { ...WORK_API_DEFAULT, ...(settings.api?.[kind] || {}) };
@@ -780,8 +784,11 @@ async function callCustomApi(conf, messages, responseLength) {
         throw new Error(`自定义 API 请求失败：${error?.message || error}`);
     }
     if (!response.ok) {
+        const retryAfter = Number(response.headers.get('retry-after') || 0);
         const detail = await response.text().catch(() => '');
-        throw new Error(`自定义 API 返回 HTTP ${response.status}：${String(detail || response.statusText).slice(0, 300)}`);
+        const error = new Error(`自定义 API 返回 HTTP ${response.status}：${String(detail || response.statusText).slice(0, 300)}`);
+        if (retryAfter > 0) error.retryAfterMs = Math.min(retryAfter * 1000, 30000);
+        throw error;
     }
     let data;
     try { data = await response.json(); } catch (error) { throw new Error(`自定义 API 响应不是有效 JSON：${error?.message || error}`); }
@@ -790,31 +797,66 @@ async function callCustomApi(conf, messages, responseLength) {
     return text;
 }
 
+// —— 网络健壮性 ——
+// 供应商偶发 429/5xx/断连/超时是常态：对"瞬时"错误做独立于语义重试（maxRetries）
+// 的网络层自动重试，指数退避 + 抖动，并优先尊重 Retry-After；永久性错误（4xx 认证、
+// 响应非 JSON、无文本）不重试，直接抛给上层清晰报错。
+const NETWORK_TRANSIENT_RE = /HTTP (429|50[0-9])\b|Failed to fetch|fetch failed|ECONN|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket hang up|upstream error|network error|网络|超时|timed out|timeout/i;
+function isTransientLlmError(error) {
+    const message = String(error?.message || error || '');
+    if (/已取消/.test(message)) return false;
+    return NETWORK_TRANSIENT_RE.test(message);
+}
+function networkRetryLimit() {
+    return Math.max(2, Math.min(20, Number(settings.networkRetries) || 6));
+}
+function llmRetryDelayMs(attempt, error) {
+    if (Number(error?.retryAfterMs) > 0) return Math.min(Number(error.retryAfterMs), 30000);
+    const base = Math.min(700 * Math.pow(2, attempt), 12000);
+    return Math.round(base * (0.75 + Math.random() * 0.5));
+}
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0))); }
+
 async function generateRaw(messages, responseLength = 4000, label = 'LLM 调用', apiKind = null) {
     const ctx = activeContext();
     const conf = apiKind ? settings.api?.[apiKind] : null;
     const custom = Boolean(conf && conf.provider === 'custom');
+    const attempts = networkRetryLimit();
     const startedAt = performance.now();
-    let ok = false;
-    let response = null;
-    let failure = null;
-    try {
-        if (custom) {
-            response = await withLlmTask(label, () => callCustomApi(conf, messages, responseLength));
-        } else {
-            if (typeof ctx.generateRaw !== 'function') throw new Error('当前酒馆版本没有 generateRaw 扩展接口');
-            response = await withLlmTask(label, () => ctx.generateRaw({ prompt: messages, responseLength, trimNames: false }));
+    let lastFailure = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+            let response;
+            if (custom) {
+                response = await withLlmTask(label, () => callCustomApi(conf, messages, responseLength));
+            } else {
+                if (typeof ctx.generateRaw !== 'function') throw new Error('当前酒馆版本没有 generateRaw 扩展接口');
+                response = await withLlmTask(label, () => ctx.generateRaw({ prompt: messages, responseLength, trimNames: false }));
+            }
+            const durationMs = Math.round((performance.now() - startedAt) * 10) / 10;
+            recordPrompt(label, messages, { ok: true, durationMs, response });
+            recordDebug('llm_call', { stage: label, ok: true, durationMs, error: null, messageCount: Array.isArray(messages) ? messages.length : 0 });
+            return response;
+        } catch (error) {
+            if (String(error?.message || '').includes('已取消')) throw error;
+            lastFailure = error;
+            if (attempt < attempts - 1 && isTransientLlmError(error)) {
+                const delayMs = llmRetryDelayMs(attempt, error);
+                recordDebug('llm_retry', { stage: label, attempt: attempt + 1, remaining: attempts - attempt - 1, delayMs, error: String(error.message || error) });
+                setStatus(`${label}：网络波动（${String(error.message || error).slice(0, 140)}），${delayMs}ms 后自动重试（第 ${attempt + 2}/${attempts} 次）…`, 'warn'); render();
+                await sleep(delayMs);
+                if (autoCancelRequested) throw new Error('LLM 任务已取消');
+                continue;
+            }
+            break;
         }
-        ok = true;
-        return response;
-    } catch (error) {
-        failure = error;
-        throw error;
-    } finally {
-        const durationMs = Math.round((performance.now() - startedAt) * 10) / 10;
-        recordPrompt(label, messages, { ok, error: failure?.message || null, durationMs, response });
-        recordDebug('llm_call', { stage: label, ok, durationMs, error: failure?.message || null, messageCount: Array.isArray(messages) ? messages.length : 0 });
     }
+    const durationMs = Math.round((performance.now() - startedAt) * 10) / 10;
+    const failure = lastFailure || new Error(`${label}失败`);
+    recordPrompt(label, messages, { ok: false, error: failure?.message || null, durationMs });
+    recordDebug('llm_call', { stage: label, ok: false, durationMs, error: failure?.message || null, messageCount: Array.isArray(messages) ? messages.length : 0 });
+    if (isTransientLlmError(failure)) throw new Error(`${label}：网络持续异常，已自动重试 ${attempts - 1} 次仍失败 — ${failure.message}`);
+    throw failure;
 }
 
 function currentPlayerMvu() {
@@ -1247,7 +1289,11 @@ async function withRetry(fn, label) {
         catch (error) {
             if (String(error?.message || '').includes('已取消')) throw error;
             lastError = error;
-            if (attempt < limit - 1) { setStatus(`${label}第 ${attempt + 1} 次失败（${error.message}），正在重试（${attempt + 2}/${limit}）…`, 'warn'); render(); }
+            if (attempt < limit - 1) {
+                const delayMs = Math.round(Math.min(600 * Math.pow(2, attempt), 8000) * (0.75 + Math.random() * 0.5));
+                setStatus(`${label}第 ${attempt + 1} 次失败（${error.message}），${delayMs}ms 后重试（${attempt + 2}/${limit}）…`, 'warn'); render();
+                await sleep(delayMs);
+            }
         }
     }
     throw lastError || new Error(`${label}失败`);
@@ -1384,7 +1430,13 @@ async function createBattleCore() {
         mapIntent = null; mapMenu = null; selectedUnitId = null; inspectorUnitId = null; mapZoom = 1; mapPan = { x: 0, y: 0 };
         stageOverride = null;
         recordDebug('battle_created', { battleId: battle.id, combatants: model.combatants?.length || 0, title: model.title, ruleset: battle.rulesetVersion, mode: modeNote || phaseOneNote, auto: Boolean(autoState.running) });
-        return { note: `${modeNote}${phaseOneNote}` };
+        const degradedNote = `${modeNote}${phaseOneNote}`;
+        battleModelWarning = /回滚|已回退/.test(degradedNote) ? degradedNote : '';
+        if (battleModelWarning) {
+            notify(`本战场由降级建模创建${battleModelWarning}：战斗属性/伤害可能不准确，请检查 API 渠道可用性后重新发起战斗`, 'error');
+            setStatus(`战场已由降级建模创建${battleModelWarning}：战斗属性/伤害可能不准确`, 'error'); render();
+        }
+        return { note: degradedNote };
 }
 
 async function createBattle() {
@@ -1454,7 +1506,7 @@ async function runFullAuto() {
                     declaration = null;
                     setStatus(`一键全自动第 ${attempt + 1} 次失败（${autoState.step}）：${error.message}，正在整体重试（${attempt + 2}/${limit}）…`, 'warn');
                     render();
-                    await new Promise(resolve => setTimeout(resolve, 500));
+                    await sleep(Math.round(Math.min(1000 * Math.pow(2, attempt), 10000) * (0.75 + Math.random() * 0.5)));
                 }
             }
         }
@@ -2187,7 +2239,7 @@ function stageMarkup(stage) {
     }
     const state = publicBattle();
     const completed = stage === 'completed';
-    return `<section id="battle-orb-field" class="bo-field"><header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div>${completed ? `<button id="battle-orb-narrate" class="bo-primary" type="button">回写主 AI</button>` : ''}</header><div class="bo-field-map"><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-preview"></div></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details><div class="bo-preview-toggle"><label><input id="battle-orb-preview-toggle" type="checkbox" ${settings.previewCombat ? 'checked' : ''}><span>释放前预览检定与伤害（可撤回，范围技能无需点目标）</span></label></div>${completed ? `<div class="bo-completed-actions"><button id="battle-orb-new-battle" class="bo-secondary" type="button">发起新战斗</button><button id="battle-orb-tool-debug-inline" class="bo-secondary" type="button">导出 DEBUG</button></div>` : ''}</section>`;
+    return `<section id="battle-orb-field" class="bo-field">${battleModelWarning ? `<div class="bo-degraded-warning">⚠ 本战场由降级建模创建${escapeHtml(battleModelWarning)}：战斗属性/伤害可能不准确。请确认工作 API 渠道可用后重新发起战斗。</div>` : ''}<header><div><b>二维战场</b><small id="battle-orb-battle-meta">本地权威演算</small></div>${completed ? `<button id="battle-orb-narrate" class="bo-primary" type="button">回写主 AI</button>` : ''}</header><div class="bo-field-map"><div id="battle-orb-map-wrap" class="bo-map-wrap"></div><div id="battle-orb-preview"></div></div><div id="battle-orb-turn" class="bo-turn"></div><details class="bo-fold"><summary>本地裁定账本</summary><div id="battle-orb-ledger" class="bo-ledger"></div></details><div class="bo-preview-toggle"><label><input id="battle-orb-preview-toggle" type="checkbox" ${settings.previewCombat ? 'checked' : ''}><span>释放前预览检定与伤害（可撤回，范围技能无需点目标）</span></label></div>${completed ? `<div class="bo-completed-actions"><button id="battle-orb-new-battle" class="bo-secondary" type="button">发起新战斗</button><button id="battle-orb-tool-debug-inline" class="bo-secondary" type="button">导出 DEBUG</button></div>` : ''}</section>`;
 }
 
 function renderStage() {
@@ -2676,7 +2728,7 @@ function renderSettingsView() {
     const content = $('#battle-orb-settings-content');
     if (!content) return;
     const floorInfo = tavernSnapshot ? `<div id="battle-orb-floor" class="bo-floor">已读取 ${tavernSnapshot.messages.length} 楼 · MVU ${tavernSnapshot.mvu.applied} 条 Patch · ${tavernSnapshot.mvu.source}</div>` : '<div class="bo-floor">尚未读取楼层</div>';
-    content.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>全自动与调试</summary><label class="bo-setting"><input id="battle-orb-debug-mode" type="checkbox" ${settings.debugMode ? 'checked' : ''}><span>DEBUG 模式（默认关闭）</span><small>关闭时界面只显示“一键全自动战斗”与最后确认队伍战术的界面；开启后恢复详细的分步页面（读取/识别/创建）与提示词、基准等工具。导出 DEBUG 记录按钮无论何时都可用。</small></label><label class="bo-setting"><input id="battle-orb-max-retries" type="number" min="1" max="1000" step="1" value="${settings.maxRetries}"><span>LLM 最大尝试次数（1-1000）</span><small>识别 / 建模 / 数据审查 / 战后剧情等每次 LLM 请求的最大尝试次数；全自动模式在限制内整体自动重试；识别声明校验失败会先让主 AI 修正一步而非直接报错。</small></label></details><details class="bo-fold" open><summary>战场建模</summary><label class="bo-setting"><input id="battle-orb-fast-modeling" type="checkbox" ${settings.fastModeling ? 'checked' : ''}><span>急速模式（无二阶段检查）</span><small>建模阶段仅做一次生成，跳过战斗数据检查 AI 的审查；适合追求速度与低消耗。</small></label><label class="bo-setting"><input id="battle-orb-rollback-modeling" type="checkbox" ${settings.rollbackModeling ? 'checked' : ''}><span>回滚模式</span><small>第一阶段成功即归档；第二阶段全部失败时立刻用第一阶段结果创建战场，不再报错或等待。</small></label></details><details class="bo-fold" open><summary>工作 API 预设</summary><small class="bo-muted">为“战场识别”与“战场建模”两种调用场景各自配置调用来源：酒馆 API（generateRaw）为默认选项，也可改用自定义 API 预设（Base URL / 路径 / 模型 / Key / 额外头与体），并可按实例保存复用。</small>${renderWorkApiSection('declaration')}${renderWorkApiSection('modeling')}</details><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示、判断依据、建模模式、重试次数、DEBUG 模式与工作 API 预设设置已持久化到浏览器本地。</p>`;
+    content.innerHTML = `<label class="bo-setting"><input id="battle-orb-write-verdict" type="checkbox" ${settings.writeVerdictBasis ? 'checked' : ''}><span>判断依据回写正文</span><small>战斗记录正式插入楼层后再剧情创作；关闭则只写回剧情</small></label><details class="bo-fold" open><summary>全自动与调试</summary><label class="bo-setting"><input id="battle-orb-debug-mode" type="checkbox" ${settings.debugMode ? 'checked' : ''}><span>DEBUG 模式（默认关闭）</span><small>关闭时界面只显示“一键全自动战斗”与最后确认队伍战术的界面；开启后恢复详细的分步页面（读取/识别/创建）与提示词、基准等工具。导出 DEBUG 记录按钮无论何时都可用。</small></label><label class="bo-setting"><input id="battle-orb-max-retries" type="number" min="1" max="1000" step="1" value="${settings.maxRetries}"><span>LLM 最大尝试次数（1-1000）</span><small>识别 / 建模 / 数据审查 / 战后剧情等每次 LLM 请求的最大尝试次数；全自动模式在限制内整体自动重试；识别声明校验失败会先让主 AI 修正一步而非直接报错。</small></label><label class="bo-setting"><input id="battle-orb-network-retries" type="number" min="2" max="20" step="1" value="${settings.networkRetries}"><span>网络波动自动重试次数（2-20）</span><small>对 429/5xx/断连/超时等瞬时错误自动重试：指数退避 + 抖动，并优先尊重服务端 Retry-After；与上面的语义级重试相互独立，网络波动不会消耗建模修复次数。</small></label></details><details class="bo-fold" open><summary>战场建模</summary><label class="bo-setting"><input id="battle-orb-fast-modeling" type="checkbox" ${settings.fastModeling ? 'checked' : ''}><span>急速模式（无二阶段检查）</span><small>建模阶段仅做一次生成，跳过战斗数据检查 AI 的审查；适合追求速度与低消耗。</small></label><label class="bo-setting"><input id="battle-orb-rollback-modeling" type="checkbox" ${settings.rollbackModeling ? 'checked' : ''}><span>回滚模式</span><small>第一阶段成功即归档；第二阶段全部失败时立刻用第一阶段结果创建战场，不再报错或等待。</small></label></details><details class="bo-fold" open><summary>工作 API 预设</summary><small class="bo-muted">为“战场识别”与“战场建模”两种调用场景各自配置调用来源：酒馆 API（generateRaw）为默认选项，也可改用自定义 API 预设（Base URL / 路径 / 模型 / Key / 额外头与体），并可按实例保存复用。</small>${renderWorkApiSection('declaration')}${renderWorkApiSection('modeling')}</details><details class="bo-fold" open><summary>当前 MVU 快照</summary>${floorInfo}<pre id="battle-orb-mvu">同步后显示</pre></details><button id="battle-orb-reset-fab" class="bo-secondary" type="button">重置悬浮球位置</button><p class="bo-muted">识别提示、判断依据、建模模式、重试次数、DEBUG 模式与工作 API 预设设置已持久化到浏览器本地。</p>`;
     const mvu = content.querySelector('#battle-orb-mvu');
     if (mvu) mvu.textContent = tavernSnapshot ? JSON.stringify(tavernSnapshot.mvu.state, null, 2) : '同步后显示';
 }
@@ -2882,6 +2934,7 @@ function bindPanel() {
         if (event.target.id === 'battle-orb-fast-modeling') { settings.fastModeling = Boolean(event.target.checked); saveSettings(); setStatus(settings.fastModeling ? '急速模式：创建战场时将跳过二阶段检查' : '已关闭急速模式，恢复两段式审查', 'ok'); return; }
         if (event.target.id === 'battle-orb-rollback-modeling') { settings.rollbackModeling = Boolean(event.target.checked); saveSettings(); setStatus(settings.rollbackModeling ? '回滚模式：二阶段失败将立即用第一阶段结果创建战场' : '已关闭回滚模式', 'ok'); return; }
         if (event.target.id === 'battle-orb-max-retries') { settings.maxRetries = Math.max(1, Math.min(1000, Number(event.target.value) || 3)); saveSettings(); setStatus(`LLM 最大尝试次数：${settings.maxRetries}`, 'ok'); return; }
+        if (event.target.id === 'battle-orb-network-retries') { settings.networkRetries = Math.max(2, Math.min(20, Number(event.target.value) || 6)); saveSettings(); setStatus(`网络波动自动重试次数：${settings.networkRetries}`, 'ok'); return; }
         if (event.target.id === 'battle-orb-debug-mode') { settings.debugMode = Boolean(event.target.checked); saveSettings(); setStatus(settings.debugMode ? 'DEBUG 模式已开启：显示详细分步页面与工具' : '已关闭 DEBUG 模式：界面恢复为一键全自动', 'ok'); render(); return; }
         const apiFieldMatch = String(event.target.id).match(/^battle-orb-api-(decl|model)-(.+)$/);
         if (apiFieldMatch && Object.hasOwn(WORK_API_FIELDS, apiFieldMatch[2])) {
