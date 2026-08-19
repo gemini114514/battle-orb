@@ -1689,7 +1689,7 @@ export class CombatEngine {
             this.emitNoise(state, actor, { reason: 'script_ability', radiusMeters: actor.intelProfile?.attackNoiseMeters });
             if (isMeleeAbility(ability)) for (const target of targets) this.updateKnowledge(state, target, actor, { source: 'melee_contact', reason: 'melee_script_received', force: true });
             const scriptRng = this.nextScriptRng(state);
-            const output = await runScript(ability.script, {
+            const output = await this.benchmarkMeasureAsync(state, 'engine.auto.script-run', () => runScript(ability.script, {
                 ability: { ...ability, script: undefined },
                 actor: deepClone(actor),
                 targets: deepClone(targets),
@@ -1698,7 +1698,7 @@ export class CombatEngine {
                 round: state.round,
                 zones: state.zones,
                 rng: scriptRng,
-            });
+            }));
             await this.applyEffects(state, actor, output.effects);
             this.event(state, 'script_action_resolved', { actorId: actor.id, abilityId: ability.id, scriptHash: hash, epCost: ability.epCost, rng: scriptRng, effects: output.effects });            return true;
         } catch (error) {

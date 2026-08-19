@@ -47,10 +47,19 @@ export class BrowserCombatRepository {
     events(id) { return deepClone(this.ledger.get(id) || []); }
 
     commit(state) {
+        const benchmark = state?.__combatBenchmark;
+        const nowMs = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        const eventStartedAt = benchmark ? nowMs() : 0;
         const pending = Array.isArray(state.pendingEvents) ? state.pendingEvents.splice(0) : [];
         for (const event of pending) this.appendEvent(state.id, event);
+        if (benchmark) benchmark.spans['persist.events'] = { totalMs: nowMs() - eventStartedAt, count: pending.length, maxMs: nowMs() - eventStartedAt };
+        const stateStartedAt = benchmark ? nowMs() : 0;
         this.save(state);
-        return this.publicSnapshot(state);
+        if (benchmark) benchmark.spans['persist.state'] = { totalMs: nowMs() - stateStartedAt, count: 1, maxMs: nowMs() - stateStartedAt };
+        const publicStartedAt = benchmark ? nowMs() : 0;
+        const snapshot = this.publicSnapshot(state);
+        if (benchmark) benchmark.spans['response.public-state'] = { totalMs: nowMs() - publicStartedAt, count: 1, maxMs: nowMs() - publicStartedAt };
+        return snapshot;
     }
 
     isScriptApproved(hash, rulesetVersion) { return this.approved.has(`${rulesetVersion}:${hash}`); }
