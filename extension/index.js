@@ -1,4 +1,4 @@
-const VERSION = '0.20.0';
+const VERSION = '0.21.0';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -13,7 +13,7 @@ void import('./diagnose.js')
 
 (async function battleOrbBootstrap() {
 try {
-    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl, buildKillCountPatches }, sandbox, { damageValue, isMeleeAbility, rangeLegal, living }] = await Promise.all([
+    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl, buildKillCountPatches }, sandbox, { damageValue, isMeleeAbility, rangeLegal, living }, { parsePatchBlocks, isMvuStatData, cachedReplayMvu, boundedMvuForLlm }] = await Promise.all([
         import('../../../extensions.js'),
         import('./combat/engine.js'),
         import('./combat/browser-repository.js'),
@@ -21,6 +21,7 @@ try {
         import('./combat/narrative-dsl.js'),
         import('./combat/sandbox.js'),
         import('./combat/rules.js'),
+        import('./combat/mvu.js'),
     ]);
     const { compileStrategy } = await import('./combat/strategy.js');
     const { materializeScriptLibrary, scriptLibraryPromptText } = await import('./combat/script-library.js');
@@ -31,6 +32,9 @@ const ROOT_ID = 'battle-orb-root';
 const PANEL_ID = 'battle-orb-panel';
 const FAB_ID = 'battle-orb-fab';
 const MAX_FLOOR_CHARS = 9000;
+// MVU 快照读取/投递的优化策略见 combat/mvu.js（parsePatchBlocks 前置判定、cachedReplayMvu 缓存、
+// boundedMvuForLlm 有界投影）：楼层越多、正文内容越长，逐楼正则扫描越贵；发送给大模型的 MVU
+// 也必须有界，防止几百楼累积出的超大 stat_data 整棵喂给模型导致上下文爆炸。
 
 let context = null;
 let repository = null;
@@ -240,44 +244,6 @@ function activeContext() {
     return context;
 }
 
-function pointerParts(pointer) {
-    return String(pointer || '').split('/').slice(1).map(part => part.replace(/~1/g, '/').replace(/~0/g, '~'));
-}
-
-function applyPatch(root, operation) {
-    const path = pointerParts(operation?.path);
-    if (!path.length) return operation?.op === 'remove' ? {} : clone(operation?.value ?? {});
-    let parent = root;
-    for (let index = 0; index < path.length - 1; index += 1) {
-        const key = path[index];
-        if (parent[key] === undefined || parent[key] === null || typeof parent[key] !== 'object') parent[key] = /^\d+$/.test(path[index + 1]) ? [] : {};
-        parent = parent[key];
-    }
-    const key = path.at(-1);
-    if (operation?.op === 'remove') {
-        if (Array.isArray(parent)) parent.splice(Number(key), 1);
-        else delete parent[key];
-    } else if (Array.isArray(parent) && key === '-') parent.push(clone(operation.value));
-    else parent[key] = clone(operation?.value);
-    return root;
-}
-
-function parsePatchBlocks(content) {
-    const patches = [];
-    const pattern = /<JSONPatch\b[^>]*>\s*([\s\S]*?)\s*<\/JSONPatch\s*>/gi;
-    for (const match of String(content || '').matchAll(pattern)) {
-        try {
-            const parsed = JSON.parse(match[1]);
-            if (Array.isArray(parsed)) patches.push(...parsed);
-        } catch { /* preserve the floor even when a model emitted bad JSON */ }
-    }
-    return patches;
-}
-
-function isMvuStatData(value) {
-    return Boolean(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length);
-}
-
 function optionalGlobal(name) {
     const hosts = [globalThis];
     try { if (window && !hosts.includes(window)) hosts.push(window); } catch {}
@@ -295,19 +261,6 @@ function messageMvuStatData(ctx, floor) {
     const swipeId = Number.isInteger(Number(message.swipe_id)) ? Number(message.swipe_id) : 0;
     const selected = Array.isArray(variables) ? (variables[swipeId] ?? variables.at(-1)) : variables;
     return isMvuStatData(selected?.stat_data) ? clone(selected.stat_data) : null;
-}
-
-function replayMvu(messages) {
-    const output = { stat_data: {} };
-    let applied = 0;
-    for (const message of messages || []) {
-        for (const operation of parsePatchBlocks(message.content)) {
-            if (!operation?.path) continue;
-            applyPatch(output, operation);
-            applied += 1;
-        }
-    }
-    return { state: output, applied };
 }
 
 function syncAuthoritativeMvu(ctx) {
@@ -352,7 +305,7 @@ function readTavern() {
         content: String(message.mes || message.content || ''),
         hidden: Boolean(message.is_system && message.extra?.isSmallSys),
     })).filter(message => message.content.trim());
-    const replayed = replayMvu(messages);
+    const replayed = cachedReplayMvu(ctx.getCurrentChatId?.() || null, messages);
     const authoritative = syncAuthoritativeMvu(ctx);
     return {
         chatId: ctx.getCurrentChatId?.() || null,
@@ -1308,7 +1261,7 @@ async function recognizeCore() {
         if (declarationBox) declarationBox.value = JSON.stringify(declaration, null, 2);
         return tagged;
     }
-    const declarationPrompt = () => JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: tavernSnapshot.mvu.state, ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2);
+    const declarationPrompt = () => JSON.stringify({ recentStory: tavernSnapshot.recent, mvu: boundedMvuForLlm(tavernSnapshot.mvu.state), ...(String(settings.recognizeHint || '').trim() ? { playerHint: String(settings.recognizeHint).trim() } : {}), ...(String(settings.unitHint || '').trim() ? { unitHint: String(settings.unitHint).trim() } : {}) }, null, 2);
     let candidate = normalizeDeclaration(extractJsonObject(await generateRaw([{ role: 'system', content: DECLARATION_SYSTEM }, { role: 'user', content: declarationPrompt() }], 2600, '识别战场声明', 'declaration')));
     // 二步式：识别出的声明校验失败时，把错误回传要求主 AI 修正一次，而不是直接致命报错。
     let errors = declarationValidationReport(candidate);
@@ -1362,7 +1315,7 @@ async function createBattleCore() {
     let phaseOneNote = '';
     for (let attempt = 0; attempt < attempts; attempt += 1) {
             try {
-                const userPayload = { declaration, mvu: tavernSnapshot.mvu.state };
+                const userPayload = { declaration, mvu: boundedMvuForLlm(tavernSnapshot.mvu.state) };
                 if (attempt > 0 && fatalErrors.length) userPayload.repairErrors = fatalErrors;
                 if (String(settings.unitHint || '').trim()) userPayload.unitHint = String(settings.unitHint).trim();
                 candidate = extractJsonObject(await generateRaw([
