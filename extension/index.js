@@ -1,4 +1,4 @@
-const VERSION = '0.24.6';
+const VERSION = '0.24.7';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -13,7 +13,7 @@ void import('./diagnose.js')
 
 (async function battleOrbBootstrap() {
 try {
-    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl, buildKillCountPatches }, sandbox, { damageValue, isMeleeAbility, rangeLegal, living }, { parsePatchBlocks, isMvuStatData, cachedReplayMvu, boundedMvuForLlm }] = await Promise.all([
+    const [{ getContext }, { CombatEngine }, { BrowserCombatRepository }, { validateBattleDeclaration }, { buildBattleResultDsl, buildKillCountPatches }, sandbox, { damageValue, isMeleeAbility, rangeLegal, living, positionInsideBattlefield }, { parsePatchBlocks, isMvuStatData, cachedReplayMvu, boundedMvuForLlm }] = await Promise.all([
         import('../../../extensions.js'),
         import('./combat/engine.js'),
         import('./combat/browser-repository.js'),
@@ -1152,6 +1152,62 @@ function checkCombatModelFatalErrors(model) {
     return [...new Set(errors)];
 }
 
+// —— 初始坐标越界·warn 级检测 ——
+// 大模型没有"战场边界"的空间概念，给出的初始坐标可能落在战场边界之外。这属于
+// 可自行修复的 warn 级问题：阶段 1 会随修复请求把越界单位回传给战斗 AI 让其修正，
+// 但绝不致命（不会导致回退安全默认模型、不会阻塞继续）。若最终仍有个别单位越界，
+// 创建战场前由 expandBattlefieldToContain 扩展战场边界来容纳（而不是静默挪单位）。
+function checkCombatModelBoundaryIssues(model) {
+    if (!model || !model.battlefield || !Array.isArray(model.combatants)) return [];
+    const issues = [];
+    for (const unit of model.combatants) {
+        if (!unit || !unit.position || !Number.isFinite(Number(unit.position.x)) || !Number.isFinite(Number(unit.position.y))) continue;
+        if (!positionInsideBattlefield(unit.position, Number(unit.radiusMeters || .5), model.battlefield)) {
+            const field = model.battlefield.shape === 'circle'
+                ? `圆形半径 ${model.battlefield.radiusMeters}m，中心 (${model.battlefield.center?.x}, ${model.battlefield.center?.y})`
+                : `矩形 ${model.battlefield.widthMeters}m×${model.battlefield.heightMeters}m，中心 (${model.battlefield.center?.x}, ${model.battlefield.center?.y})`;
+            issues.push(`单位 ${unit.id}（${unit.name}）初始坐标 (${unit.position.x}, ${unit.position.y}) 位于战场边界外（${field}）：请把该单位坐标移动到战场边界内，或相应扩大 battlefield 的尺寸以容纳它`);
+        }
+    }
+    return [...new Set(issues)];
+}
+
+// —— 边界扩展·最后一步兜底 ——
+// 若经过阶段 1 修复请求后仍有单位在边界外，创建战场前把战场边界对称扩展到能容纳
+// 所有单位（保留中心，矩形扩 width/height、圆形扩 radius，各留 2m 余量）。这与
+// validateSpatialEncounter 的"把单位重新安放进战场"是相反的取向：宁可让边界变大，
+// 也不要悄悄改动大模型精心设计的初始布局。
+function expandBattlefieldToContain(model) {
+    if (!model || !model.battlefield || !Array.isArray(model.combatants)) return model;
+    const bf = model.battlefield;
+    const units = model.combatants.filter(unit => unit && unit.position && Number.isFinite(Number(unit.position.x)) && Number.isFinite(Number(unit.position.y)));
+    if (!units.length) return model;
+    const margin = 2;
+    if (bf.shape === 'circle') {
+        const center = bf.center || { x: 0, y: 0 };
+        let needed = Number(bf.radiusMeters || 0);
+        for (const unit of units) {
+            const radius = Number(unit.radiusMeters || .5);
+            const distance = Math.hypot(unit.position.x - center.x, unit.position.y - center.y) + radius + margin;
+            if (distance > needed) needed = distance;
+        }
+        if (needed <= Number(bf.radiusMeters || 0)) return model;
+        return { ...model, battlefield: { ...bf, radiusMeters: Math.ceil(needed * 2) / 2 } };
+    }
+    const halfWidth = Number(bf.widthMeters || 0) / 2, halfHeight = Number(bf.heightMeters || 0) / 2;
+    const center = bf.center || { x: 0, y: 0 };
+    let maxExtentX = halfWidth, maxExtentY = halfHeight;
+    for (const unit of units) {
+        const radius = Number(unit.radiusMeters || .5);
+        maxExtentX = Math.max(maxExtentX, Math.abs(unit.position.x - center.x) + radius + margin);
+        maxExtentY = Math.max(maxExtentY, Math.abs(unit.position.y - center.y) + radius + margin);
+    }
+    const nextWidth = Math.ceil(maxExtentX * 2 * 2) / 2;
+    const nextHeight = Math.ceil(maxExtentY * 2 * 2) / 2;
+    if (nextWidth <= Number(bf.widthMeters || 0) && nextHeight <= Number(bf.heightMeters || 0)) return model;
+    return { ...model, battlefield: { ...bf, widthMeters: Math.max(nextWidth, 4), heightMeters: Math.max(nextHeight, 4) } };
+}
+
 function mergeModel(candidate, input) {
     const fallback = fallbackModel(input);
     if (!candidate || typeof candidate !== 'object') return fallback;
@@ -1186,10 +1242,27 @@ function mergeModel(candidate, input) {
             if (declared && occurrences.get(key) === 1 && (unit.count === undefined || unit.count === null || Number(unit.count) === 1)) combatants[index] = { ...unit, count: declared };
         }
     }
+    const candidateBf = candidate.battlefield && typeof candidate.battlefield === 'object' ? candidate.battlefield : {};
+    // 兼容 LLM 的两写形式：顶层 widthMeters/heightMeters/radiusMeters/center（引擎读的格式），
+    // 或嵌套 rectangle{widthMeters,heightMeters,center} / circle{radiusMeters,center}（提示词
+    // "battlefield 使用 rectangle(widthMeters/heightMeters/center)" 的另一种自然解读）。嵌套形式
+    // 必须提升为顶层字段，否则引擎拿不到 LLM 想要的战场尺寸，会把本应能容纳的坐标判为越界。
+    const battlefield = { ...fallback.battlefield, ...candidateBf };
+    if (candidateBf.rectangle && typeof candidateBf.rectangle === 'object') {
+        battlefield.shape = 'rectangle';
+        if (Number.isFinite(Number(candidateBf.rectangle.widthMeters))) battlefield.widthMeters = Number(candidateBf.rectangle.widthMeters);
+        if (Number.isFinite(Number(candidateBf.rectangle.heightMeters))) battlefield.heightMeters = Number(candidateBf.rectangle.heightMeters);
+        if (candidateBf.rectangle.center && typeof candidateBf.rectangle.center === 'object') battlefield.center = { x: Number(candidateBf.rectangle.center.x) || 0, y: Number(candidateBf.rectangle.center.y) || 0 };
+    }
+    if (candidateBf.circle && typeof candidateBf.circle === 'object') {
+        battlefield.shape = 'circle';
+        if (Number.isFinite(Number(candidateBf.circle.radiusMeters))) battlefield.radiusMeters = Number(candidateBf.circle.radiusMeters);
+        if (candidateBf.circle.center && typeof candidateBf.circle.center === 'object') battlefield.center = { x: Number(candidateBf.circle.center.x) || 0, y: Number(candidateBf.circle.center.y) || 0 };
+    }
     const output = {
         ...fallback,
         ...candidate,
-        battlefield: { ...fallback.battlefield, ...(candidate.battlefield || {}) },
+        battlefield,
         zones: Array.isArray(candidate.zones) && candidate.zones.length ? candidate.zones : fallback.zones,
         combatants: deconflictPositions(combatants),
     };
@@ -1419,25 +1492,35 @@ async function createBattleCore() {
     declarationValidation(declaration);
     setStatus('正在用酒馆当前 AI 建立 CombatModel…', 'working'); render();
     tavernSnapshot ||= readTavern();
-    // 第一段生成 + 致命错误保底检测：本地不静默改模型，检测到致命错误就把问题
-    // 回传给战斗 AI 要求其自行修复（最多 maxRetries-1 次修复请求）；生成异常也按限次重试。
+    // 第一段生成 + 错误保底检测：本地不静默改模型，检测到错误就把问题回传给战斗 AI
+    // 要求其自行修复（最多 maxRetries-1 次修复请求）；生成异常也按限次重试。
+    // 两类错误分级：致命错误（缺普通攻击）阻塞——未修复则回退安全默认模型；初始坐标
+    // 越界是 warn 级——随修复请求回传给大模型修正一次，但绝不阻塞后续流程。
     const attempts = retryLimit();
     let candidate = null;
     let fatalErrors = [];
+    let boundaryIssues = [];
+    let boundaryPrompted = false;
     let phaseOneNote = '';
     for (let attempt = 0; attempt < attempts; attempt += 1) {
             try {
                 const userPayload = { declaration, mvu: mvuForLlm(tavernSnapshot.mvu.state) };
-                if (attempt > 0 && fatalErrors.length) userPayload.repairErrors = fatalErrors;
+                if (attempt > 0 && (fatalErrors.length || boundaryIssues.length)) userPayload.repairErrors = [...fatalErrors, ...boundaryIssues];
                 if (String(settings.unitHint || '').trim()) userPayload.unitHint = String(settings.unitHint).trim();
                 candidate = extractJsonObject(await generateRaw([
                     { role: 'system', content: MODEL_SYSTEM },
                     { role: 'user', content: JSON.stringify(userPayload, null, 2) },
                 ], 7000, attempt ? `战斗建模（第一段 · 修复请求 ${attempt}）` : '战斗建模（第一段生成）', 'modeling'));
-                fatalErrors = checkCombatModelFatalErrors(mergeModel(candidate, declaration));
-                if (!fatalErrors.length) break;
-                recordDebug('modeling_phase1_fatal_errors', { attempt, errors: fatalErrors });
-                setStatus(`第一段建模存在致命错误（第 ${attempt + 1} 次修复请求）：${fatalErrors.join('；')}`, 'warn'); render();
+                const mergedCandidate = mergeModel(candidate, declaration);
+                fatalErrors = checkCombatModelFatalErrors(mergedCandidate);
+                boundaryIssues = checkCombatModelBoundaryIssues(mergedCandidate);
+                // 边界问题 warn 级：仅随修复请求提示大模型一轮，之后无论是否修复都放行。
+                const onlyBoundary = !fatalErrors.length && boundaryIssues.length && !boundaryPrompted;
+                if (!fatalErrors.length && (!boundaryIssues.length || boundaryPrompted)) break;
+                boundaryPrompted = true;
+                const allIssues = [...fatalErrors, ...boundaryIssues];
+                recordDebug('modeling_phase1_issues', { attempt, fatal: fatalErrors, boundary: boundaryIssues });
+                setStatus(`第一段建模需修正（第 ${attempt + 1} 次修复请求）：${allIssues.slice(0, 2).join('；')}${allIssues.length > 2 ? ` 等 ${allIssues.length} 项` : ''}`, 'warn'); render();
             } catch (error) {
                 if (String(error?.message || '').includes('已取消') || isNetworkDownError(error)) throw error;
                 recordDebug('modeling_phase1_generation_error', { attempt, error: String(error.message || error) });
@@ -1453,6 +1536,8 @@ async function createBattleCore() {
             phaseOneNote = '（已回退安全默认模型：致命错误未修复）';
             recordDebug('modeling_phase1_unrepaired', { errors: fatalErrors });
             setStatus(`CombatModel 多次修复仍存在致命错误，改用本地安全默认模型：${fatalErrors.join('；')}`, 'warn'); render();
+        } else if (boundaryIssues.length) {
+            recordDebug('modeling_phase1_boundary_warned', { issues: boundaryIssues });
         }
         setStatus('CombatModel 已生成，正在由战斗数据检查 AI 审查修正…', 'working'); render();        // 第一阶段成功即归档：第二阶段（数据检查 AI）若全部失败，回滚模式将直接用
         // 这份归档结果创建战场，不再报错或等待。
@@ -1479,6 +1564,14 @@ async function createBattleCore() {
         }
         model = mergeModel(candidate, declaration);
         recordDebug('modeling_final', { mode: modeNote || '两段式', combatants: model.combatants?.length || 0, basicAttacks: model.combatants?.reduce((sum, unit) => sum + (unit.abilities || []).filter(ability => /^basic-attack/.test(ability.id)).length, 0) || 0 });
+        // 最后一步：若仍有单位在战场边界外，扩展边界容纳，而不是静默挪动大模型设计的坐标。
+        const finalBoundary = checkCombatModelBoundaryIssues(model);
+        if (finalBoundary.length) {
+            const before = { ...(model.battlefield || {}) };
+            model = expandBattlefieldToContain(model);
+            recordDebug('modeling_boundary_expanded', { issues: finalBoundary, before, after: { ...(model.battlefield || {}) } });
+            setStatus(`检测到 ${finalBoundary.length} 个单位初始坐标位于战场边界外，已自动扩展战场边界容纳（${finalBoundary[0].split('（')[0]} 等）`, 'warn'); render();
+        }
         repository = new BrowserCombatRepository({ chatId: tavernSnapshot?.chatId || null });
         engine = new CombatEngine(repository);
         // 全自动模式：进入战场时自动批准脚本（并写入持久化缓存），无需手动逐条确认。
