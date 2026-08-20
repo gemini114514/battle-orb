@@ -1031,7 +1031,11 @@ export class CombatEngine {
             ? this.pickPilotAbility(actor, target, available)
             : available.find(item => item.id !== 'basic-attack') || available[0];
         if (!ability) { state.flags.noLegalAction = true; this.event(state, 'unit_waited', { actorId: actor.id, reason: 'no_legal_action', targetId: target?.id || null, targetDistance: target ? edgeDistance(actor, target) : null, movementRemaining: this.movementRemaining(state, actor), knownTargetIds: this.knownTargets(state, actor).map(unit => unit.id).slice(0, 24), abilityDiagnostics: actor.abilities.map(item => ({ id: item.id, affordable: actor.ep >= item.epCost, cooldown: Number(actor.cooldowns?.[item.id] || 0), inRange: target ? rangeLegal(state, actor, target, item) : false, canEngage: target ? this.canEngage(state, actor, target, item) : false })) }); state.cursor += 1; return; }
-        const targets = (ability.aoe || ability.targetCount > 1) ? this.knownTargets(state, actor).filter(item => this.canEngage(state, actor, item, ability)).slice(0, ability.targetCount) : [target];
+        const targets = (ability.aoe || ability.targetCount > 1)
+            // 多目标/范围能力：先保证选中的主目标在最前，其余按距离施法者由近到远补齐，
+            // 而不是沿用 combatants 数组顺序（数组顺序≠最近，会让次目标打到地图另一端的敌人）。
+            ? [...[target].filter(item => item && this.canEngage(state, actor, item, ability)), ...this.knownTargets(state, actor).filter(item => item.id !== target?.id && this.canEngage(state, actor, item, ability)).sort((a, b) => edgeDistance(actor, a) - edgeDistance(actor, b))].slice(0, ability.targetCount)
+            : [target];
         while (!ability.aoe && targets.length > 1 && actor.ep < Math.ceil(ability.epCost * targetCostMultiplier(targets.length))) targets.pop();
         if (ability.script) { if (!await this.executeScriptAbility(state, actor, targets, ability)) return; }
         else await this.resolveAttack(state, actor, targets, ability);

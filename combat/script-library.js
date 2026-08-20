@@ -9,9 +9,9 @@ export const SCRIPT_LIBRARY = Object.freeze([
     {
         id: 'volley',
         name: '连射/连击 N 发',
-        description: '固定多发攻击：每次激活无条件发射恰好 N 发独立 api.attack；第 1 发打所选主目标（targets[0]），后续每一发优先改打另一存活敌人（api.state().enemies 里 hp>0 且 id 不同），无其它存活敌人时才连击同一目标。每一发都走独立权威检定。',
+        description: '固定多发攻击：每次激活无条件发射恰好 N 发独立 api.attack；第 1 发打所选主目标（targets[0]），后续每一发在能力合法射程内按离施法者由近到远优先改打另一存活敌人，射程内无其它存活敌人时才连击同一目标。每一发都走独立权威检定。',
         params: { shots: 2 },
-        script: `const state = api.state(); const primary = (state.targets || [])[0]; if (!primary) { api.log('没有可攻击目标'); } else { api.attack(primary.id); for (let i = 1; i < {{shots}}; i += 1) { const alt = state.enemies.find(u => u.hp > 0 && u.id !== primary.id); api.attack((alt || primary).id); } }`,
+        script: `const state = api.state(); const primary = (state.targets || [])[0]; if (!primary) { api.log('没有可攻击目标'); } else { const maxRange = Number((state.ability && state.ability.maxRangeMeters) ?? (state.ability && state.ability.range === 'far' ? 1000 : (state.ability && state.ability.range === 'contact' ? 1.5 : 8))); const inRange = state.enemies.filter(u => u.hp > 0 && u.id !== primary.id && api.distance(state.actor.id, u.id) <= maxRange + 1e-6).sort((a, b) => api.distance(state.actor.id, a.id) - api.distance(state.actor.id, b.id)); api.attack(primary.id); for (let i = 1; i < {{shots}}; i += 1) { const alt = inRange[i - 1] || primary; api.attack(alt.id); } }`,
     },
     {
         id: 'guard-stance',

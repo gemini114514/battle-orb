@@ -97,7 +97,7 @@ export async function runScript(source, input) {
             const sideOf = u => u.side === "player" ? "player" : u.side === "neutral" ? "neutral" : "enemy";
             const actorSide = sideOf(input.actor || {});
             const api = Object.freeze({
-              state: () => ({ round: input.round || 0, battlefield: input.battlefield || null, actor: input.actor || null, targets: input.targets || [], units: input.units || [], enemies: (input.units || []).filter(u => u.id !== (input.actor && input.actor.id) && sideOf(u) !== actorSide), allies: (input.units || []).filter(u => u.id !== (input.actor && input.actor.id) && sideOf(u) === actorSide) }),
+              state: () => ({ round: input.round || 0, battlefield: input.battlefield || null, ability: input.ability || null, actor: input.actor || null, targets: input.targets || [], units: input.units || [], enemies: (input.units || []).filter(u => u.id !== (input.actor && input.actor.id) && sideOf(u) !== actorSide), allies: (input.units || []).filter(u => u.id !== (input.actor && input.actor.id) && sideOf(u) === actorSide) }),
               distance: (aId, bId) => { const a = unitsById.get(String(aId)), b = unitsById.get(String(bId)); if (!a || !b || !a.position || !b.position) return NaN; return Math.hypot(a.position.x - b.position.x, a.position.y - b.position.y); },
               unitsInArea: (x, y, radius) => (input.units || []).filter(u => u.position && Math.hypot(u.position.x - Number(x), u.position.y - Number(y)) <= Number(radius)).map(u => ({ id: u.id, name: u.name, side: u.side, hp: u.hp, maxHp: u.maxHp, position: u.position, statuses: u.statuses })),
               d100: () => 1 + Math.floor(rand() * 100),
