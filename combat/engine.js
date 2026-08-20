@@ -1555,9 +1555,17 @@ export class CombatEngine {
             }
         }
         const from = { ...actor.position };
-        const distance = Math.hypot(to.x - from.x, to.y - from.y);
+        let distance = Math.hypot(to.x - from.x, to.y - from.y);
         const available = this.movementRemaining(state, actor);
-        if (!ignoreBudget && distance > available + 1e-6) throw httpError(400, `移动距离 ${distance.toFixed(2)}m 超过本回合剩余移动 ${available.toFixed(1)}m`);
+        // 预算容差：仅略微超出本回合剩余移动（≤1m 内）时，沿移动方向就近取可达点，
+        // 而不是让玩家的移动指令整体报错。只有明显超出才按预算不足拒绝。
+        if (!ignoreBudget && distance > available + 1e-6) {
+            const overrun = distance - available;
+            if (overrun > 1 + 1e-6 || distance <= 1e-6) throw httpError(400, `移动距离 ${distance.toFixed(2)}m 超过本回合剩余移动 ${available.toFixed(1)}m`);
+            to.x = from.x + (to.x - from.x) * (available / distance);
+            to.y = from.y + (to.y - from.y) * (available / distance);
+            distance = Math.hypot(to.x - from.x, to.y - from.y);
+        }
         // A no-op coordinate is not movement.  In particular it must not
         // produce a footstep/noise event that wakes a nearby group merely
         // because an automatic policy re-evaluated an already optimal point.
