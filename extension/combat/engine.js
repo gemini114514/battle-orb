@@ -1,4 +1,4 @@
-import { aggregateCohorts, alliesOf, applyDamage, centerDistance, damageValue, edgeDistance, effectiveSpeed, enemiesOf, entityRadiusMeters, evasionAttacks, exertionMaximum, isMeleeAbility, living, normalizeAttributes, normalizeEncounter, normalizeIntelProfile, normalizePassives, normalizeTacticalProfile, positionInsideBattlefield, rangeLegal, sprintMeters, tacticalGroupKey, targetCostMultiplier, validateSpatialEncounter, withdrawMeters } from './rules.js';
+import { aggregateCohorts, alliesOf, applyDamage, centerDistance, clampToBattlefield, damageValue, edgeDistance, effectiveSpeed, enemiesOf, entityRadiusMeters, evasionAttacks, exertionMaximum, isMeleeAbility, living, normalizeAttributes, normalizeEncounter, normalizeIntelProfile, normalizePassives, normalizeTacticalProfile, positionInsideBattlefield, rangeLegal, sprintMeters, tacticalGroupKey, targetCostMultiplier, validateSpatialEncounter, withdrawMeters } from './rules.js';
 import { evaluateTriggers } from './strategy.js';
 import { inspectScript, runScript, scriptHash } from './sandbox.js';
 import { canonical, deepClone, DeterministicRng, makeId, RULESET_VERSION, seed256, sha256 } from './util.js';
@@ -1098,8 +1098,12 @@ export class CombatEngine {
         const edge = edgeDistance(actor, target);
         if (edge <= maxRange + 1e-6) return { ...actor.position };
         const desiredCenterDistance = Number(actor.radiusMeters || .5) + Number(target.radiusMeters || .5) + maxRange;
-        const destination = { x: target.position.x + dx / centerDistance * desiredCenterDistance, y: target.position.y + dy / centerDistance * desiredCenterDistance };
-        if (!positionInsideBattlefield(destination, Number(actor.radiusMeters || .5), state.battlefield)) throw httpError(400, '最短攻击落点超出战场边界');
+        let destination = { x: target.position.x + dx / centerDistance * desiredCenterDistance, y: target.position.y + dy / centerDistance * desiredCenterDistance };
+        if (!positionInsideBattlefield(destination, Number(actor.radiusMeters || .5), state.battlefield)) {
+            const clamped = clampToBattlefield(destination, Number(actor.radiusMeters || .5), state.battlefield);
+            if (Math.hypot(clamped.x - destination.x, clamped.y - destination.y) <= 1 + 1e-6) destination = clamped;
+            else throw httpError(400, '最短攻击落点超出战场边界');
+        }
         return destination;
     }
 
@@ -1538,6 +1542,14 @@ export class CombatEngine {
     moveTo(state, actor, destination, { ignoreBudget = false, source = 'player', disengageChecked = false } = {}) {
         const to = { x: Number(destination?.x), y: Number(destination?.y) };
         if (!Number.isFinite(to.x) || !Number.isFinite(to.y)) throw httpError(400, '移动坐标必须是有限数字');
+        // 边界容差：目标落点仅略微越出战场边界（≤1m 内）时，直接就近取边界内可达点，
+        // 而不是让玩家/脚本的移动指令整体报错。只有明显越界才按非法落点拒绝。
+        if (!positionInsideBattlefield(to, actor.radiusMeters, state.battlefield)) {
+            const clamped = clampToBattlefield(to, Number(actor.radiusMeters || .5), state.battlefield);
+            if (Math.hypot(clamped.x - to.x, clamped.y - to.y) <= 1 + 1e-6) {
+                to.x = clamped.x; to.y = clamped.y;
+            }
+        }
         const from = { ...actor.position };
         const distance = Math.hypot(to.x - from.x, to.y - from.y);
         const available = this.movementRemaining(state, actor);
@@ -1642,31 +1654,61 @@ export class CombatEngine {
             this.event(state, 'unit_waited', { actorId: actor.id, reason: 'retreat_disengage_failed' });
             return false;
         }
-        // Sum inverse-distance vectors away from *known* threats. Candidate
-        // rotations avoid using one target as a misleading escape axis when
-        // the player is already between several pursuers.
-        let awayX = 0, awayY = 0;
-        for (const threat of threats) {
-            const dx = actor.position.x - threat.position.x, dy = actor.position.y - threat.position.y;
-            const distance = Math.max(1, Math.hypot(dx, dy));
-            const weight = 1 / distance;
-            awayX += dx / distance * weight; awayY += dy / distance * weight;
+        // 把已知威胁建模成一个包围圆：圆心 = 各敌位的质心（均值），半径 = 到圆心最远
+        // 的敌方距离。游击逃逸的主动方向就是"朝距离圆心最远的一侧跑"——即沿质心→自身
+        // 的射线方向逃离整个敌群，而不是对每个威胁做逆距离加权求和。后者在四面被围时
+        // 反向向量会互相抵消、退化成一个随机方向；圆心模型即使被大半包围也有稳定指向。
+        let centroidX = 0, centroidY = 0;
+        for (const threat of threats) { centroidX += threat.position.x; centroidY += threat.position.y; }
+        centroidX /= threats.length; centroidY /= threats.length;
+        const toCentroidX = actor.position.x - centroidX, toCentroidY = actor.position.y - centroidY;
+        let angle = Math.atan2(toCentroidY, toCentroidX);
+        if (!Number.isFinite(angle) || Math.hypot(toCentroidX, toCentroidY) < 1e-6) {
+            // 已被完全合围（圆心≈自身）：从威胁方位分布里找最大的角向空隙（逃生豁口），
+            // 朝缺口中心跑，而不是随便甩一个朝向反方向。
+            const bearings = threats.map(({ position }) => Math.atan2(position.y - actor.position.y, position.x - actor.position.x)).sort((a, b) => a - b);
+            let largestGap = 0, gapCenter = 0;
+            for (let i = 0; i < bearings.length; i += 1) {
+                const next = bearings[(i + 1) % bearings.length];
+                const gap = (next - bearings[i] + Math.PI * 2) % (Math.PI * 2);
+                if (gap > largestGap) { largestGap = gap; gapCenter = bearings[i] + gap / 2; }
+            }
+            angle = Number.isFinite(gapCenter) ? gapCenter : Number(actor.facingDegrees || 0) * Math.PI / 180 + Math.PI;
         }
-        let angle = Math.atan2(awayY, awayX);
-        if (!Number.isFinite(angle) || Math.hypot(awayX, awayY) < 1e-6) angle = Number(actor.facingDegrees || 0) * Math.PI / 180 + Math.PI;
+        const radius = Number(actor.radiusMeters || .5);
+        const bf = state.battlefield;
+        // 候选方向：主动逃逸角 + 一组旋转偏移（应对堵截）；若已贴近战场边缘，再显式
+        // 加入沿该边滑行的切向方向——"到边界则贴边移动"。
         const offsets = [0, Math.PI / 8, -Math.PI / 8, Math.PI / 4, -Math.PI / 4, Math.PI / 2, -Math.PI / 2, Math.PI * .75, -Math.PI * .75];
-        const candidates = offsets.map(offset => {
-            const direction = { x: Math.cos(angle + offset), y: Math.sin(angle + offset) };
-            const destination = { x: actor.position.x + direction.x * speed, y: actor.position.y + direction.y * speed };
-            // Favour the candidate that maximises its minimum separation,
-            // rather than merely running away from the current focus target.
+        const directions = offsets.map(offset => ({ angle: angle + offset, offset }));
+        const edgeMargin = Math.min(2.5, Math.max(1, speed * .5));
+        if (bf.shape === 'circle') {
+            const dFromCenter = Math.hypot(actor.position.x - bf.center.x, actor.position.y - bf.center.y);
+            if (bf.radiusMeters - dFromCenter <= edgeMargin) {
+                const radial = Math.atan2(actor.position.y - bf.center.y, actor.position.x - bf.center.x);
+                directions.push({ angle: radial + Math.PI / 2, offset: Math.PI / 2 }, { angle: radial - Math.PI / 2, offset: -Math.PI / 2 });
+            }
+        } else {
+            const halfW = bf.widthMeters / 2, halfH = bf.heightMeters / 2;
+            const minX = bf.center.x - halfW, maxX = bf.center.x + halfW, minY = bf.center.y - halfH, maxY = bf.center.y + halfH;
+            if (actor.position.x >= maxX - edgeMargin || actor.position.x <= minX + edgeMargin) directions.push({ angle: Math.PI / 2, offset: Math.PI / 2 }, { angle: -Math.PI / 2, offset: -Math.PI / 2 });
+            if (actor.position.y >= maxY - edgeMargin || actor.position.y <= minY + edgeMargin) directions.push({ angle: 0, offset: 0 }, { angle: Math.PI, offset: Math.PI });
+        }
+        // 每个候选先做边界裁剪（贴边载体），再按"距圆心更远 → 与最近威胁间隔更大 →
+        // 偏移更小"排序。已贴边时主方向被裁剪为零位移，会被剔除，从而落到切向滑动上。
+        const candidates = directions.map(({ angle: candidateAngle, offset }) => {
+            const direction = { x: Math.cos(candidateAngle), y: Math.sin(candidateAngle) };
+            let destination = { x: actor.position.x + direction.x * speed, y: actor.position.y + direction.y * speed };
+            if (!positionInsideBattlefield(destination, radius, bf)) destination = clampToBattlefield(destination, radius, bf);
+            if (Math.hypot(destination.x - actor.position.x, destination.y - actor.position.y) <= 1e-6) return null;
+            const distToCentroid = Math.hypot(destination.x - centroidX, destination.y - centroidY);
             const minDistance = Math.min(...threats.map(threat => Math.hypot(destination.x - threat.position.x, destination.y - threat.position.y)));
-            return { direction, destination, minDistance, offset };
-        }).sort((a, b) => b.minDistance - a.minDistance || Math.abs(a.offset) - Math.abs(b.offset));
+            return { direction, destination, distToCentroid, minDistance, offset };
+        }).filter(Boolean).sort((a, b) => b.distToCentroid - a.distToCentroid || b.minDistance - a.minDistance || Math.abs(a.offset) - Math.abs(b.offset));
         for (const candidate of candidates) {
             try {
                 const moved = this.moveTo(state, actor, candidate.destination, { source: 'strategy', disengageChecked: true });
-                this.event(state, 'strategy_retreat', { actorId: actor.id, reason, threatIds: threats.map(item => item.unit.id).slice(0, 24), distanceMeters: moved, destination: actor.position, minimumSeparationMeters: Math.round(candidate.minDistance * 1000) / 1000 });
+                this.event(state, 'strategy_retreat', { actorId: actor.id, reason, threatIds: threats.map(item => item.unit.id).slice(0, 24), distanceMeters: moved, destination: actor.position, centroid: { x: Math.round(centroidX * 100) / 100, y: Math.round(centroidY * 100) / 100 }, escapeAngleDegrees: Math.round(angle * 180 / Math.PI), minimumSeparationMeters: Math.round(candidate.minDistance * 1000) / 1000, distToCentroidMeters: Math.round(candidate.distToCentroid * 1000) / 1000, candidateCount: candidates.length });
                 return moved;
             } catch { /* evaluate the next deterministic legal escape vector */ }
         }

@@ -104,7 +104,7 @@ export function positionInsideBattlefield(position, radiusMeters, battlefield) {
 
 // 大模型没有"战场边界"的空间概念，给出的坐标可能落在边界之外。这里不再报致命
 // 错误，而是把落点钳制回战场内部：圆形战场按方向缩回半径内，矩形战场按边界裁剪。
-function clampToBattlefield(point, radiusMeters, battlefield) {
+export function clampToBattlefield(point, radiusMeters, battlefield) {
     if (battlefield.shape === 'circle') {
         const dx = point.x - battlefield.center.x, dy = point.y - battlefield.center.y;
         const distance = Math.hypot(dx, dy);

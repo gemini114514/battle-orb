@@ -1,4 +1,4 @@
-const VERSION = '0.24.7';
+const VERSION = '0.24.8';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
