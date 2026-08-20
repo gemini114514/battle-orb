@@ -1,4 +1,4 @@
-const VERSION = '0.24.12';
+const VERSION = '0.24.13';
 globalThis.__battleOrbExpectedVersion = VERSION;
 const bootTrace = (stage, detail = {}) => {
     const event = { time: new Date().toISOString(), stage, detail };
@@ -2207,7 +2207,8 @@ function renderBattlefield(state) {
     const notice = actionNotice ? `<div class="combat-action-notice ${escapeHtml(actionNotice.kind)}" role="status">${escapeHtml(actionNotice.text)}</div>` : '';
     const inspectorUnit = inspectorUnitId ? state.combatants.find(unit => unit.id === inspectorUnitId) : null;
     const selectedUnitBox = state.combatants.find(unit => unit.id === selectedUnitId) || actor;
-    root.innerHTML = `<div class="combat-map-wrap">${notice}<div class="combat-map-zoom" role="toolbar" aria-label="战场缩放"><button data-action="combat-map-zoom-out" title="缩小">−</button><button data-action="combat-map-zoom-reset" title="恢复 100%">${Math.round(mapZoom * 100)}%</button><button data-action="combat-map-zoom-in" title="放大">＋</button><button data-action="combat-map-zoom-200" title="快速放大到 200%">200%</button></div><canvas id="battle-orb-map" aria-label="二维战场"></canvas>${rangeLegendMarkup(selectedUnitBox, state)}${mapMenuMarkup(state, actor)}${entityInspectorMarkup(inspectorUnit, state)}<div class="combat-map-caption"><span>${escapeHtml(field.shape === 'circle' ? `圆形 · 半径 ${field.radiusMeters}m` : `矩形 · ${field.widthMeters}m × ${field.heightMeters}m`)}</span><b>${escapeHtml(intent)}</b><span title="${escapeHtml(intel.text)}">情报：已见敌 ${intel.visibleEnemies}${intel.hiddenEnemies ? ` · 未确认 ${intel.hiddenEnemies}` : ''}</span></div></div>`;
+    const semiDisabled = busy || ['completed', 'abandoned'].includes(state.status) ? 'disabled' : '';
+    root.innerHTML = `<div class="combat-map-wrap">${notice}<div class="combat-map-zoom" role="toolbar" aria-label="战场缩放"><button data-action="combat-map-zoom-out" title="缩小">−</button><button data-action="combat-map-zoom-reset" title="恢复 100%">${Math.round(mapZoom * 100)}%</button><button data-action="combat-map-zoom-in" title="放大">＋</button><button data-action="combat-map-zoom-200" title="快速放大到 200%">200%</button></div><div class="combat-map-semi" role="toolbar" aria-label="半自动战斗"><button data-bo-action="semi-auto" ${semiDisabled} title="按当前战斗策略演算当前单位这一回合（移动进射程→攻击→拉扯），随后交还控制">半自动</button></div><canvas id="battle-orb-map" aria-label="二维战场"></canvas>${rangeLegendMarkup(selectedUnitBox, state)}${mapMenuMarkup(state, actor)}${entityInspectorMarkup(inspectorUnit, state)}<div class="combat-map-caption"><span>${escapeHtml(field.shape === 'circle' ? `圆形 · 半径 ${field.radiusMeters}m` : `矩形 · ${field.widthMeters}m × ${field.heightMeters}m`)}</span><b>${escapeHtml(intent)}</b><span title="${escapeHtml(intel.text)}">情报：已见敌 ${intel.visibleEnemies}${intel.hiddenEnemies ? ` · 未确认 ${intel.hiddenEnemies}` : ''}</span></div></div>`;
     requestAnimationFrame(() => {
         drawMap();
         if (mapIntent) {
@@ -2336,7 +2337,7 @@ function renderTurn(state) {
         const preview = effective?.confirmed ? strategyBehaviorMarkup(effective) : '<span class="bo-muted">当前没有已确认策略：半自动将按默认最近目标推进（优先 0 EP 最高输出）。</span>';
         strategySection = `<div class="bo-turn-strategy"><label>本回合策略</label>${turnStrategyOptionMarkup(actor.id)}<div class="bo-turn-strategy-preview">${preview}</div></div>`;
     }
-    root.innerHTML = `<div class="bo-turn-head"><b>${escapeHtml(actor?.name || '等待演算')}</b><span>${escapeHtml(state.status)} · 第 ${state.round || 0} 回合</span></div><p>${escapeHtml(state.pauseReason ? JSON.stringify(state.pauseReason) : '本地引擎正在推进')}</p>${strategySection}<div class="bo-auto-runbar"><button class="bo-secondary" data-bo-action="semi-auto" ${disabled} title="按当前战斗策略演算当前单位这一回合（移动进射程→攻击→拉扯），随后交还控制">半自动 · 按策略行动</button><button class="bo-primary" data-bo-action="full-auto" ${disabled} title="按当前战斗策略自动走回合直到战斗结束">全自动 · 战斗至结束</button>${busy ? '<span class="bo-muted">演算中…</span>' : ''}</div><div class="bo-turn-options ${optionsOpen ? 'open' : ''}"><button class="bo-turn-options-toggle" type="button" data-bo-action="toggle-options" ${disabled}>行动选项${optionCount ? `（${optionCount}）` : ''}${reactionButtons ? ' · ⚠ 反应窗口' : ''} · ${optionsOpen ? '收起 ▲' : '展开 ▼'}</button>${optionsOpen ? `<div class="bo-turn-options-body">${optionsBody}</div>` : ''}</div>`;
+    root.innerHTML = `${strategySection}<div class="bo-auto-runbar"><button class="bo-primary" data-bo-action="full-auto" ${disabled} title="按当前战斗策略自动走回合直到战斗结束">全自动 · 战斗至结束</button>${busy ? '<span class="bo-muted">演算中…</span>' : ''}</div><div class="bo-turn-options ${optionsOpen ? 'open' : ''}"><button class="bo-turn-options-toggle" type="button" data-bo-action="toggle-options" ${disabled}>行动选项${optionCount ? `（${optionCount}）` : ''}${reactionButtons ? ' · ⚠ 反应窗口' : ''} · ${optionsOpen ? '收起 ▲' : '展开 ▼'}</button>${optionsOpen ? `<div class="bo-turn-options-body">${optionsBody}</div>` : ''}</div>`;
 }
 
 function renderLedger(state) {
